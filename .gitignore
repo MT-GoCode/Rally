@@ -1,0 +1,8 @@
+engine/.venv/
+engine/models/
+engine/serve.log
+app/.build/
+app/CIVM.app/Contents/MacOS/CIVM
+
+# local-only demo content (course slides + instructor/TA emails — not for the public repo)
+seed/
