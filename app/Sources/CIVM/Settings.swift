@@ -20,6 +20,24 @@ enum SK {
     static let defaultCopyBinding = "ctrl+alt+c"     // ⌃⌥C
 }
 
+// ---- shared settings accessors — the SINGLE authority for reading the SK keys with the right
+// fallbacks. SettingsView writes via @AppStorage; RootView's computed vars delegate here (their
+// @AppStorage stays only as a render-invalidation trigger); ChatSession keeps stored copies it
+// refreshes from these on UserDefaults.didChangeNotification. One place owns each default. ----
+extension Mode         { static func from(_ raw: String) -> Mode { Mode(rawValue: raw) ?? .textText }
+                         static var current: Mode { from(UserDefaults.standard.string(forKey: SK.mode) ?? "") } }
+extension Submode      { static func from(_ raw: String) -> Submode { Submode(rawValue: raw) ?? .toggle }
+                         static var current: Submode { from(UserDefaults.standard.string(forKey: SK.submode) ?? "") } }
+extension Transcription { static func from(_ raw: String) -> Transcription { Transcription(rawValue: raw) ?? .after }
+                          static var current: Transcription { from(UserDefaults.standard.string(forKey: SK.transcription) ?? "") } }
+extension ShotStyle    { static func from(_ raw: String) -> ShotStyle { ShotStyle(rawValue: raw) ?? .initiate } }
+extension SK {
+    static var hotkeyValue: String     { UserDefaults.standard.string(forKey: hotkey) ?? defaultHotkey }
+    static var shotBindingValue: String { UserDefaults.standard.string(forKey: shotBinding) ?? defaultShotBinding }
+    static var shotStyleValue: String  { UserDefaults.standard.string(forKey: shotStyle) ?? defaultShotStyle }
+    static var copyBindingValue: String { UserDefaults.standard.string(forKey: copyBinding) ?? defaultCopyBinding }
+}
+
 // ---- hotkey chord: a modifier-only chord, stored as an engine string ("ctrl+alt") and shown as symbols (⌃⌥) ----
 func hotkeyString(_ m: NSEvent.ModifierFlags) -> String {
     var parts: [String] = []
@@ -185,9 +203,9 @@ struct SettingsView: View {
     @StateObject private var shotRec = BindingRecorder()
     @StateObject private var copyRec = BindingRecorder()
 
-    private var submode: Binding<Submode> { Binding(get: { Submode(rawValue: submodeRaw) ?? .toggle }, set: { submodeRaw = $0.rawValue }) }
-    private var transcription: Binding<Transcription> { Binding(get: { Transcription(rawValue: transcriptionRaw) ?? .after }, set: { transcriptionRaw = $0.rawValue }) }
-    private var shotStyle: Binding<ShotStyle> { Binding(get: { ShotStyle(rawValue: shotStyleRaw) ?? .initiate }, set: { shotStyleRaw = $0.rawValue }) }
+    private var submode: Binding<Submode> { Binding(get: { .from(submodeRaw) }, set: { submodeRaw = $0.rawValue }) }
+    private var transcription: Binding<Transcription> { Binding(get: { .from(transcriptionRaw) }, set: { transcriptionRaw = $0.rawValue }) }
+    private var shotStyle: Binding<ShotStyle> { Binding(get: { .from(shotStyleRaw) }, set: { shotStyleRaw = $0.rawValue }) }
     private var sym: String { hotkeySymbols(hotkey) }
 
     var body: some View {

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import UniformTypeIdentifiers
 import AVFoundation
 import ApplicationServices
@@ -99,6 +100,10 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
 
 @MainActor final class Store: ObservableObject {
     enum Screen { case home, chat }
+    // How the current chat was activated — the session listens on `activated` and reacts once per
+    // activation (opened → re-pin; created/seeded → no pin), keeping today's per-path behavior.
+    enum Activation { case opened, created, seeded }
+    let activated = PassthroughSubject<Activation, Never>()
     @Published var screen: Screen = .home
     @Published var chat = Chat()
     @Published var stubs: [ChatStub] = []
@@ -129,13 +134,13 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
             }
             .sorted { ($0.mtime ?? .distantPast) > ($1.mtime ?? .distantPast) }
     }
-    func open(_ id: UUID) -> Bool {
+    func open(_ id: UUID) {
         guard let d = try? Data(contentsOf: dir.appendingPathComponent("\(id).json")),
-              let c = try? JSONDecoder().decode(Chat.self, from: d) else { return false }
-        chat = c; screen = .chat; return true
+              let c = try? JSONDecoder().decode(Chat.self, from: d) else { return }
+        chat = c; screen = .chat; activated.send(.opened)
     }
     func goHome() { save(); refreshStubs(); screen = .home }
-    func startNew() { chat = Chat(); screen = .chat }
+    func startNew() { chat = Chat(); screen = .chat; activated.send(.created) }
 
     // Names are USER-SET ONLY (never auto-named from content). Rename rewrites the saved chat's name
     // in place; if it's the open chat, keep store.chat in sync. Delete removes the JSON + refreshes.
@@ -170,7 +175,7 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
         } else if let arr = try? JSONDecoder().decode([Block].self, from: d), !arr.isEmpty {
             c.context = arr          // a bare block array → load as the context
         } else { return }
-        chat = c; screen = .chat; save()
+        chat = c; screen = .chat; save(); activated.send(.seeded)
     }
 }
 
@@ -220,10 +225,25 @@ struct ChatRow: View {
     private func commit() { onRename(name); editing = false }
 }
 
+// Non-publishing dependency container: holds the app's long-lived objects so the App scene can
+// own them via a SINGLE @StateObject without re-rendering per token/keystroke/tick. It has NO
+// @Published members, so it never fires objectWillChange; the three runtimes are still observed by
+// the views that need them, injected below via environmentObject.
+@MainActor final class AppDeps: ObservableObject {
+    let engine: Engine
+    let store: Store
+    let promptLib: PromptLib
+    let session: ChatSession
+    init() {
+        let e = Engine(); let s = Store()
+        engine = e; store = s
+        promptLib = PromptLib()
+        session = ChatSession(engine: e, store: s)
+    }
+}
+
 @main struct CIVMApp: App {
-    @StateObject var engine = Engine()
-    @StateObject var store = Store()
-    @StateObject var promptLib = PromptLib()
+    @StateObject private var deps = AppDeps()
     let memOK: Bool
     init() { NSApplication.shared.setActivationPolicy(.regular); memOK = Mem.enough }
     var body: some Scene {
@@ -237,9 +257,9 @@ struct ChatRow: View {
                             .foregroundStyle(.secondary).multilineTextAlignment(.center)
                     }.padding(40).frame(minWidth: 460, minHeight: 240)
                 } else {
-                    RootView().environmentObject(engine).environmentObject(store).environmentObject(promptLib)
+                    RootView().environmentObject(deps.engine).environmentObject(deps.store).environmentObject(deps.promptLib).environmentObject(deps.session)
                         .onAppear {
-                            engine.start()
+                            deps.engine.start()
                             if !UserDefaults.standard.bool(forKey: "permsRequested") {
                                 UserDefaults.standard.set(true, forKey: "permsRequested")
                                 requestAgentPerms()
@@ -293,13 +313,8 @@ struct BlockStream: View {
 
     // Paste from the clipboard: image → image block, else text → text block. (cmd+V or the button.)
     func paste() {
+        if let blk = clipboardImageBlock() { blocks.append(blk); return }
         let pb = NSPasteboard.general
-        if let img = NSImage(pasteboard: pb), let tiff = img.tiffRepresentation, let (b64, mt) = imageToBase64(tiff) {
-            blocks.append(Block(mediaType: mt, data: b64)); return
-        }
-        for t in [NSPasteboard.PasteboardType.png, .tiff] {
-            if let d = pb.data(forType: t), let (b64, mt) = imageToBase64(d) { blocks.append(Block(mediaType: mt, data: b64)); return }
-        }
         if let s = pb.string(forType: .string), !s.isEmpty { blocks.append(Block(text: s)) }
     }
 
@@ -353,95 +368,65 @@ struct RootView: View {
     @EnvironmentObject var engine: Engine
     @EnvironmentObject var store: Store
     @EnvironmentObject var promptLib: PromptLib
+    @EnvironmentObject var session: ChatSession   // conversation runtime — all behavior lives here
     @AppStorage(SK.sidebarCollapsed) private var sidebarCollapsed = false
     @State private var lastSidebarW: CGFloat = 0   // direction tracking for auto-collapse (shrink-only)
-    @State private var lastReused = 0              // /chat meta "reused" — streaming-prefill proof
-    @State private var prevHadOutput = false       // did the turn we just cancelled produce any text?
     @State private var saveTarget: SaveTarget? = nil     // chat sidebar "Save current as…" sheet
     private let chatBottomID = "civm.chatBottom"          // stable auto-scroll anchor id
-    @State private var caching = false
-    @State private var cacheMsg = ""
-    @State private var cacheProgress: Double = 0      // client-side estimated cache progress (0…1), 0 = hidden
     @State private var editingChatName = false        // chat-screen inline rename
     @State private var chatNameDraft = ""
     @FocusState private var chatNameFocused: Bool
-    @State private var input = ""
-    @State private var busy = false
-    @State private var streaming = ""
     @State private var systemOpen = true
     @State private var contextOpen = true
     @State private var reminderOpen = true
 
     // ---- modes / voice settings (persisted; shared with the Settings sheet) ----
+    // The @AppStorage vars stay purely as render-invalidation triggers; the computed values delegate
+    // to the shared accessors so the fallback logic lives in ONE place (Settings.swift).
     @AppStorage(SK.mode) private var modeRaw = Mode.textText.rawValue
     @AppStorage(SK.submode) private var submodeRaw = Submode.toggle.rawValue
     @AppStorage(SK.transcription) private var transcriptionRaw = Transcription.after.rawValue
     @AppStorage(SK.hotkey) private var hotkey = SK.defaultHotkey
-    // capture shortcuts (screenshot + copy-to-chat) — bindings serialized as engine strings
-    @AppStorage(SK.shotBinding) private var shotBinding = SK.defaultShotBinding
-    @AppStorage(SK.shotStyle) private var shotStyleRaw = SK.defaultShotStyle
-    @AppStorage(SK.copyBinding) private var copyBinding = SK.defaultCopyBinding
-    var mode: Mode { Mode(rawValue: modeRaw) ?? .textText }
-    var submode: Submode { Submode(rawValue: submodeRaw) ?? .toggle }
-    var transcription: Transcription { Transcription(rawValue: transcriptionRaw) ?? .after }
+    var mode: Mode { .from(modeRaw) }
+    var submode: Submode { .from(submodeRaw) }
+    var transcription: Transcription { .from(transcriptionRaw) }
     var hk: String { hotkeySymbols(hotkey) }
 
     @State private var showSettings = false
-    @State private var queuedCaptures: [Block] = []    // voice-mode captures (images + text) attached to the NEXT ask
-    @State private var pastedImages: [Block] = []      // chat-input pasted images (thumbnail bar → ride with the question)
     @State private var pasteMonitor: Any? = nil         // ⌘V image-paste interceptor (see textInputRegion)
     @FocusState private var inputFocused: Bool
     @State private var reminderDraft: [Block] = []     // staged reminder edits; applied to chat.reminder on "Update reminder"
     @State private var reminderConfirm = false
-    // AskPipeline (mode-agnostic): one in-flight turn; interrupts cancel it and stack a new one.
-    @State private var askTask: Task<Void, Never>? = nil
-    // Voice·Text live state (from GET /voice/poll)
-    @State private var voiceState = "idle"
-    @State private var voiceSeq = -1
-    @State private var livePartial = ""
 
-    // engine currently holds a pin for THIS chat (maybe a stale version — that still allows chatting)
-    var pinned: Bool { store.enginePinnedChat == store.chat.id }
-    // …and it's the CURRENT version → Cache greys out
-    var cachedCurrent: Bool { pinned && store.enginePinnedHash == store.chat.contentHash }
-    var contentEmpty: Bool { nonEmpty(store.chat.system).isEmpty && nonEmpty(store.chat.context).isEmpty }
-    var cacheStatus: String {
-        if !cacheMsg.isEmpty { return cacheMsg }
-        if caching { return "caching…" }
-        if contentEmpty { return "nothing to cache — just ask" }
-        if cachedCurrent { return "cached ✓ · \(store.chat.pinnedTokens ?? 0) tok" }
-        return pinned ? "cache changed" : "not cached"
-    }
     var reminderDirty: Bool { reminderDraft != store.chat.reminder }
 
-    // ---- cheap client-side token estimate (recomputed on every edit) — pre-gates Cache ----
-    // Calibration: Sipser seed = 18,474 text chars + 20 images → 14,244 real tokens (≈2.1 chars/tok
-    // on dense technical text). Tuned to slightly OVERestimate — the gate's job is to block BEFORE
-    // the engine errs, so erring high is correct; the engine's exact 200K check stays as backstop.
-    var cacheBlocks: [Block] { nonEmpty(store.chat.system) + nonEmpty(store.chat.context) }
-    var estTokens: Int {
-        let chars = cacheBlocks.reduce(0) { $0 + ($1.type == "text" ? ($1.text?.count ?? 0) : 0) }
-        let images = cacheBlocks.filter { $0.type == "image" }.count
-        return Int((Double(chars) / 2.2).rounded(.up)) + 300 * images
+    // ---- cache status / estimate wording (the view owns the strings; the session owns the state) ----
+    var cacheStatusText: String {
+        switch session.cacheState {
+        case .idle:                return "not cached"
+        case .nothingToCache:      return "nothing to cache — just ask"
+        case .caching:             return "caching…"
+        case .cached(let t):       return "cached ✓ · \(t) tok"
+        case .changed:             return "cache changed"
+        case .overLimit(let t):    return "context is \(t) tok — over the 200K limit"
+        case .failed(let m):       return "cache failed: \(m)"
+        case .notReady:            return "engine not ready yet"
+        }
     }
-    // disable a bit below the real 200K ceiling to leave slack for estimate error (engine overLimit is the backstop)
-    var estOverLimit: Bool { estTokens > 190_000 }
+    var cacheStatusIsError: Bool {
+        switch session.cacheState { case .overLimit, .failed: return true; default: return false }
+    }
     var estLabel: String {
-        if contentEmpty { return "nothing to cache" }
-        let n = estTokens.formatted()
-        return estOverLimit ? "est. ~\(n) tok — over the 200K limit" : "est. ~\(n) tok"
-    }
-    // rough expected cache time (s) for the estimated progress bar — no engine progress endpoint
-    var expectedCacheSeconds: Double {
-        let images = cacheBlocks.filter { $0.type == "image" }.count
-        return Double(estTokens) / 350.0 + Double(images) * 0.7 + 3.0
+        if session.contentEmpty { return "nothing to cache" }
+        let n = session.estTokens.formatted()
+        return session.estOverLimit ? "est. ~\(n) tok — over the 200K limit" : "est. ~\(n) tok"
     }
 
     // "{pinned} pinned + {chat} chat = {total} tok" — from /pin and the last /chat done meta.
     // "⚡N pre-fed" appears after a streamed dictation: N tokens were already in the KV at send.
     var tokenLine: some View {
         let p = store.chat.pinnedTokens ?? 0, c = store.chat.chatTokens
-        return Text("\(p) pinned + \(c) chat = \(p + c) tok\(lastReused > 0 ? "  ·  ⚡\(lastReused) pre-fed while you spoke" : "")")
+        return Text("\(p) pinned + \(c) chat = \(p + c) tok\(session.lastReused > 0 ? "  ·  ⚡\(session.lastReused) pre-fed while you spoke" : "")")
             .font(.caption2).foregroundStyle(.secondary)
     }
 
@@ -450,11 +435,9 @@ struct RootView: View {
             if store.screen == .home { homeBody } else { chatBody }
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
-        // Voice config lifecycle that must outlive the chat screen: launch, engine-ready, and
-        // entering/leaving a chat (voice only enables in a Voice·Text chat — never on home).
-        .onAppear { if engine.ready { postVoiceConfig() } }
-        .onChange(of: engine.ready) { _, r in if r { postVoiceConfig() } }
-        .onChange(of: store.screen) { _, _ in postVoiceConfig() }
+        // Voice-config lifecycle (launch, engine-ready, entering/leaving a chat, settings changes) is
+        // owned by the session itself — it subscribes to engine.ready / store.screen / the SK keys and
+        // re-posts /voice/config on its own. No view-side relays remain.
     }
 
     private var gearButton: some View {
@@ -491,7 +474,7 @@ struct RootView: View {
                 LazyVStack(spacing: 6) {
                     ForEach(store.stubs) { s in
                         ChatRow(stub: s,
-                                onOpen: { if store.open(s.id) { cache() } },   // opening evicts the old KV, re-pins this chat
+                                onOpen: { store.open(s.id) },   // session re-pins on the .opened activation
                                 onRename: { store.rename(s.id, to: $0) },
                                 onDelete: { store.delete(s.id) })
                     }
@@ -529,27 +512,14 @@ struct RootView: View {
                 promptLib.save(SavedPrompt(name: name, kind: t.rawValue, blocks: blocks))
             }
         }
+        // Chat-screen lifecycle: the session owns the voice/capture poll loop, driven by `.task`
+        // (runs on appear, auto-cancels on disappear). Config/context posts and the per-chat reset
+        // are the session's own subscriptions now; the view only tracks its own draft/edit state.
         .onAppear { reminderDraft = store.chat.reminder }
+        .task { await session.pollLoop() }
         .onChange(of: store.chat.id) { _, _ in
-            reminderDraft = store.chat.reminder; voiceSeq = -1; livePartial = ""; queuedCaptures = []
+            reminderDraft = store.chat.reminder
             editingChatName = false
-        }
-        .onChange(of: modeRaw) { _, _ in postVoiceConfig(); if mode == .voiceText { Task { await postVoiceContext() } } }
-        .onChange(of: submodeRaw) { _, _ in postVoiceConfig() }
-        .onChange(of: transcriptionRaw) { _, _ in postVoiceConfig() }
-        .onChange(of: hotkey) { _, _ in postVoiceConfig() }
-        .onChange(of: shotBinding) { _, _ in postVoiceConfig() }
-        .onChange(of: shotStyleRaw) { _, _ in postVoiceConfig() }
-        .onChange(of: copyBinding) { _, _ in postVoiceConfig() }
-        .onChange(of: store.chat.messages.count) { _, _ in if mode == .voiceText { Task { await postVoiceContext() } } }
-        // Poll GET /voice/poll ~10Hz while a chat is open in ANY mode: capture events are delivered in
-        // every mode; voice state (partial/final auto-send) is consumed only in Voice·Text.
-        .task(id: modeRaw) {
-            if mode == .voiceText { await postVoiceContext() }
-            while !Task.isCancelled {
-                if let p = try? await engine.voicePoll() { await handleVoicePoll(p) }
-                try? await Task.sleep(for: .milliseconds(100))
-            }
         }
     }
 
@@ -570,16 +540,16 @@ struct RootView: View {
             pane("CONTEXT", $contextOpen, $store.chat.context, key: "context")
 
             HStack(spacing: 8) {
-                Button(caching ? "Caching…" : "Cache") { cache() }
-                    .disabled(caching || !engine.ready || cachedCurrent || contentEmpty || estOverLimit)
-                if caching || cacheProgress > 0 { cacheProgressBar }
-                Text(cacheStatus).font(.caption).foregroundStyle(cacheStatus.contains("over") || cacheStatus.contains("fail") ? .red : .secondary)
+                Button(session.caching ? "Caching…" : "Cache") { session.cache() }
+                    .disabled(!session.canCache)
+                if session.caching || session.cacheProgress > 0 { cacheProgressBar }
+                Text(cacheStatusText).font(.caption).foregroundStyle(cacheStatusIsError ? .red : .secondary)
                 Spacer()
             }
             HStack(spacing: 6) {
                 Text("cache above").font(.caption2).foregroundStyle(.secondary)
                 Spacer()
-                Text(estLabel).font(.caption2).foregroundStyle(estOverLimit ? .red : .secondary)
+                Text(estLabel).font(.caption2).foregroundStyle(session.estOverLimit ? .red : .secondary)
             }
             Text(engine.status).font(.caption2).foregroundStyle(engine.ready ? .green : .secondary)
 
@@ -588,10 +558,7 @@ struct RootView: View {
             pane("REMINDER — rides with each question, not pinned", $reminderOpen, $reminderDraft, key: "reminder") { reminderMenu }
             if reminderOpen {
                 HStack(spacing: 10) {
-                    Button("Update reminder") {
-                        store.chat.reminder = reminderDraft; store.save(); confirmReminder()
-                        if mode == .voiceText { Task { await postVoiceContext() } }
-                    }
+                    Button("Update reminder") { applyReminder(reminderDraft) }
                         .disabled(!reminderDirty)
                     if reminderConfirm { Text("reminder updated ✓").font(.caption2).foregroundStyle(.green) }
                     else if reminderDirty { Text("edited — not applied").font(.caption2).foregroundStyle(.orange) }
@@ -639,7 +606,7 @@ struct RootView: View {
     var cacheProgressBar: some View {
         ZStack(alignment: .leading) {
             Capsule().fill(Color.secondary.opacity(0.20)).frame(width: 120, height: 4)
-            Capsule().fill(Color.accentColor).frame(width: 120 * max(0, min(cacheProgress, 1)), height: 4)
+            Capsule().fill(Color.accentColor).frame(width: 120 * max(0, min(session.cacheProgress, 1)), height: 4)
         }.frame(width: 120, height: 4)
     }
 
@@ -682,14 +649,14 @@ struct RootView: View {
                         ForEach(store.chat.messages) { m in
                             messageBubble(role: m.role, text: m.text, interrupted: m.interrupted, isInterruption: m.isInterruption, images: m.content)
                         }
-                        if busy { messageBubble(role: "assistant", text: streaming.isEmpty ? "…" : streaming) }
+                        if session.busy { messageBubble(role: "assistant", text: session.streaming.isEmpty ? "…" : session.streaming) }
                         Color.clear.frame(height: 1).id(chatBottomID)      // stable bottom anchor for auto-scroll
                     }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onAppear { scrollDown(proxy, animated: false) }
                 .onChange(of: store.chat.id) { _, _ in scrollDown(proxy, animated: false) }
                 .onChange(of: store.chat.messages.count) { _, _ in scrollDown(proxy) }
-                .onChange(of: streaming.count / 40) { _, _ in scrollDown(proxy, animated: false) }   // throttle: ~every 40 streamed chars
+                .onChange(of: session.streaming.count / 40) { _, _ in scrollDown(proxy, animated: false) }   // throttle: ~every 40 streamed chars
             }
             Divider()
             if mode == .voiceText { voiceInputRegion } else { textInputRegion }
@@ -708,9 +675,7 @@ struct RootView: View {
     // Apply a reminder from the library (or Default) directly: draft + active chat.reminder, then persist.
     func applyReminder(_ blocks: [Block]) {
         reminderDraft = blocks
-        store.chat.reminder = blocks
-        store.save(); confirmReminder()
-        if mode == .voiceText { Task { await postVoiceContext() } }
+        session.commitReminder(blocks); confirmReminder()
     }
 
     // ---- modes bar ----
@@ -761,13 +726,13 @@ struct RootView: View {
     // ---- input regions ----
     var textInputRegion: some View {
         VStack(spacing: 6) {
-            if !pastedImages.isEmpty { thumbnailBar }
+            if !session.pastedImages.isEmpty { thumbnailBar }
             HStack {
-                TextField(pinned ? "ask about the pinned context…" : "ask anything…", text: $input)
-                    .textFieldStyle(.roundedBorder).disabled(!engine.ready).onSubmit { send() }
+                TextField(session.pinned ? "ask about the pinned context…" : "ask anything…", text: $session.input)
+                    .textFieldStyle(.roundedBorder).disabled(!session.canCompose).onSubmit { session.send() }
                     .focused($inputFocused)
-                Button(busy ? "Interrupt & Ask" : "Ask") { send() }
-                    .disabled(!engine.ready || (input.isEmpty && pastedImages.isEmpty))
+                Button(session.busy ? "Interrupt & Ask" : "Ask") { session.send() }
+                    .disabled(!session.canSend)
             }
             tokenLine.frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -793,18 +758,18 @@ struct RootView: View {
 
     var voiceInputRegion: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if !queuedCaptures.isEmpty { queuedStrip }
+            if !session.queuedCaptures.isEmpty { queuedStrip }
             HStack(spacing: 8) {
                 // dot mirrors the screen overlay: ONLY red (listening) / yellow (processing), else gone
                 if let c = voiceDotColor { Circle().fill(c).frame(width: 8, height: 8) }
                 Text(submode == .toggle ? "Press \(hk) to interrupt & talk, again when finished · Esc cancels"
                                         : "Hold \(hk) to talk · Esc cancels")
                     .font(.caption).foregroundStyle(.secondary)
-                if busy { Text("· agent is answering — talk to interrupt").font(.caption2).foregroundStyle(.orange) }
+                if session.busy { Text("· agent is answering — talk to interrupt").font(.caption2).foregroundStyle(.orange) }
             }
             if transcription == .stream {
                 ScrollView {
-                    Text(livePartial.isEmpty ? "…" : livePartial)
+                    Text(session.livePartial.isEmpty ? "…" : session.livePartial)
                         .font(.system(size: 13)).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -818,9 +783,9 @@ struct RootView: View {
     }
 
     var voiceDotColor: Color? {
-        switch voiceState {
-        case "listening": return .red
-        case "processing": return .yellow
+        switch session.voiceState {
+        case .listening: return .red
+        case .processing: return .yellow
         default: return nil            // ready/idle → no dot (matches the screen overlay)
         }
     }
@@ -828,14 +793,14 @@ struct RootView: View {
     var thumbnailBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(pastedImages) { b in
+                ForEach(session.pastedImages) { b in
                     ZStack(alignment: .topTrailing) {
                         if let ns = b.nsImage {
                             Image(nsImage: ns).resizable().scaledToFill().frame(width: 54, height: 54)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.25)))
                         }
-                        Button { pastedImages.removeAll { $0.id == b.id } } label: {
+                        Button { session.removePastedImage(id: b.id) } label: {
                             Image(systemName: "xmark.circle.fill").font(.system(size: 14))
                         }.buttonStyle(.plain).foregroundStyle(.white, .black.opacity(0.55)).padding(2)
                     }
@@ -850,7 +815,7 @@ struct RootView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 Text("attach to next:").font(.caption2).foregroundStyle(.secondary)
-                ForEach(queuedCaptures) { b in
+                ForEach(session.queuedCaptures) { b in
                     ZStack(alignment: .topTrailing) {
                         if b.type == "image", let ns = b.nsImage {
                             Image(nsImage: ns).resizable().scaledToFill().frame(width: 48, height: 48)
@@ -860,7 +825,7 @@ struct RootView: View {
                             Text(b.text ?? "").font(.caption2).lineLimit(2).frame(maxWidth: 140, alignment: .leading)
                                 .padding(6).background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.14)))
                         }
-                        Button { queuedCaptures.removeAll { $0.id == b.id } } label: {
+                        Button { session.removeQueuedCapture(id: b.id) } label: {
                             Image(systemName: "xmark.circle.fill").font(.system(size: 13))
                         }.buttonStyle(.plain).foregroundStyle(.white, .black.opacity(0.55)).padding(1)
                     }
@@ -927,193 +892,14 @@ struct RootView: View {
         }
     }
 
-    func cache() { Task { await pinNow() } }
-    // pin (or re-pin) this chat's system+context into the engine's single KV slot
-    func pinNow() async {
-        guard engine.ready else { cacheMsg = "engine not ready yet"; return }
-        let id = store.chat.id, hash = store.chat.contentHash
-        if contentEmpty {
-            // nothing to pin: reset the engine to its EMPTY baseline (instant — no vision, no prefill)
-            // so a leftover pin from another chat can't leak into this one.
-            await engine.reset()
-            store.chat.pinnedTokens = 0
-            store.enginePinnedChat = id; store.enginePinnedHash = hash
-            return
-        }
-        caching = true; cacheMsg = ""; cacheProgress = 0
-        // estimated progress: fill toward 0.97 over the expected duration while caching (no engine endpoint)
-        let start = Date(); let expected = max(0.5, expectedCacheSeconds)
-        let ticker = Task { @MainActor in
-            while !Task.isCancelled && caching {
-                cacheProgress = min(Date().timeIntervalSince(start) / expected, 0.97)
-                try? await Task.sleep(for: .milliseconds(80))
-            }
-        }
-        let sys = nonEmpty(store.chat.system), ctx = nonEmpty(store.chat.context)
-        do {
-            let (tokens, over) = try await engine.pin(system: sys, context: ctx)
-            if over { cacheMsg = "context is \(tokens) tok — over the 200K limit"; store.chat.pinnedTokens = nil }
-            else {
-                store.chat.pinnedTokens = tokens
-                store.enginePinnedChat = id; store.enginePinnedHash = hash
-                store.save()
-            }
-        } catch { cacheMsg = "cache failed: \(error.localizedDescription)" }
-        caching = false
-        ticker.cancel()
-        if cacheMsg.isEmpty {                       // success → snap full briefly, then hide
-            cacheProgress = 1.0
-            Task { @MainActor in try? await Task.sleep(for: .milliseconds(350)); if !caching { cacheProgress = 0 } }
-        } else {
-            cacheProgress = 0
-        }
-    }
-    // Typed input → AskPipeline. Fires an interruption when busy, a normal ask otherwise.
-    func send() {
-        let q = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        let imgs = pastedImages
-        guard !q.isEmpty || !imgs.isEmpty else { return }
-        input = ""; pastedImages = []
-        ask(text: q, images: imgs)
-    }
-
-    // ------------------------------------------------------------------
-    // AskPipeline — mode-agnostic. Typed input AND voice transcripts flow through here.
-    // History is app-owned: each turn POSTs the whole clean transcript (last 24) + reminder.
-    // Interrupt: if a turn is in flight, cancel it, keep its partial in an assistant bubble
-    // flagged `interrupted`, then append the new user message (amber; engine text prefixed
-    // "@@INTERRUPTION@@: ") and start a fresh turn. Stackable — each interrupt repeats this.
-    // ------------------------------------------------------------------
-    func ask(text: String, images: [Block] = []) {
-        let q = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (!q.isEmpty || !images.isEmpty), engine.ready else { return }
-        let prev = askTask                      // the in-flight turn (if any) that we're interrupting
-        let interrupting = busy
-        askTask = Task { await runTurn(q, images: images, interrupting: interrupting, prev: prev) }
-    }
-
-    private func runTurn(_ q: String, images: [Block], interrupting: Bool, prev: Task<Void, Never>?) async {
-        if interrupting {
-            prevHadOutput = false               // the cancelled turn sets this if it actually produced text
-            prev?.cancel()                      // stop the in-flight /chat …
-            await prev?.value                   // … and let it stash its partial as an interrupted bubble
-        }
-        var um = Msg(role: "user", text: q, content: images)
-        // Only a REAL interruption (the model had said something) gets the amber flag + engine prefix.
-        // Cutting off a turn that never produced a token (e.g. still pinning) is just a normal ask.
-        if interrupting && prevHadOutput { um.isInterruption = true }
-        store.chat.messages.append(um)
-        busy = true; streaming = ""
-        if !pinned { await pinNow() }           // pin on demand (caching first isn't required)
-        do {
-            let meta = try await engine.chat(messages: buildEngineMessages(), reminder: store.chat.reminder) { streaming += $0 }
-            if Task.isCancelled {               // interrupted right as the stream ended
-                stashInterrupted(); return
-            }
-            store.chat.messages.append(Msg(role: "assistant", text: streaming))
-            if let ct = meta["chat_tokens"] as? Int { store.chat.chatTokens = ct }
-            if let pt = meta["pinned"] as? Int, pt > 0 { store.chat.pinnedTokens = pt }
-            lastReused = meta["reused"] as? Int ?? 0   // streaming-prefill proof: tokens already in KV at send
-            streaming = ""; busy = false; store.save()
-        } catch {
-            if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
-                stashInterrupted()              // the interrupting turn keeps busy=true
-            } else {
-                store.chat.messages.append(Msg(role: "assistant", text: "⚠ \(error.localizedDescription)"))
-                streaming = ""; busy = false; store.save()
-            }
-        }
-    }
-
-    // Keep a cancelled turn's partial ONLY if it produced text — no phantom "— interrupted" bubbles.
-    private func stashInterrupted() {
-        prevHadOutput = !streaming.isEmpty
-        if !streaming.isEmpty {
-            store.chat.messages.append(Msg(role: "assistant", text: streaming, interrupted: true))
-        }
-        streaming = ""
-    }
-
-    // The clean transcript for the engine: last 24 messages, images as blocks, interruption prefix added HERE only.
-    func buildEngineMessages() -> [ChatMessage] {
-        store.chat.messages.suffix(24).map { m in
-            var blocks: [Block] = []
-            let t = m.isInterruption ? "@@INTERRUPTION@@: " + m.text : m.text
-            if !t.isEmpty { blocks.append(Block(text: t)) }
-            blocks.append(contentsOf: m.content)
-            return ChatMessage(role: m.role, content: blocks)
-        }
-    }
-
-    // ---- chat-input image paste (⌘V) → thumbnail bar above the input ----
+    // ---- chat-input image paste (⌘V) → the session's pasted-images staging bar ----
+    // (Clipboard intake is a UI concern; it hands finished Blocks to the session, which owns them.)
     func pasteChatImages() {
-        let pb = NSPasteboard.general
-        if let img = NSImage(pasteboard: pb), let tiff = img.tiffRepresentation, let (b64, mt) = imageToBase64(tiff) {
-            pastedImages.append(Block(mediaType: mt, data: b64)); return
-        }
-        for t in [NSPasteboard.PasteboardType.png, .tiff] {
-            if let d = pb.data(forType: t), let (b64, mt) = imageToBase64(d) { pastedImages.append(Block(mediaType: mt, data: b64)); return }
-        }
+        if let blk = clipboardImageBlock() { session.attachPastedImages([blk]) }
     }
 
     func confirmReminder() {
         reminderConfirm = true
         Task { try? await Task.sleep(for: .seconds(2)); reminderConfirm = false }
-    }
-
-    // ---- Voice·Text + capture control channel ----
-    func postVoiceConfig() {
-        // voice chord enables inside a Voice·Text chat only; capture bindings are active whenever a
-        // chat is open in ANY mode — never on the home screen.
-        let inChat = store.screen == .chat
-        Task { await engine.voiceConfig(
-            voiceEnabled: inChat && mode == .voiceText,
-            captureEnabled: inChat,
-            submode: submode.rawValue,
-            streaming: transcription == .stream,
-            key: hotkey,
-            shotBinding: shotBinding, shotStyle: shotStyleRaw, copyBinding: copyBinding) }
-    }
-    func postVoiceContext() async {
-        await engine.voiceContext(messages: buildEngineMessages(), reminder: store.chat.reminder)
-    }
-    func handleVoicePoll(_ p: VoicePoll) async {
-        // capture events arrive in ALL modes — deliver, then ack exactly what we consumed (FIFO).
-        if let caps = p.captures, !caps.isEmpty {
-            deliverCaptures(caps)
-            await engine.voiceCapturesAck(count: caps.count)
-        }
-        guard mode == .voiceText else { return }
-        voiceState = p.state
-        livePartial = p.partial
-        // When a final transcript is ready, auto-send it (interrupts if busy), ack it once by seq.
-        if p.state == "ready", p.seq != voiceSeq,
-           let f = p.final, !f.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            voiceSeq = p.seq
-            let (pre, imgs) = drainQueuedCaptures()   // fold queued screenshots/copies into this turn
-            ask(text: pre.isEmpty ? f : pre + "\n" + f, images: imgs)
-            Task { await engine.voiceAck(seq: p.seq) }
-        }
-    }
-
-    // Deliver captures to the chat as if the user had pasted them. Text mode: images → thumbnail bar,
-    // text → input box. Voice modes: both → the queued strip, attached to the next spoken message.
-    func deliverCaptures(_ caps: [Capture]) {
-        for c in caps {
-            if c.kind == "image", let d = c.data, !d.isEmpty {
-                let blk = Block(mediaType: "image/png", data: d)
-                if mode == .voiceText { queuedCaptures.append(blk) } else { pastedImages.append(blk) }
-            } else if c.kind == "text", let t = c.text, !t.isEmpty {
-                if mode == .voiceText { queuedCaptures.append(Block(text: t)) }
-                else { input += input.isEmpty ? t : " " + t }
-            }
-        }
-    }
-    // Pull queued captures for a voice send: (joined text prefix, image blocks); clears the queue.
-    func drainQueuedCaptures() -> (String, [Block]) {
-        let texts = queuedCaptures.compactMap { $0.type == "text" ? $0.text : nil }.filter { !$0.isEmpty }
-        let imgs = queuedCaptures.filter { $0.type == "image" }
-        queuedCaptures = []
-        return (texts.joined(separator: "\n"), imgs)
     }
 }

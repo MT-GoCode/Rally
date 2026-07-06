@@ -20,3 +20,16 @@ func imageToBase64(_ data: Data) -> (String, String)? {
     guard let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) else { return nil }
     return (jpeg.base64EncodedString(), "image/jpeg")
 }
+
+// Decode the clipboard's image (if any) into a Block: NSImage→tiff first, else the raw png/tiff data.
+// Shared by the BlockStream panes' paste and the chat-input ⌘V image intake.
+func clipboardImageBlock() -> Block? {
+    let pb = NSPasteboard.general
+    if let img = NSImage(pasteboard: pb), let tiff = img.tiffRepresentation, let (b64, mt) = imageToBase64(tiff) {
+        return Block(mediaType: mt, data: b64)
+    }
+    for t in [NSPasteboard.PasteboardType.png, .tiff] {
+        if let d = pb.data(forType: t), let (b64, mt) = imageToBase64(d) { return Block(mediaType: mt, data: b64) }
+    }
+    return nil
+}
