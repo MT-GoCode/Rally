@@ -11,8 +11,13 @@ import Textual
 // The @@APPENDIX@@ split lives in the caller (messageBubble); Appendix below.
 // ---------------------------------------------------------------------------
 
-struct MarkdownText: View {
+// Equatable so SwiftUI skips re-evaluating (and Textual skips re-parsing markdown+math) when `raw`
+// is unchanged. Without this, any parent invalidation — e.g. selecting a different message, which
+// every bubble observes for its highlight ring — re-parses EVERY visible message's CoreText, which
+// beachballed the app when arrow-key navigation was spammed. Used via `.equatable()` at the call site.
+struct MarkdownText: View, Equatable {
     let raw: String
+    nonisolated static func == (a: MarkdownText, b: MarkdownText) -> Bool { a.raw == b.raw }
     var body: some View {
         StructuredText(markdown: raw, syntaxExtensions: [.math])
             .textual.structuredTextStyle(.gitHub)

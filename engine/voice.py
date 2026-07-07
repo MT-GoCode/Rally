@@ -18,7 +18,7 @@ Self-contained, reusable pieces the engine wires together (serve.py owns the sta
 The overlays/tap must be created on the AppKit main thread; parakeet loads on its own voice thread
 AFTER Gemma. All colors per SPEC-voice.md ("Overlay colors").
 """
-import base64, os, subprocess, tempfile, threading, time, wave
+import base64, os, subprocess, sys, tempfile, threading, time, wave
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -92,6 +92,23 @@ def parse_binding(s):
     if kc is None:
         return None
     return ('key', kc, frozenset(parts[:-1]))
+
+
+# modifier-name -> CGEvent flag mask, for the voice modifier-only chord (push-to-talk).
+MOD_MASKS = {
+    'ctrl':  Q.kCGEventFlagMaskControl,
+    'alt':   Q.kCGEventFlagMaskAlternate,
+    'shift': Q.kCGEventFlagMaskShift,
+    'cmd':   Q.kCGEventFlagMaskCommand,
+}
+
+
+def parse_chord_mods(s):
+    """Voice chord string -> the exact set of modifiers to match. 'shift+alt' -> {'shift','alt'};
+    empty/unknown -> the ctrl+alt default. The tap fires the chord only when EXACTLY these modifiers
+    are held (no extras), so e.g. a shift+alt chord won't fire while you Shift-type a capital."""
+    mods = frozenset(p for p in (s or '').strip().lower().split('+') if p in MOD_MASKS)
+    return mods or frozenset({'ctrl', 'alt'})
 
 
 # ---------- overlay: dot bottom-center (wtalk NSPanel pattern) ----------
@@ -178,13 +195,25 @@ class Rec:
         self.device = self._builtin()
 
     def _builtin(self):
+        # Pin the built-in mic so opening the input never flips AirPods A2DP→HFP (muffled call codec).
+        # 1) a device that names itself built-in; 2) otherwise the first NON-Bluetooth input — never
+        # fall through to a Bluetooth/AirPods default. Logs the pick to serve.log for diagnosis.
+        BUILTIN = ('macbook', 'built-in', 'imac', 'mac mini', 'mac studio')
+        BT = ('airpod', 'bluetooth', 'headset', 'headphone', 'wireless', 'beats', 'buds')
         try:
-            for i, d in enumerate(self.sd.query_devices()):
-                if d['max_input_channels'] > 0 and any(
-                        k in d['name'].lower() for k in ('macbook', 'built-in', 'imac')):
-                    return i
+            inputs = [(i, d) for i, d in enumerate(self.sd.query_devices())
+                      if d.get('max_input_channels', 0) > 0]
         except Exception:
-            pass
+            return None
+        for i, d in inputs:
+            if any(k in d['name'].lower() for k in BUILTIN):
+                sys.stderr.write(f"[voice] built-in mic: {d['name']} (#{i})\n"); sys.stderr.flush()
+                return i
+        for i, d in inputs:                                   # avoid AirPods/BT so playback stays A2DP
+            if not any(k in d['name'].lower() for k in BT):
+                sys.stderr.write(f"[voice] mic (non-BT fallback): {d['name']} (#{i})\n"); sys.stderr.flush()
+                return i
+        sys.stderr.write("[voice] WARNING: no non-Bluetooth input found; using system default\n"); sys.stderr.flush()
         return None
 
     def start(self):
@@ -434,10 +463,12 @@ class Tap:
             flags = Q.CGEventGetFlags(event)
 
             # ---- voice modifier chord (passed through; emitted only when voice enabled) ----
+            # EXACTLY the configured modifiers must be held (no extras) — the chord key is user-set
+            # (cfg['chord_mods']); the old code hardcoded ctrl+alt so a changed hotkey never took effect.
             if etype == Q.kCGEventFlagsChanged:
-                chord_now = bool(flags & Q.kCGEventFlagMaskControl) and \
-                    bool(flags & Q.kCGEventFlagMaskAlternate) and \
-                    not bool(flags & Q.kCGEventFlagMaskCommand)
+                want = cfg.get('chord_mods') or ('ctrl', 'alt')
+                chord_now = all(flags & MOD_MASKS[m] for m in want) and \
+                    not any(flags & MOD_MASKS[m] for m in MOD_MASKS if m not in want)
                 if chord_now and not self.chord:
                     self.chord = True
                     if cfg.get('voice'):

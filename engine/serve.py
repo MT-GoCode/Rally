@@ -48,6 +48,10 @@ ACK = "Understood — I have the reference material. Ask me anything."
 MAX_TOKENS = 2048         # SAFETY CEILING ONLY — the model stops at <end_of_turn>. Length is
                           # controlled by REMINDER, not this.
 TEMPERATURE = 0.5
+# MLX buffer-reuse pool cap. UNSET by default → MLX's default (full reuse = fastest decode). Capping the
+# pool trims the generation footprint but costs tok/s (more alloc/free per token), so it's opt-in only:
+# set CIVM_CACHE_LIMIT_GB=<n> if you ever need to trade speed for memory. (Idle already drops via _free_mem.)
+GEN_CACHE_LIMIT_GB = os.environ.get("CIVM_CACHE_LIMIT_GB")
 # ---- REMINDER prompt: rides WITH each question (default when /chat sends reminder=None) ----
 # Gemma-4 uses sliding-window attention (25/30 layers see only the last ~1024 tokens); a reminder
 # appended right after the question sits INSIDE that window, so ALL layers attend to it.
@@ -81,6 +85,10 @@ PRECACHE = {"state": "idle"}               # post-response KV warm-up for the NE
 VLOCK = threading.Lock()
 VOICE = {"enabled": False, "submode": "toggle", "streaming": False, "key": "ctrl+alt",
          "state": "idle", "partial": "", "final": None, "seq": 0, "perm": True}
+# Intended listening state, driven by chord events and decoupled from VOICE["state"] (which lags because
+# start/stop are QUEUED and applied by the voice thread). Gating stop on the lagging state dropped the
+# stop on a fast press+release → stuck "listening". Touched only on the single tap-drain thread.
+VOICE_WANT = {"on": False}
 
 # ---- capture shortcuts (screenshot + copy-to-chat); config guarded by VLOCK ----
 # The tap is active whenever a chat is open in ANY mode (voice OR capture enabled). "enabled" here
@@ -91,7 +99,7 @@ CAPTURES = []            # pending capture events for the app: {kind:"image",dat
 CAP_LOCK = threading.Lock()
 # TAP_CFG: lock-free snapshot the tap callback reads (refreshed by the main-thread timer under VLOCK;
 # both callback and timer run on the main thread, so no lock is needed on the read side).
-TAP_CFG = {"voice": False, "capture": False, "shot": None, "copy": None}
+TAP_CFG = {"voice": False, "capture": False, "shot": None, "copy": None, "chord_mods": None}
 # SHOT: press&hold drag state — touched ONLY on the main thread (timer + tap-event application).
 SHOT = {"armed": False, "anchor": (0.0, 0.0), "shown": False}
 
@@ -113,6 +121,14 @@ def _free_mem():
 
 def load_model():
     global model, processor, config
+    # Only cap MLX's buffer-reuse pool if explicitly asked (CIVM_CACHE_LIMIT_GB). Default = MLX's full
+    # reuse pool → fastest decode. Capping trims footprint but slows tok/s, so it's off unless requested.
+    if GEN_CACHE_LIMIT_GB:
+        try:
+            _set = getattr(mx, "set_cache_limit", None) or getattr(getattr(mx, "metal", None), "set_cache_limit", None)
+            if _set: _set(int(float(GEN_CACHE_LIMIT_GB) * 1024**3))
+        except Exception:
+            pass
     log(f"loading {MODEL_PATH} …")
     model, processor = load(MODEL_PATH)
     config = model.config
@@ -666,6 +682,7 @@ def voice_processing():
 
 
 def voice_cancel():
+    VOICE_WANT["on"] = False        # keep intent in sync with the forced-idle so the next chord starts clean
     with VLOCK:
         VOICE["state"] = "idle"
         VOICE["partial"] = ""
@@ -894,6 +911,7 @@ class H(BaseHTTPRequestHandler):
                     VOICE["streaming"] = bool(d.get("streaming", VOICE["streaming"]))
                     VOICE["key"] = d.get("key", VOICE["key"])
                     if not VOICE["enabled"]:
+                        VOICE_WANT["on"] = False    # voice turned off → clear intent so re-enable starts clean
                         VOICE["state"] = "idle"; VOICE["partial"] = ""; VOICE["final"] = None
                     CAPTURE["enabled"] = bool(d.get("captureEnabled", CAPTURE["enabled"]))
                     shot = d.get("shot") or {}
@@ -1070,6 +1088,7 @@ def _drain_tap_and_overlay(overlay, sel, tap, flash):
         TAP_CFG["capture"] = CAPTURE["enabled"]
         TAP_CFG["shot"] = CAPTURE["shot_parsed"]
         TAP_CFG["copy"] = CAPTURE["copy_parsed"]
+        TAP_CFG["chord_mods"] = V.parse_chord_mods(VOICE["key"])   # user-set dictation chord (was hardcoded ctrl+alt)
 
     # drain raw physical events -> apply submode / capture-style / state semantics
     while True:
@@ -1118,20 +1137,23 @@ def _apply_tap_event(ev):
         submode = VOICE["submode"]
         streaming = VOICE["streaming"]
     if ev == "esc":
-        if state in ("listening", "processing"):
+        if VOICE_WANT["on"] or state in ("listening", "processing"):
+            VOICE_WANT["on"] = False
             VOICE_Q.put(("cancel",))
         return
     if submode == "toggle":
-        if ev == "chord_down":
-            if state == "listening":
-                VOICE_Q.put(("stop",))
-            elif state in ("idle", "ready"):
-                VOICE_Q.put(("start", streaming))
-        # chord_up ignored in toggle
-    else:  # hold
-        if ev == "chord_down" and state in ("idle", "ready"):
+        # a COMPLETE press+release (chord_up) toggles listening on/off — "start when both keys pressed
+        # and released, and again to stop". chord_down is ignored so it doesn't fire mid-press.
+        if ev == "chord_up":
+            VOICE_WANT["on"] = not VOICE_WANT["on"]
+            VOICE_Q.put(("start", streaming) if VOICE_WANT["on"] else ("stop",))
+    else:  # hold: listen only WHILE the chord is held. Gate on intent, not the lagging state, so a fast
+           # press+release still queues both start and stop (FIFO → no stuck "listening").
+        if ev == "chord_down" and not VOICE_WANT["on"]:
+            VOICE_WANT["on"] = True
             VOICE_Q.put(("start", streaming))
-        elif ev == "chord_up" and state == "listening":
+        elif ev == "chord_up" and VOICE_WANT["on"]:
+            VOICE_WANT["on"] = False
             VOICE_Q.put(("stop",))
 
 

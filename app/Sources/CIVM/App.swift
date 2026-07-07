@@ -43,17 +43,54 @@ struct Msg: Codable, Identifiable, Equatable {
     }
 }
 
-// Editable "reminder" sent AFTER each question (in the 1024-tok sliding window → all layers see it).
-// It is NOT pinned and NOT stored in the transcript, so editing it is free (no re-cache).
-let defaultReminderText = """
-——— REMINDER (obey this absolutely, over everything above) ———
-Your name is Rally. You talk like a sharp, real human in live conversation — NEVER like an assistant writing an essay.
-BREVITY IS LAW. Answer in the fewest possible words. If one word answers it (Yes / No / a name / a number), say ONE word. If one sentence answers it, ONE sentence. Two sentences is the normal maximum. No exceptions unless I explicitly ask you to go deep or produce an artifact.
-High signal only: no preamble, no restating my question, no hedging, no filler, no "great question", no lists unless I ask.
-Use EVERYTHING you know — your training knowledge AND the context above — whichever answers best.
-Be helpful and sharp. If I'm wrong, say so plainly. Minimal.
-This REMINDER is silent stage direction: NEVER respond to it, mention it, or acknowledge it. Respond ONLY to my message above, as if the reminder were invisible.
-"""
+// Per-chat settings: SNAPSHOTTED from the DEFAULTS store (SK.*) when a chat is CREATED, then owned by
+// that chat. Editing them in the chat UI changes only THIS chat; editing the defaults in Settings
+// changes only FUTURE new chats. Lenient-decoded, so chats saved by older builds (no settings key)
+// open with the factory values below. Hotkey + capture bindings are NOT here — those are process-global.
+struct ChatSettings: Codable, Equatable {
+    var agentOutput = AgentOutput.text.rawValue
+    var reminderMode = ReminderMode.start.rawValue
+    var voiceInput = true
+    var submode = Submode.hold.rawValue
+    var autoSend = AutoSend.ifAlone.rawValue
+    var muteDictation = true
+    var transcription = Transcription.after.rawValue
+    var speechLocale = "en-US"
+
+    init() {}
+    enum CodingKeys: String, CodingKey { case agentOutput, reminderMode, voiceInput, submode, autoSend, muteDictation, transcription, speechLocale }
+    init(from d: Decoder) throws {   // per-field lenient: a new field added later won't wipe saved settings
+        let c = try d.container(keyedBy: CodingKeys.self)
+        if let v = try? c.decode(String.self, forKey: .agentOutput)   { agentOutput = v }
+        if let v = try? c.decode(String.self, forKey: .reminderMode)  { reminderMode = v }
+        if let v = try? c.decode(Bool.self,   forKey: .voiceInput)    { voiceInput = v }
+        if let v = try? c.decode(String.self, forKey: .submode)       { submode = v }
+        if let v = try? c.decode(String.self, forKey: .autoSend)      { autoSend = v }
+        if let v = try? c.decode(Bool.self,   forKey: .muteDictation) { muteDictation = v }
+        if let v = try? c.decode(String.self, forKey: .transcription) { transcription = v }
+        if let v = try? c.decode(String.self, forKey: .speechLocale)  { speechLocale = v }
+    }
+
+    var agentOutputV: AgentOutput   { AgentOutput(rawValue: agentOutput) ?? .text }
+    var reminderModeV: ReminderMode { ReminderMode(rawValue: reminderMode) ?? .start }
+    var submodeV: Submode           { Submode(rawValue: submode) ?? .hold }
+    var autoSendV: AutoSend         { AutoSend(rawValue: autoSend) ?? .ifAlone }
+    var transcriptionV: Transcription { Transcription(rawValue: transcription) ?? .after }
+
+    // Snapshot the current DEFAULTS store (SK.*) — used when a NEW chat is created.
+    static func fromDefaults() -> ChatSettings {
+        var s = ChatSettings()
+        s.agentOutput = AgentOutput.current.rawValue
+        s.reminderMode = ReminderMode.current.rawValue
+        s.voiceInput = SK.voiceInputOn
+        s.submode = Submode.current.rawValue
+        s.autoSend = AutoSend.current.rawValue
+        s.muteDictation = SK.muteDictationOn
+        s.transcription = Transcription.current.rawValue
+        s.speechLocale = SK.speechLocaleValue
+        return s
+    }
+}
 
 // A chat = an ordered content-block SYSTEM prompt + an ordered content-block CONTEXT
 // (text + images interleaved, exactly the shape the engine pins), plus the transcript.
@@ -65,12 +102,13 @@ struct Chat: Codable, Identifiable, Equatable {
     var messages: [Msg] = []
     var pinnedTokens: Int? = nil
     var chatTokens: Int = 0                                     // last /chat done meta chat_tokens (history+q+reminder+answer)
-    var reminder: [Block] = [Block(text: defaultReminderText)]  // text+image, sent after every question; not pinned
+    var reminder: [Block] = [Block(text: "")]                   // text+image, sent after every question; not pinned. blank by default
+    var settings = ChatSettings()                              // per-chat input/output settings (snapshotted from defaults on create)
 
     init(name: String = "New chat") { self.name = name }
     // Lenient decode: every field falls back to its default, so chats saved by OLDER builds
-    // (no reminder key, or reminder-as-String, no chatTokens) still open instead of silently failing.
-    enum CodingKeys: String, CodingKey { case id, name, system, context, messages, pinnedTokens, chatTokens, reminder }
+    // (no reminder key, or reminder-as-String, no chatTokens, no settings) still open instead of failing.
+    enum CodingKeys: String, CodingKey { case id, name, system, context, messages, pinnedTokens, chatTokens, reminder, settings }
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
         id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
@@ -82,6 +120,7 @@ struct Chat: Codable, Identifiable, Equatable {
         chatTokens = (try? c.decode(Int.self, forKey: .chatTokens)) ?? 0
         if let b = try? c.decode([Block].self, forKey: .reminder) { reminder = b }
         else if let s = try? c.decode(String.self, forKey: .reminder) { reminder = [Block(text: s)] }  // legacy String
+        settings = (try? c.decode(ChatSettings.self, forKey: .settings)) ?? ChatSettings()
     }
 
     // cheap fingerprint of what Cache would pin — drives the "cache unchanged → grey" logic
@@ -142,7 +181,12 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
         chat = c; screen = .chat; activated.send(.opened)
     }
     func goHome() { save(); refreshStubs(); screen = .home }
-    func startNew() { chat = Chat(); screen = .chat; activated.send(.created) }
+    func startNew() {
+        var c = Chat()
+        c.settings = .fromDefaults()          // snapshot the current DEFAULTS store into the new chat
+        chat = c; screen = .chat; activated.send(.created)
+        // default system/reminder prompts (if set) are filled by RootView.newChat, which has the prompt lib
+    }
 
     // Names are USER-SET ONLY (never auto-named from content). Rename rewrites the saved chat's name
     // in place; if it's the open chat, keep store.chat in sync. Delete removes the JSON + refreshes.
@@ -160,24 +204,6 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
     func delete(_ id: UUID) {
         try? FileManager.default.removeItem(at: dir.appendingPathComponent("\(id).json"))
         refreshStubs()
-    }
-
-    func loadSipserSeed() {
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("code/contextualized_instant_voice_models/seed/sipser.json")
-        if let d = try? Data(contentsOf: url) { loadData(d, name: "Sipser lecture") }
-    }
-
-    private func loadData(_ d: Data, name: String) {
-        var c = Chat(name: name)
-        if let j = try? JSONDecoder().decode([String: [Block]].self, from: d) {
-            if let s = j["system"], !s.isEmpty { c.system = s }
-            if let ctx = j["context"], !ctx.isEmpty { c.context = ctx }
-            if let r = j["reminder"], !r.isEmpty { c.reminder = r }
-        } else if let arr = try? JSONDecoder().decode([Block].self, from: d), !arr.isEmpty {
-            c.context = arr          // a bare block array → load as the context
-        } else { return }
-        chat = c; screen = .chat; save(); activated.send(.seeded)
     }
 }
 
@@ -247,7 +273,15 @@ struct ChatRow: View {
 @main struct CIVMApp: App {
     @StateObject private var deps = AppDeps()
     let memOK: Bool
-    init() { NSApplication.shared.setActivationPolicy(.regular); memOK = Mem.enough }
+    init() {
+        NSApplication.shared.setActivationPolicy(.regular)
+        // Disable the press-and-hold accent popup (ś š ș…) so held keys repeat like a normal text
+        // editor — a chat input shouldn't pop the accent menu when you rest on a key. `register` only
+        // seeds the lowest-priority domain, so a value in NSGlobalDomain overrides it (which is why it
+        // kept coming back). `set` writes the app domain, which wins over global — force it off.
+        UserDefaults.standard.set(false, forKey: "ApplePressAndHoldEnabled")
+        memOK = Mem.enough
+    }
     var body: some Scene {
         WindowGroup("Rally") {
             Group {
@@ -266,7 +300,7 @@ struct ChatRow: View {
                                 UserDefaults.standard.set(true, forKey: "permsRequested")
                                 requestAgentPerms()
                             }
-                        }.frame(minWidth: 1040, minHeight: 680)
+                        }.frame(minWidth: 260, minHeight: 200)   // shrinks to a thin sliver (collapse the sidebar for the narrowest)
                 }
             }
         }
@@ -399,23 +433,22 @@ struct RootView: View {
     @State private var systemOpen = true
     @State private var contextOpen = true
     @State private var reminderOpen = true
-    @State private var sourceShown: Set<UUID> = []   // messages flipped to raw-markdown (selectable) source view
 
-    // ---- modes / voice settings (persisted; shared with the Settings sheet) ----
-    // The @AppStorage vars stay purely as render-invalidation triggers; the computed values delegate
-    // to the shared accessors so the fallback logic lives in ONE place (Settings.swift).
-    @AppStorage(SK.mode) private var modeRaw = Mode.textText.rawValue
-    @AppStorage(SK.submode) private var submodeRaw = Submode.toggle.rawValue
-    @AppStorage(SK.transcription) private var transcriptionRaw = Transcription.after.rawValue
+    // ---- input / voice settings ----
+    // These are now PER-CHAT: they live on the open chat (store.chat.settings) and the chat UI writes
+    // them via ChatSession setters (which save + re-post engine config). The Settings sheet edits the
+    // separate DEFAULTS store (SK.*), consulted only when a new chat is created. Only the hotkey +
+    // capture bindings are process-global (they drive the one CGEventTap), so hotkey stays @AppStorage.
     @AppStorage(SK.hotkey) private var hotkey = SK.defaultHotkey
-    @AppStorage(SK.reminderMode) private var reminderModeRaw = SK.defaultReminderMode
-    var mode: Mode { .from(modeRaw) }
-    var submode: Submode { .from(submodeRaw) }
-    var transcription: Transcription { .from(transcriptionRaw) }
+    var cs: ChatSettings { store.chat.settings }         // the open chat's live settings (read by the input UI)
+    var submode: Submode { cs.submodeV }
+    var transcription: Transcription { cs.transcriptionV }
     var hk: String { hotkeySymbols(hotkey) }
 
+    @State private var inputOptsOpen = false            // "Your Input" sub-options popover
+    @State private var speechLocales: [String] = []     // Apple streaming locales (loaded lazily for the popover)
     @State private var showSettings = false
-    @State private var pasteMonitor: Any? = nil         // ⌘V image-paste interceptor (see textInputRegion)
+    @State private var pasteMonitor: Any? = nil         // ⌘V image-paste interceptor (see inputRegion)
     @FocusState private var inputFocused: Bool
     @State private var reminderDraft: [Block] = []     // staged reminder edits; applied to chat.reminder on "Update reminder"
     @State private var reminderConfirm = false
@@ -453,20 +486,28 @@ struct RootView: View {
         Menu {
             ForEach(ReminderMode.allCases, id: \.self) { m in
                 Button {
-                    reminderModeRaw = m.rawValue
                     session.setReminderMode(m)
                 } label: {
-                    if ReminderMode(rawValue: reminderModeRaw) == m { Label(m.label, systemImage: "checkmark") }
+                    if cs.reminderModeV == m { Label(m.label, systemImage: "checkmark") }
                     else { Text(m.label) }
                 }
             }
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: "text.insert").font(.system(size: 9))
-                Text("reminder: \(ReminderMode(rawValue: reminderModeRaw)?.label ?? "")").font(.caption2)
+                Text("reminder: \(cs.reminderModeV.label)").font(.caption2)
             }.foregroundStyle(.secondary)
         }
         .menuStyle(.borderlessButton).fixedSize().menuIndicator(.hidden)
+    }
+
+    // Shared chrome for BOTH input modes (text·text and voice·text): the token/cache breakdown line
+    // plus the reminder-placement switch. Text and voice differ ONLY in the input widget above this.
+    var chatMetaBar: some View {
+        HStack(alignment: .bottom) {
+            tokenLine.frame(maxWidth: .infinity, alignment: .leading)
+            reminderModeControl
+        }
     }
 
     var tokenLine: some View {
@@ -488,7 +529,7 @@ struct RootView: View {
         Group {
             if store.screen == .home { homeBody } else { chatBody }
         }
-        .sheet(isPresented: $showSettings) { SettingsView() }
+        .sheet(isPresented: $showSettings) { SettingsView().environmentObject(promptLib) }
         // Voice-config lifecycle (launch, engine-ready, entering/leaving a chat, settings changes) is
         // owned by the session itself — it subscribes to engine.ready / store.screen / the SK keys and
         // re-posts /voice/config on its own. No view-side relays remain.
@@ -520,7 +561,7 @@ struct RootView: View {
                         .font(.caption).foregroundStyle(engine.parakeet ? .primary : .secondary)
                 }
                 HStack {
-                    Button("＋ New chat") { store.startNew() }   // chat-able immediately (engine holds an empty baseline; first ask resets the pin)
+                    Button("＋ New chat") { newChat() }   // chat-able immediately (engine holds an empty baseline; first ask resets the pin)
                     Button("Grant agent permissions…") { requestAgentPerms() }.font(.caption)
                 }
                 Text("CHATS").font(.caption.bold()).foregroundStyle(.secondary).padding(.top, 8)
@@ -545,7 +586,7 @@ struct RootView: View {
         HSplitView {
             if !sidebarCollapsed {
                 sidebar
-                    .frame(minWidth: 240, idealWidth: 480)
+                    .frame(minWidth: 200, idealWidth: 480)
                     // Auto-collapse ONLY while the user is shrinking the pane (w decreasing through
                     // ~280pt). Reopen inserts the pane small and grows it — growth must never
                     // re-trigger collapse (that was the reopen "bounce" glitch). No withAnimation
@@ -558,7 +599,7 @@ struct RootView: View {
                     })
             }
             chatPane
-                .frame(minWidth: 520)
+                .frame(minWidth: 240)
         }
         .sheet(item: $saveTarget) { t in
             SavePromptSheet(kind: t.rawValue) { name in
@@ -585,7 +626,6 @@ struct RootView: View {
                     Image(systemName: "sidebar.left")
                 }.help("Collapse sidebar")
                 Button("⌂ Home") { store.goHome() }
-                Button("Load Sipser seed") { store.loadSipserSeed() }
                 Spacer()
                 gearButton
             }
@@ -675,10 +715,10 @@ struct RootView: View {
         }.menuStyle(.borderlessButton).font(.caption2).fixedSize()
     }
 
-    // REMINDER pane header menu — Default + saved reminders apply DIRECTLY; plus save-current. (Replaces the old reset button.)
+    // REMINDER pane header menu — saved reminders apply DIRECTLY; plus save-current, and clear.
     var reminderMenu: some View {
         Menu("Load") {
-            Button("Default") { applyReminder([Block(text: defaultReminderText)]) }
+            Button("Clear (no reminder)") { applyReminder([Block(text: "")]) }
             let rems = promptLib.prompts.filter { $0.kind == "reminder" }
             if !rems.isEmpty {
                 Divider()
@@ -694,7 +734,7 @@ struct RootView: View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 if sidebarCollapsed { reopenTab }   // reopen handle sits where the sidebar's collapse button was
-                modesBar
+                inputOutputBar
             }
             Divider()
             ScrollViewReader { proxy in
@@ -711,10 +751,40 @@ struct RootView: View {
                 .onChange(of: store.chat.id) { _, _ in scrollDown(proxy, animated: false) }
                 .onChange(of: store.chat.messages.count) { _, _ in scrollDown(proxy) }
                 .onChange(of: session.streaming.count / 40) { _, _ in scrollDown(proxy, animated: false) }   // throttle: ~every 40 streamed chars
+                .onChange(of: session.selectedMessageID) { _, id in   // keep the keyboard-selected reply on screen
+                    if let id { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) } }
+                }
                 .overlay(alignment: .bottomTrailing) { precacheChip.padding(10) }
             }
             Divider()
-            if mode == .voiceText { voiceInputRegion } else { textInputRegion }
+            inputRegion
+        }
+        // Keyboard nav + focus mirroring live at the chat-pane level so ↑/↓/space/s/c/r work regardless
+        // of whether the user is typing or dictating (there is now ONE input region for both).
+        // Monitor lifetime is the whole chat screen.
+        .onChange(of: inputFocused) { _, f in session.inputIsFocused = f; if f { session.clearSelection() } }
+        .onChange(of: session.inputFocusToken) { _, _ in inputFocused = true }
+        .onChange(of: session.selectedMessageID) { _, id in if id != nil { inputFocused = false } }
+        .onAppear {
+            guard pasteMonitor == nil else { return }
+            pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in keyMonitor(e) }
+        }
+        .onDisappear { if let m = pasteMonitor { NSEvent.removeMonitor(m); pasteMonitor = nil } }
+        .overlay(alignment: .top) { copiedToast }
+    }
+
+    // Transient "Copied" confirmation — shown briefly after any copy (C shortcut, ⋯ Copy, right-click).
+    @ViewBuilder var copiedToast: some View {
+        if session.justCopied {
+            HStack(spacing: 5) {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                Text("Copied").font(.caption.weight(.medium))
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().stroke(.secondary.opacity(0.2)))
+            .padding(.top, 8)
+            .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
 
@@ -745,127 +815,222 @@ struct RootView: View {
     func freshCopy(_ blocks: [Block]) -> [Block] {
         blocks.map { $0.type == "image" ? Block(mediaType: $0.mediaType ?? "image/png", data: $0.data ?? "") : Block(text: $0.text ?? "") }
     }
+
+    // New chat: snapshot the defaults (done in store.startNew) + fill the chosen DEFAULT system/reminder
+    // prompts from the library. A deleted default prompt just resolves to nil → that pane stays blank.
+    func newChat() {
+        store.startNew()
+        if let sys = defaultPrompt(SK.defaultSystemPrompt, kind: "system") { store.chat.system = freshCopy(sys.blocks) }
+        if let rem = defaultPrompt(SK.defaultReminderPrompt, kind: "reminder") { store.chat.reminder = freshCopy(rem.blocks) }
+    }
+    func defaultPrompt(_ key: String, kind: String) -> SavedPrompt? {
+        guard let idS = UserDefaults.standard.string(forKey: key), let id = UUID(uuidString: idS) else { return nil }
+        return promptLib.prompts.first { $0.id == id && $0.kind == kind }
+    }
     // Apply a reminder from the library (or Default) directly: draft + active chat.reminder, then persist.
     func applyReminder(_ blocks: [Block]) {
         reminderDraft = blocks
         session.commitReminder(blocks); confirmReminder()
     }
 
-    // ---- modes bar ----
-    @ViewBuilder var modesBar: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text("YOUR INPUT · AGENT OUTPUT").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
-            HStack(spacing: 6) {
-                modeButton(.textText, "Text · Text", caption: nil, enabled: true)
-                modeButton(.textVoice, "Text · Voice", caption: "(Coming Soon)", enabled: false)
-                modeButton(.voiceText, "Voice · Text", caption: nil, enabled: true)
-                modeButton(.voiceVoice, "Voice · Voice", caption: "(Coming Soon)", enabled: false)
+    // ---- input / output bar (replaces the old 4-way mode tabs) ----
+    // TWO halves: YOUR INPUT (one hybrid box — a voice toggle arms the ⌃⌥ chord on top of typing, with
+    // a ⋯ popover for submode / auto-send / mute) and AGENT OUTPUT (Text; Voice coming soon).
+    @ViewBuilder var inputOutputBar: some View {
+        HStack(alignment: .top, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("YOUR INPUT").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
+                HStack(spacing: 8) {
+                    Toggle(isOn: Binding(get: { cs.voiceInput }, set: { session.setVoiceInput($0) })) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "mic.fill").font(.system(size: 10))
+                            Text("Voice").font(.caption.weight(.semibold))
+                        }
+                    }.toggleStyle(.switch).controlSize(.mini)
+                    Button { inputOptsOpen.toggle() } label: {
+                        Image(systemName: "ellipsis.circle").font(.system(size: 13))
+                    }.buttonStyle(.plain).foregroundStyle(.secondary)
+                    .popover(isPresented: $inputOptsOpen, arrowEdge: .bottom) { inputOptionsPopover }
+                    if cs.voiceInput {
+                        Text(submode == .toggle ? "press \(hk) to talk" : "hold \(hk) to talk")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
             }
-            if mode == .voiceText { submodeMenu }
+            Divider().frame(height: 30)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("AGENT OUTPUT").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
+                Picker("", selection: Binding(get: { cs.agentOutputV },
+                                              set: { if !$0.comingSoon { session.setAgentOutput($0) } })) {
+                    ForEach(AgentOutput.allCases, id: \.self) { o in
+                        Text(o.comingSoon ? "\(o.label) (soon)" : o.label).tag(o)
+                    }
+                }.pickerStyle(.segmented).labelsHidden().controlSize(.small).frame(width: 150)
+            }
+            Spacer()
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
-    func modeButton(_ m: Mode, _ title: String, caption: String?, enabled: Bool) -> some View {
-        let on = mode == m
-        return Button { if enabled { modeRaw = m.rawValue } } label: {
-            VStack(spacing: 1) {
-                Text(title).font(.caption.weight(.semibold))
-                if let caption { Text(caption).font(.system(size: 8)) }
+    // The "Your Input" sub-options: dictation submode, what a finished dictation does, and mute-while-talking.
+    var inputOptionsPopover: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("DICTATION").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
+                Picker("", selection: Binding(get: { submode }, set: { if $0 != .vad { session.setSubmode($0) } })) {
+                    Text("Press \(hk) to interrupt & talk, again when finished").tag(Submode.toggle)
+                    Text("Hold \(hk) to talk").tag(Submode.hold)
+                    Text("VAD (coming soon)").tag(Submode.vad)
+                }.pickerStyle(.radioGroup).labelsHidden().disabled(!cs.voiceInput)
             }
-            .foregroundStyle(on ? Color.accentColor : (enabled ? .primary : .secondary))
-            .padding(.vertical, 5).padding(.horizontal, 8).frame(maxWidth: .infinity)
-            .background(RoundedRectangle(cornerRadius: 7).fill(on ? Color.accentColor.opacity(0.18) : Color.gray.opacity(0.10)))
-            .overlay(RoundedRectangle(cornerRadius: 7).stroke(on ? Color.accentColor.opacity(0.6) : .clear, lineWidth: 1))
-            .contentShape(Rectangle())
+            VStack(alignment: .leading, spacing: 4) {
+                Text("AUTO-SEND WHEN DICTATION ENDS").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
+                Picker("", selection: Binding(get: { cs.autoSendV }, set: { session.setAutoSend($0) })) {
+                    ForEach(AutoSend.allCases, id: \.self) { Text($0.label).tag($0) }
+                }.pickerStyle(.radioGroup).labelsHidden()
+                Text(cs.autoSendV.blurb)
+                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Toggle("Mute system audio while dictating", isOn: Binding(get: { cs.muteDictation }, set: { session.setMuteDictation($0) })).controlSize(.small)
+            Divider()
+            VStack(alignment: .leading, spacing: 4) {
+                Text("TRANSCRIPTION").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
+                Picker("", selection: Binding(get: { cs.transcriptionV }, set: { session.setTranscription($0) })) {
+                    Text("Transcribe after finished — Parakeet, most accurate").tag(Transcription.after)
+                    Text("Streaming — Apple on-device, live as you speak").tag(Transcription.stream)
+                }.pickerStyle(.radioGroup).labelsHidden().disabled(!cs.voiceInput)
+                HStack(spacing: 6) {
+                    Text("Streaming language").font(.caption2).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(get: { cs.speechLocale }, set: { session.setSpeechLocale($0) })) {
+                        ForEach(speechLocales, id: \.self) { Text($0).tag($0) }
+                    }.labelsHidden().pickerStyle(.menu).frame(width: 120)
+                    .disabled(!cs.voiceInput || cs.transcriptionV != .stream)
+                }
+            }
         }
-        .buttonStyle(.plain).disabled(!enabled).opacity(enabled ? 1 : 0.55)
+        .padding(14).frame(width: 320)
+        .task {
+            var locs = await AppleSpeech.supportedLocaleIDs()
+            if !locs.contains(cs.speechLocale) { locs.insert(cs.speechLocale, at: 0) }
+            speechLocales = locs
+        }
     }
 
-    var submodeMenu: some View {
-        Menu {
-            Button((submode == .toggle ? "✓ " : "") + "press \(hk) to interrupt & talk, again when finished") { submodeRaw = Submode.toggle.rawValue }
-            Button((submode == .hold ? "✓ " : "") + "hold \(hk) to talk") { submodeRaw = Submode.hold.rawValue }
-            Button("VAD (Coming Soon)") {}.disabled(true)
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "waveform").font(.system(size: 10))
-                Text(submode == .toggle ? "press \(hk) to interrupt & talk, again when finished" : "hold \(hk) to talk").font(.caption)
-                Image(systemName: "chevron.down").font(.system(size: 8))
-            }.foregroundStyle(.secondary)
-        }.menuStyle(.borderlessButton).fixedSize()
-    }
-
-    // ---- input regions ----
-    var textInputRegion: some View {
+    // ---- input region (ONE hybrid box: type, or dictate at the caret when voice is armed) ----
+    var inputRegion: some View {
         VStack(spacing: 6) {
             if !session.pastedImages.isEmpty { thumbnailBar }
+            // Voice adornments: status dot + (while dictating) the live streaming partial preview.
+            if cs.voiceInput {
+                HStack(spacing: 6) {
+                    if let c = voiceDotColor { Circle().fill(c).frame(width: 7, height: 7) }
+                    if session.dictating {
+                        Text(submode == .toggle ? "listening — press \(hk) again to insert" : "listening — release \(hk) to insert")
+                            .font(.caption2).foregroundStyle(.red)
+                    } else if session.busy {
+                        Text("· talk to interrupt").font(.caption2).foregroundStyle(.orange)
+                    }
+                    Spacer()
+                }
+                if session.dictating, transcription == .stream, !session.livePartial.isEmpty {
+                    ScrollView {
+                        Text(session.livePartial).font(.system(size: 12)).foregroundStyle(.secondary).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 60).padding(6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.08)))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.2)))
+                }
+            }
             HStack(alignment: .bottom) {
-                // Multi-line: vertical axis grows 1…6 lines. Enter sends; Shift+Enter inserts a newline
-                // (handled in the keyDown monitor below, since a vertical TextField makes Return a newline).
-                TextField(session.pinned ? "ask about the pinned context…" : "ask anything…",
+                // Multi-line: vertical axis grows 1…14 lines. Enter sends; Shift+Enter inserts a newline
+                // (handled in the keyDown monitor, since a vertical TextField makes Return a newline).
+                // Locked (uneditable) while dictating — the transcript lands at the caret on completion.
+                TextField(inputFocused ? (session.pinned ? "ask about the pinned context…" : "ask anything…")
+                                       : (cs.voiceInput ? "press Space to type · \(submode == .toggle ? "press" : "hold") \(hk) to talk"
+                                                        : "press Space to type…"),
                           text: $session.input, axis: .vertical)
                     .textFieldStyle(.roundedBorder).lineLimit(1...14)   // grows to 14 lines, then scrolls
-                    .disabled(!session.canCompose)
+                    .disabled(!session.canCompose || session.dictating)
                     .focused($inputFocused)
+                if session.busy {
+                    Button { session.stop() } label: { Image(systemName: "stop.fill") }
+                        .help("Stop generating")
+                }
                 Button(session.busy ? "Interrupt & Ask" : "Ask") { session.send() }
                     .disabled(!session.canSend)
             }
-            HStack(alignment: .bottom) {
-                tokenLine.frame(maxWidth: .infinity, alignment: .leading)
-                reminderModeControl
-            }
+            chatMetaBar
         }
         .padding(10)
         .onPasteCommand(of: [.image, .png, .tiff]) { _ in pasteChatImages() }
-        // A focused TextField's field editor swallows ⌘V (and silently drops image-only content),
-        // so onPasteCommand never fires. Intercept ⌘V ahead of key equivalents: image on the
-        // clipboard + chat input focused → thumbnail; anything else passes through untouched
-        // (plain text paste, the BlockStream panes' own paste handling).
-        .onAppear {
-            guard pasteMonitor == nil else { return }
-            pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
-                if e.modifierFlags.contains(.command), e.charactersIgnoringModifiers == "v",
-                   inputFocused,
-                   NSPasteboard.general.availableType(from: [.png, .tiff]) != nil {
-                    pasteChatImages(); return nil
-                }
-                // Return in the chat input: plain Enter sends (consume so no newline is inserted);
-                // Shift+Enter falls through to the vertical TextField, which inserts a newline.
-                if inputFocused, e.keyCode == 36 || e.keyCode == 76,      // Return / keypad Enter
-                   !e.modifierFlags.contains(.shift) {
-                    session.send(); return nil
-                }
-                return e
-            }
-        }
-        .onDisappear { if let m = pasteMonitor { NSEvent.removeMonitor(m); pasteMonitor = nil } }
     }
 
-    var voiceInputRegion: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if !session.queuedCaptures.isEmpty { queuedStrip }
-            HStack(spacing: 8) {
-                // dot mirrors the screen overlay: ONLY red (listening) / yellow (processing), else gone
-                if let c = voiceDotColor { Circle().fill(c).frame(width: 8, height: 8) }
-                Text(submode == .toggle ? "Press \(hk) to interrupt & talk, again when finished · Esc cancels"
-                                        : "Hold \(hk) to talk · Esc cancels")
-                    .font(.caption).foregroundStyle(.secondary)
-                if session.busy { Text("· agent is answering — talk to interrupt").font(.caption2).foregroundStyle(.orange) }
-            }
-            if transcription == .stream {
-                ScrollView {
-                    Text(session.livePartial.isEmpty ? "…" : session.livePartial)
-                        .font(.system(size: 13)).textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 84).padding(8)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.08)))
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.25)))
-            }
-            tokenLine
+    // Slack-like keyboard model. Focus is owned by EITHER the input OR one selected agent message.
+    // The monitor returns nil to consume an event, or the event to let it flow to the focused field.
+    func keyMonitor(_ e: NSEvent) -> NSEvent? {
+        // A modal sheet (Settings / save-chat) owns the keyboard: don't let the chat's single-key
+        // shortcuts hijack keys the sheet needs — e.g. a hotkey/binding recorder, or plain typing —
+        // especially when a chat message is still selected behind it (s/c/r would be consumed).
+        if showSettings || saveTarget != nil { return e }
+        let focused = session.inputIsFocused
+        let editing = isTextEditing()
+        // ⌘V with an image on the clipboard, input focused → stage the image (field editor eats paste).
+        if e.modifierFlags.contains(.command), e.charactersIgnoringModifiers == "v", focused,
+           NSPasteboard.general.availableType(from: [.png, .tiff]) != nil {
+            pasteChatImages(); return nil
         }
-        .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+        switch e.keyCode {
+        case 36, 76:                                   // Return / keypad Enter
+            if focused {
+                if e.modifierFlags.contains(.shift) {  // Shift+Enter → insert a newline at the caret
+                    if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
+                        tv.insertText("\n", replacementRange: tv.selectedRange())
+                    }
+                    return nil                         // consume so SwiftUI doesn't treat it as a submit
+                }
+                session.send(); return nil             // plain Enter → send
+            }
+            return e
+        case 126:                                      // Up
+            if focused { if chatCaretOnFirstLine() { session.navUp(); return nil }; return e }
+            if editing { return e }                    // a block/reminder editor owns the caret
+            session.navUp(); return nil                // none/selected → older (or select newest)
+        case 125:                                      // Down
+            if focused || editing { return e }
+            session.navDown(); return nil              // newer, or past-newest → input
+        case 49:                                       // Space → jump to input (when not editing text)
+            if editing { return e }
+            session.focusInput(); return nil
+        case 53:                                        // Esc → drop the message-nav selection
+            if session.selectedMessageID != nil { session.clearSelection(); return nil }
+            return e
+        default: break
+        }
+        // Single-key actions on the selected message (only when no text field owns the caret).
+        if let sel = session.selectedMessageID, !editing {
+            switch e.charactersIgnoringModifiers {
+            case "s": session.toggleSource(sel); return nil
+            case "c": copyText(session.messageBody(sel)); return nil
+            case "r": session.resetToHere(sel); return nil
+            default: break
+            }
+        }
+        return e
+    }
+
+    // Is a text field (any NSText field editor) the window's first responder? (chat input, block panes,
+    // reminder, rename) — used to NOT hijack single-key shortcuts while the user is typing.
+    func isTextEditing() -> Bool {
+        (NSApp.keyWindow?.firstResponder as? NSView)?.isKind(of: NSText.self) ?? false
+    }
+    // Is the chat input's caret on its first visual line? (so Up navigates to messages only from the top)
+    func chatCaretOnFirstLine() -> Bool {
+        guard let tv = NSApp.keyWindow?.firstResponder as? NSTextView else { return !session.input.contains("\n") }
+        let loc = tv.selectedRange().location
+        let ns = tv.string as NSString
+        if loc <= 0 || loc > ns.length { return true }
+        return ns.range(of: "\n", options: [], range: NSRange(location: 0, length: loc)).location == NSNotFound
     }
 
     var voiceDotColor: Color? {
@@ -894,31 +1059,6 @@ struct RootView: View {
             }.padding(.vertical, 2)
         }
         .frame(height: 60).frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    // Voice-mode captures queued for the next spoken message: image thumbnails + text chips, each removable.
-    var queuedStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                Text("attach to next:").font(.caption2).foregroundStyle(.secondary)
-                ForEach(session.queuedCaptures) { b in
-                    ZStack(alignment: .topTrailing) {
-                        if b.type == "image", let ns = b.nsImage {
-                            Image(nsImage: ns).resizable().scaledToFill().frame(width: 48, height: 48)
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.25)))
-                        } else {
-                            Text(b.text ?? "").font(.caption2).lineLimit(2).frame(maxWidth: 140, alignment: .leading)
-                                .padding(6).background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.14)))
-                        }
-                        Button { session.removeQueuedCapture(id: b.id) } label: {
-                            Image(systemName: "xmark.circle.fill").font(.system(size: 13))
-                        }.buttonStyle(.plain).foregroundStyle(.white, .black.opacity(0.55)).padding(1)
-                    }
-                }
-            }.padding(.vertical, 2)
-        }
-        .frame(height: 56).frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // A collapsible pane: header toggles it; when open its BlockStream flexes to share sidebar height.
@@ -970,18 +1110,18 @@ struct RootView: View {
                     // Textual (CoreText), whose partial selection can't map back to markdown — so a
                     // per-message "View source" toggle swaps in the raw markdown as selectable monospace
                     // text (highlight any part → copy = exact source). Right-click also copies full source.
-                    let showSrc = id.map { sourceShown.contains($0) } ?? false
+                    let showSrc = id.map { session.sourceShownIDs.contains($0) } ?? false
                     Group {
                         if isUser || showSrc {
                             Text(body).font(showSrc ? .system(size: 12, design: .monospaced) : .body)
                         } else {
-                            MarkdownText(raw: body)
+                            MarkdownText(raw: body).equatable()   // skip Textual re-parse when body is unchanged
                         }
                     }
                     .contextMenu {
                         Button { copyText(body) } label: { Label("Copy source (markdown)", systemImage: "chevron.left.forwardslash.chevron.right") }
                         if let id, !isUser {
-                            Button { toggleSource(id) } label: {
+                            Button { session.toggleSource(id) } label: {
                                 Label(showSrc ? "View rendered" : "View source", systemImage: showSrc ? "eye" : "curlybraces")
                             }
                         }
@@ -993,6 +1133,9 @@ struct RootView: View {
             .textSelection(.enabled).padding(10)
             .background(bg)
             .clipShape(RoundedRectangle(cornerRadius: 12))
+            // keyboard-nav highlight: the currently selected agent message gets an accent ring.
+            .overlay(RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.accentColor, lineWidth: (id != nil && id == session.selectedMessageID) ? 2 : 0))
             // triple-dot on a committed AGENT reply: copy it, or reset the chat back to it.
             if !isUser, let id { bubbleMenu(id: id, body: body) }
             if !isUser { Spacer(minLength: 40) }
@@ -1000,14 +1143,20 @@ struct RootView: View {
     }
 
     @ViewBuilder func bubbleMenu(id: UUID, body: String) -> some View {
+        let src = session.sourceShownIDs.contains(id)
         Menu {
-            Button { copyText(body) } label: { Label("Copy", systemImage: "doc.on.doc") }
-            Button { toggleSource(id) } label: {
-                Label(sourceShown.contains(id) ? "View rendered" : "View source",
-                      systemImage: sourceShown.contains(id) ? "eye" : "curlybraces")
+            Button { copyText(body) } label: { Label("Copy  ·  C", systemImage: "doc.on.doc") }
+            Button { session.toggleSource(id) } label: {
+                Label((src ? "View rendered" : "View source") + "  ·  S", systemImage: src ? "eye" : "curlybraces")
             }
             Button(role: .destructive) { session.resetToHere(id) } label: {
-                Label("Reset to here", systemImage: "arrow.uturn.backward")
+                Label("Reset to here  ·  R", systemImage: "arrow.uturn.backward")
+            }
+            Divider()
+            Section("Keyboard") {
+                Text("↑ ↓   move between replies")
+                Text("Space   jump to input")
+                Text("S source · C copy · R reset")
             }
         } label: {
             Image(systemName: "ellipsis").font(.caption).foregroundStyle(.secondary)
@@ -1019,10 +1168,7 @@ struct RootView: View {
     func copyText(_ s: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
-    }
-
-    func toggleSource(_ id: UUID) {
-        if sourceShown.contains(id) { sourceShown.remove(id) } else { sourceShown.insert(id) }
+        withAnimation(.easeOut(duration: 0.15)) { session.flashCopied() }
     }
 
     // ---- chat-input image paste (⌘V) → the session's pasted-images staging bar ----

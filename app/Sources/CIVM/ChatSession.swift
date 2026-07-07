@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import AppKit   // NSApp / NSTextView — read & set the chat input's caret for insert-at-cursor dictation
 
 // ---------------------------------------------------------------------------
 // ChatSession — the conversation RUNTIME, completely walled off from the UI.
@@ -121,7 +122,58 @@ enum VoiceState: Equatable {
     // ---- compose buffer + capture staging (fix E — intent methods mutate; views only read) ----
     @Published var input = ""                             // typed chat input (bound two-way to the TextField)
     @Published private(set) var pastedImages: [Block] = []   // chat-input pasted images (thumbnail bar → ride with the question)
-    @Published private(set) var queuedCaptures: [Block] = [] // voice-mode captures (images + text) attached to the NEXT ask
+
+    // ---- hybrid dictation: the field locks while talking; the transcript lands at the caret ----
+    @Published private(set) var dictating = false         // a dictation is live → the input field is uneditable
+    private var dictCaret = 0                              // UTF-16 caret offset captured at dictation start (field is
+                                                          // locked while dictating, so it can't move → valid at insert)
+    private var dictWasAlone = false                      // input box was empty at dictation start (drives .ifAlone auto-send)
+    private let sysAudio = SystemAudio()                  // mutes system output while dictating (if enabled)
+
+    // ---- keyboard navigation (Slack-like): arrow through AGENT messages, act with s/c/r ----
+    // selectedMessageID and input focus are MUTUALLY EXCLUSIVE (one owns keyboard focus at a time):
+    // selecting a message defocuses the input; focusing the input clears the selection.
+    @Published var selectedMessageID: UUID? = nil        // the highlighted agent message (nil = none)
+    @Published var sourceShownIDs: Set<UUID> = []        // agent messages flipped to raw-markdown source view
+    @Published private(set) var inputFocusToken = 0      // bump → the view moves keyboard focus to the input
+    var inputIsFocused = false                           // mirrored from the view's @FocusState (read by the key monitor)
+    @Published private(set) var justCopied = false       // brief "Copied" toast after any copy action
+    private var copyFlashTask: Task<Void, Never>? = nil
+
+    func flashCopied() {
+        justCopied = true
+        copyFlashTask?.cancel()
+        copyFlashTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.1))
+            if !Task.isCancelled { self?.justCopied = false }
+        }
+    }
+
+    // AGENT message ids oldest→newest — the navigation order (user turns are skipped).
+    var agentMessageIDs: [UUID] { store.chat.messages.filter { $0.role == "assistant" }.map { $0.id } }
+
+    func focusInput() { selectedMessageID = nil; inputFocusToken &+= 1 }
+    func clearSelection() { selectedMessageID = nil }
+    func navUp() {                                       // older; from input/none → most-recent agent msg
+        let ids = agentMessageIDs; guard !ids.isEmpty else { return }
+        if let sel = selectedMessageID, let i = ids.firstIndex(of: sel) {
+            if i > 0 { selectedMessageID = ids[i - 1] }
+        } else { selectedMessageID = ids.last }
+    }
+    func navDown() {                                     // newer; past the newest → input
+        let ids = agentMessageIDs
+        if let sel = selectedMessageID, let i = ids.firstIndex(of: sel) {
+            if i < ids.count - 1 { selectedMessageID = ids[i + 1] } else { focusInput() }
+        } else { focusInput() }
+    }
+    func toggleSource(_ id: UUID) {
+        if sourceShownIDs.contains(id) { sourceShownIDs.remove(id) } else { sourceShownIDs.insert(id) }
+    }
+    // The display body of a message (text before @@APPENDIX@@, trimmed) — for copy-source.
+    func messageBody(_ id: UUID) -> String {
+        guard let m = store.chat.messages.first(where: { $0.id == id }) else { return "" }
+        return m.text.components(separatedBy: "@@APPENDIX@@")[0].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     // ---- Voice·Text live state (from GET /voice/poll) ----
     @Published private(set) var voiceState: VoiceState = .idle
@@ -138,17 +190,14 @@ enum VoiceState: Equatable {
     // would race a start()'s installTap against a teardown/reset and crash AVFoundation (fix A).
     private var voiceTask: Task<Void, Never>? = nil
 
-    // ---- settings: STORED copies refreshed from the shared accessors on didChangeNotification
-    // (fix C/E). No per-render UserDefaults lookups — the old computed getters were a hot loop. ----
-    private var mode: Mode = .current
-    private var submode: Submode = .current
-    private var transcription: Transcription = .current
+    // ---- GLOBAL settings: stored copies refreshed on didChangeNotification. Voice input / submode /
+    // transcription / auto-send / mute / reminder placement are now PER-CHAT (store.chat.settings) —
+    // only the hotkey + capture bindings (which drive the one process-wide tap) stay global here. ----
     private var hotkey: String = SK.hotkeyValue
     private var shotBinding: String = SK.shotBindingValue
     private var shotStyleRaw: String = SK.shotStyleValue
     private var copyBinding: String = SK.copyBindingValue
-    private var reminderModeStored: ReminderMode = .current
-    private var modeSwitchTask: Task<Void, Never>? = nil   // in-flight re-cache after a mode switch
+    private var modeSwitchTask: Task<Void, Never>? = nil   // in-flight re-cache after a reminder-mode change
 
     // ---- cache gate / status (derive from store.chat + caching state) ----
     // engine currently holds a pin for THIS chat (maybe a stale version — that still allows chatting)
@@ -296,7 +345,7 @@ enum VoiceState: Equatable {
         if !pinned { await pinNow() }           // pin on demand (caching first isn't required)
         do {
             let meta = try await engine.chat(messages: buildEngineMessages(), reminder: store.chat.reminder,
-                                              reminderMode: ReminderMode.current.rawValue) { self.streaming += $0 }
+                                              reminderMode: store.chat.settings.reminderMode) { self.streaming += $0 }
             if Task.isCancelled {               // interrupted right as the stream ended
                 stashInterrupted(); return
             }
@@ -318,6 +367,23 @@ enum VoiceState: Equatable {
                 store.chat.messages.append(Msg(role: "assistant", text: "⚠ \(error.localizedDescription)"))
                 streaming = ""; busy = false; store.save()
             }
+        }
+    }
+
+    // Stop generation with NO successor turn (the ⏹ button): cancel the in-flight /chat, let runTurn
+    // stash whatever it produced as an interrupted bubble, then settle back to idle and re-warm the KV
+    // for the next message. (send()'s "Interrupt & Ask" cancels-and-replaces; this just cancels.)
+    func stop() {
+        guard busy else { return }
+        let prev = askTask
+        askTask = Task { [weak self] in
+            prev?.cancel()
+            await prev?.value               // runTurn's cancel path stashes the partial
+            guard let self else { return }
+            self.busy = false               // no successor turn → return to idle
+            self.streaming = ""
+            self.store.save()
+            self.rewarmCache()              // keep the next message instant
         }
     }
 
@@ -364,15 +430,15 @@ enum VoiceState: Equatable {
         // unchanged (fix C).
         lastReused = 0; lastNew = 0; lastPinned = 0; lastTtft = 0
         anewParts = []
-        precache = ""
         store.chat.chatTokens = 0
+        selectedMessageID = nil                 // the anchor turn is now the newest; drop any nav highlight
         store.save()
+        rewarmCache()                           // recompute the KV up to the (now truncated) transcript
     }
 
     // ---- capture staging intents (fix E) — clipboard/timeline UI hands finished Blocks in ----
     func attachPastedImages(_ blocks: [Block]) { pastedImages.append(contentsOf: blocks) }
     func removePastedImage(id: UUID) { pastedImages.removeAll { $0.id == id } }
-    func removeQueuedCapture(id: UUID) { queuedCaptures.removeAll { $0.id == id } }
 
     // ---- Voice·Text + capture control channel ----
     // Poll GET /voice/poll ~10Hz while a chat is open in ANY mode: capture events are delivered in
@@ -387,7 +453,11 @@ enum VoiceState: Equatable {
     }
 
     // reset the per-chat transient voice state when the open chat changes
-    private func resetForChatSwitch() { voiceSeq = -1; livePartial = ""; queuedCaptures = [] }
+    private func resetForChatSwitch() {
+        voiceSeq = -1; livePartial = ""
+        if dictating { endDictation() }                   // don't carry a locked field / muted audio across chats
+        selectedMessageID = nil; sourceShownIDs = []      // nav highlight + source toggles are per-chat
+    }
 
     // Single chat-activation path (fix A). Fires once per open / new / seed, AFTER store.chat settled.
     private var lastActivatedChatId: UUID? = nil
@@ -398,37 +468,42 @@ enum VoiceState: Equatable {
             pinOutcome = .none                       // chat B must not show chat A's "cache failed: …" (fix 5)
         }
         if kind == .opened { cache() }              // opening evicts the old KV, re-pins this chat
+        postVoiceConfig()                           // the new chat may have different voice settings → re-arm the tap
     }
 
+    // ---- per-chat setting writes: mutate store.chat.settings, save, and fire the right side effect ----
+    private func saveSettings() { store.save() }
+    func setVoiceInput(_ on: Bool)      { store.chat.settings.voiceInput = on;      saveSettings(); postVoiceConfig() }
+    func setSubmode(_ m: Submode)       { store.chat.settings.submode = m.rawValue; saveSettings(); postVoiceConfig() }
+    func setTranscription(_ t: Transcription) { store.chat.settings.transcription = t.rawValue; saveSettings(); postVoiceConfig() }
+    func setAutoSend(_ a: AutoSend)     { store.chat.settings.autoSend = a.rawValue; saveSettings() }
+    func setMuteDictation(_ on: Bool)   { store.chat.settings.muteDictation = on;   saveSettings() }
+    func setAgentOutput(_ o: AgentOutput) { store.chat.settings.agentOutput = o.rawValue; saveSettings() }
+    func setSpeechLocale(_ id: String)  { store.chat.settings.speechLocale = id;    saveSettings() }
+
     private func postVoiceConfig() {
-        // voice chord enables inside a Voice·Text chat only; capture bindings are active whenever a
-        // chat is open in ANY mode — never on the home screen. Reads the stored setting copies.
+        // voice chord arms when THIS chat's voice input is on; capture bindings are active whenever a
+        // chat is open (voice on or off) — never on the home screen. Voice settings are per-chat; the
+        // hotkey + capture bindings are global (stored copies).
         let inChat = store.screen == .chat
+        let s = store.chat.settings
         Task { [self] in await engine.voiceConfig(
-            voiceEnabled: inChat && mode == .voiceText,
+            voiceEnabled: inChat && s.voiceInput,
             captureEnabled: inChat,
-            submode: submode.rawValue,
-            streaming: transcription == .stream,
+            submode: s.submode,
+            streaming: s.transcriptionV == .stream,
             key: hotkey,
             shotBinding: shotBinding, shotStyle: shotStyleRaw, copyBinding: copyBinding) }
     }
 
-    // Refresh stored setting copies from the shared accessors; post config if any config-relevant key
-    // changed, and re-post context on a mode change (self-gated). Diffing keeps unrelated defaults
-    // writes (sidebar, perms) from posting anything.
+    // Refresh the GLOBAL stored copies (hotkey + capture bindings) on a defaults change; re-post config
+    // if any changed so the tap picks up a new chord/binding. Per-chat settings do NOT flow through here
+    // (they're written directly via the setters above) — and changing a DEFAULT never touches the open chat.
     private func settingsChanged() {
-        let m = Mode.current, sm = Submode.current, tr = Transcription.current
         let hk = SK.hotkeyValue, sb = SK.shotBindingValue, ss = SK.shotStyleValue, cb = SK.copyBindingValue
-        let configDirty = m != mode || sm != submode || tr != transcription
-            || hk != hotkey || sb != shotBinding || ss != shotStyleRaw || cb != copyBinding
-        mode = m; submode = sm; transcription = tr
+        let configDirty = hk != hotkey || sb != shotBinding || ss != shotStyleRaw || cb != copyBinding
         hotkey = hk; shotBinding = sb; shotStyleRaw = ss; copyBinding = cb
         if configDirty { postVoiceConfig() }
-        // reminder placement changed (via the Settings picker OR the in-chat control) → re-warm the
-        // cache with the new mode. Idempotent: setReminderMode already bumped reminderModeStored when
-        // the in-chat control fired, so this only fires for the Settings-picker path.
-        let rm = ReminderMode.current
-        if rm != reminderModeStored { setReminderMode(rm) }
     }
 
     // While Apple streams, prefill Gemma's KV from the growing partial (debounced) so the final ask
@@ -448,19 +523,26 @@ enum VoiceState: Equatable {
         }
     }
 
-    // Switch reminder placement mid-chat: persist it, then re-warm the cache with the new mode so the
-    // next message stays instant. The chip shows caching → ready. The re-cache is tracked in
-    // modeSwitchTask so the NEXT send() waits for it (else the /chat races the /precache and re-feeds
-    // the reminder). Idempotent via reminderModeStored so the in-chat control and the Settings picker
-    // (which both write SK.reminderMode) don't double-fire.
+    // Switch this CHAT's reminder placement mid-conversation: persist it on the chat, then re-warm the
+    // cache with the new mode so the next message stays instant (chip: caching → ready). The re-cache is
+    // tracked in modeSwitchTask so the NEXT send() waits for it (else /chat races /precache and re-feeds
+    // the reminder). Per-chat now — the Settings picker edits only the DEFAULT and never lands here.
     func setReminderMode(_ m: ReminderMode) {
-        reminderModeStored = m
-        UserDefaults.standard.set(m.rawValue, forKey: SK.reminderMode)
-        guard engine.ready, !store.chat.messages.isEmpty else { return }
+        store.chat.settings.reminderMode = m.rawValue
+        saveSettings()
+        rewarmCache()
+    }
+
+    // Re-warm the KV for the next message with the CURRENT transcript + reminder mode (used after a
+    // reminder-mode switch AND after resetToHere, so the next ask stays instant). Tracked in
+    // modeSwitchTask so the next send() waits for it (no /chat-vs-/precache race). Chip: working→ready.
+    func rewarmCache() {
+        guard engine.ready, !store.chat.messages.isEmpty else { precache = ""; return }
         precache = "working"
+        let msgs = buildEngineMessages(), rem = store.chat.reminder, mode = store.chat.settings.reminderMode
         let t = Task { [weak self] in
-            guard let self else { return }
-            await self.engine.precache(messages: self.buildEngineMessages(), reminder: self.store.chat.reminder, reminderMode: m.rawValue)
+            await self?.engine.precache(messages: msgs, reminder: rem, reminderMode: mode)
+            return ()
         }
         modeSwitchTask = t
         Task { [weak self] in                       // chip: working → ready (separate, so send() waits only on `t`)
@@ -490,23 +572,27 @@ enum VoiceState: Equatable {
     }
 
     private func handleVoicePoll(_ p: VoicePoll) async {
-        // capture events arrive in ALL modes — deliver, then ack exactly what we consumed (FIFO).
+        // capture events arrive whether voice is on or off — deliver, then ack what we consumed (FIFO).
         if let caps = p.captures, !caps.isEmpty {
             deliverCaptures(caps)
             await engine.voiceCapturesAck(count: caps.count)
         }
-        guard Mode.current == .voiceText else { return }    // fresh read: never auto-send a tick after leaving Voice·Text
+        guard store.chat.settings.voiceInput else {         // this chat's voice toggle: ignore voice ticks when off
+            if dictating { endDictation() }                 // …but if it was toggled off mid-dictation, unlock + unmute
+            return
+        }
         let vs = VoiceState(wire: p.state)
         if voiceState != vs { voiceState = vs }             // dedupe: no 10Hz invalidation storm at idle (fix E)
+        if vs == .listening { beginDictation() }            // lock the field + snapshot the caret (guarded: once)
 
         // STREAMING submode: Apple (Swift) owns audio+transcription. Python's poll state is just the
-        // chord signal — listening → run Apple; ready (chord-up) → finalize+send Apple's text; idle
+        // chord signal — listening → run Apple; ready (chord-up) → finalize+insert Apple's text; idle
         // while running (ESC) → discard.
-        if Transcription.current == .stream {
+        if store.chat.settings.transcriptionV == .stream {
             switch vs {
             case .listening where !appleRunning:
                 appleRunning = true; livePartial = ""; preSent = 0
-                let loc = SK.speechLocaleValue
+                let loc = store.chat.settings.speechLocale
                 let prev = voiceTask                        // chain onto any in-flight lifecycle op (fix A)
                 voiceTask = Task { [weak self] in
                     await prev?.value
@@ -520,6 +606,7 @@ enum VoiceState: Equatable {
                         NSLog("[Rally] AppleSpeech.start failed: \(error.localizedDescription)")
                         self.appleRunning = false; self.livePartial = ""; self.preSent = 0
                         self.voiceState = .idle
+                        self.endDictation()                 // unlock the field + restore audio
                         await self.apple.cancel()           // idempotent belt-and-suspenders teardown
                     }
                 }
@@ -534,12 +621,11 @@ enum VoiceState: Equatable {
                     let text = await self.apple.stop()
                     await self.engine.voiceAck(seq: seq)
                     self.preSent = 0                        // dictation over → clear live count (→ "reused" after /chat)
-                    guard !text.isEmpty else { return }
-                    let (pre, imgs) = self.drainQueuedCaptures()
-                    self.ask(text: pre.isEmpty ? text : pre + "\n" + text, images: imgs)
+                    self.deliverDictation(text)             // insert at caret (+ auto-send); unlocks field even if empty
                 }
             case .idle where appleRunning:                  // ESC / cancel
                 appleRunning = false; livePartial = ""; preSent = 0
+                endDictation()                              // unlock the field + restore audio, no insert
                 let prev = voiceTask                        // wait for the pending start() before cancelling (fix A)
                 voiceTask = Task { [weak self] in
                     await prev?.value
@@ -551,35 +637,71 @@ enum VoiceState: Equatable {
         }
 
         // TRANSCRIBE-AFTER submode: Parakeet (Python) produces the final; consume it.
+        if vs == .idle, dictating { endDictation() }        // ESC / empty transcript → unlock, no insert
         if livePartial != p.partial { livePartial = p.partial }
         if vs == .ready, p.seq != voiceSeq,
            let f = p.final, !f.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             voiceSeq = p.seq
-            let (pre, imgs) = drainQueuedCaptures()   // fold queued screenshots/copies into this turn
-            ask(text: pre.isEmpty ? f : pre + "\n" + f, images: imgs)
+            deliverDictation(f)                             // insert at caret (+ auto-send)
             Task { await self.engine.voiceAck(seq: p.seq) }
         }
     }
 
-    // Deliver captures to the chat as if the user had pasted them. Text mode: images → thumbnail bar,
-    // text → input box. Voice modes: both → the queued strip, attached to the next spoken message.
-    private func deliverCaptures(_ caps: [Capture]) {
-        let live = Mode.current                             // fresh read: route to today's mode, not a stale copy
-        for c in caps {
-            if c.kind == "image", let d = c.data, !d.isEmpty {
-                let blk = Block(mediaType: "image/png", data: d)
-                if live == .voiceText { queuedCaptures.append(blk) } else { pastedImages.append(blk) }
-            } else if c.kind == "text", let t = c.text, !t.isEmpty {
-                if live == .voiceText { queuedCaptures.append(Block(text: t)) }
-                else { input += input.isEmpty ? t : " " + t }
-            }
+    // ---- hybrid dictation lifecycle ----------------------------------------------------------------
+    // A dictation begins when the chord goes down (voiceState → .listening): snapshot where the caret
+    // is in the input box (it's locked while talking, so it can't move) and whether the box was empty,
+    // then mute system audio if enabled.
+    private func beginDictation() {
+        guard !dictating else { return }                    // once per utterance
+        dictCaret = inputCaretOffset()
+        dictWasAlone = input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        dictating = true
+        if store.chat.settings.muteDictation { sysAudio.mute() }
+    }
+    // A dictation ends (successfully-inserted OR cancelled): unlock the field + restore audio.
+    private func endDictation() {
+        guard dictating else { return }
+        dictating = false
+        sysAudio.restore()
+    }
+    // Finished transcript → drop it in at the caret we snapshotted, then auto-send per the setting.
+    private func deliverDictation(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let wasAlone = dictWasAlone
+        endDictation()                                      // unlock first (so send()/edits see an enabled field)
+        guard !t.isEmpty else { return }                    // empty → nothing to insert; field already unlocked
+        insertAtCaret(t, offset: dictCaret)
+        switch store.chat.settings.autoSendV {
+        case .always:  send()
+        case .ifAlone: if wasAlone { send() }               // box was empty at start → the transcript is the message
+        case .never:   break                                // leave it inserted; the user presses Enter
         }
     }
-    // Pull queued captures for a voice send: (joined text prefix, image blocks); clears the queue.
-    private func drainQueuedCaptures() -> (String, [Block]) {
-        let texts = queuedCaptures.compactMap { $0.type == "text" ? $0.text : nil }.filter { !$0.isEmpty }
-        let imgs = queuedCaptures.filter { $0.type == "image" }
-        queuedCaptures = []
-        return (texts.joined(separator: "\n"), imgs)
+
+    // Caret (UTF-16) in the chat input's field editor; end-of-input if it isn't first responder.
+    private func inputCaretOffset() -> Int {
+        if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
+            return min(tv.selectedRange().location, (tv.string as NSString).length)
+        }
+        return (input as NSString).length
+    }
+    // Insert `text` at `offset` in `input`, then refocus the field so the user can keep typing.
+    private func insertAtCaret(_ text: String, offset: Int) {
+        let ns = input as NSString
+        let loc = max(0, min(offset, ns.length))
+        input = ns.replacingCharacters(in: NSRange(location: loc, length: 0), with: text)
+        focusInput()                                        // re-focus the (now-unlocked) field for continued typing
+    }
+
+    // Deliver captures to the chat as if the user had pasted them: images → thumbnail bar, text → input.
+    // One path now (the input box is always present), so screenshots/copies ride the next send either way.
+    private func deliverCaptures(_ caps: [Capture]) {
+        for c in caps {
+            if c.kind == "image", let d = c.data, !d.isEmpty {
+                pastedImages.append(Block(mediaType: "image/png", data: d))
+            } else if c.kind == "text", let t = c.text, !t.isEmpty {
+                input += input.isEmpty ? t : " " + t
+            }
+        }
     }
 }

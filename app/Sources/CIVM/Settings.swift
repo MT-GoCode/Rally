@@ -1,11 +1,30 @@
 import SwiftUI
 import AppKit
 
-// ---- modes & submodes (persisted globally in UserDefaults via @AppStorage) ----
-// YOUR INPUT · AGENT OUTPUT. Only text-text and voice-text ship; the voice-output pair is coming soon.
-enum Mode: String, CaseIterable { case textText = "text-text", textVoice = "text-voice", voiceText = "voice-text", voiceVoice = "voice-voice" }
-enum Submode: String { case toggle, hold, vad }           // Voice·Text hotkey behaviour
+// ---- input/output config (persisted globally in UserDefaults via @AppStorage) ----
+// The old 4-way Mode matrix is gone: input is now ONE hybrid text box with a voice toggle on top
+// (type OR dictate at the cursor), and output is Text (Voice coming soon).
+enum Submode: String { case toggle, hold, vad }           // voice-input hotkey behaviour
 enum Transcription: String { case after, stream }          // after = accurate; stream = faster
+// What happens to a finished dictation. The field is a normal text box, so the transcript is inserted
+// at the caret; this decides whether we also press send.
+enum AutoSend: String, CaseIterable {
+    case never, always, ifAlone
+    var label: String { self == .never ? "Never" : self == .always ? "Always" : "If box empty" }
+    var blurb: String {
+        switch self {
+        case .never:   return "Insert the transcript at the cursor; you press Enter to send."
+        case .always:  return "Send immediately after every dictation (like the old voice mode)."
+        case .ifAlone: return "Send only when the box was empty at dictation start; otherwise insert and wait."
+        }
+    }
+}
+// AGENT OUTPUT half. Only Text ships today; Voice is coming soon (disabled in the picker).
+enum AgentOutput: String, CaseIterable {
+    case text, voice
+    var label: String { self == .text ? "Text" : "Voice" }
+    var comingSoon: Bool { self == .voice }
+}
 enum ShotStyle: String, CaseIterable { case initiate, hold }  // screenshot: press-to-initiate vs press&hold-drag
 // Where the reminder sits each turn — the latency ⇄ adherence trade-off (engine pre-caches accordingly).
 enum ReminderMode: String, CaseIterable {
@@ -20,11 +39,22 @@ enum ReminderMode: String, CaseIterable {
     }
 }
 
-// UserDefaults keys (shared by the modes bar, the input regions, and the Settings sheet).
+// UserDefaults keys (shared by the input/output bar, the input region, and the Settings sheet).
 enum SK {
-    static let mode = "civm.mode", submode = "civm.voiceSubmode", transcription = "civm.transcription", hotkey = "civm.hotkey"
+    static let submode = "civm.voiceSubmode", transcription = "civm.transcription", hotkey = "civm.hotkey"
     static let sidebarCollapsed = "civm.sidebarCollapsed"
     static let defaultHotkey = "ctrl+alt"
+    static let defaultSubmode = Submode.hold.rawValue
+    // Default system / reminder PROMPTS filled on new-chat creation — a SavedPrompt id, or "" = none.
+    static let defaultSystemPrompt = "civm.defaultSystemPrompt", defaultReminderPrompt = "civm.defaultReminderPrompt"
+    // Hybrid input: the voice toggle (arms the chord), what a finished dictation does, agent output mode,
+    // and whether to mute system audio while dictating.
+    static let voiceInput = "civm.voiceInput", autoSend = "civm.autoSend"
+    static let agentOutput = "civm.agentOutput", muteDictation = "civm.muteDictation"
+    static let defaultVoiceInput = true
+    static let defaultAutoSend = AutoSend.ifAlone.rawValue
+    static let defaultAgentOutput = AgentOutput.text.rawValue
+    static let defaultMuteDictation = true
     // Capture shortcuts (screenshot + copy-to-chat)
     static let shotBinding = "civm.shotBinding", shotStyle = "civm.shotStyle", copyBinding = "civm.copyBinding"
     static let defaultShotBinding = "cmd+shift+2"    // ⌘⇧2
@@ -33,22 +63,25 @@ enum SK {
     static let speechLocale = "civm.speechLocale"    // Apple streaming-transcription language (BCP-47)
     static let defaultSpeechLocale = "en-US"
     static let reminderMode = "civm.reminderMode"    // reminder placement (latency ⇄ adherence)
-    static let defaultReminderMode = ReminderMode.before.rawValue
+    static let defaultReminderMode = ReminderMode.start.rawValue
 }
 
 // ---- shared settings accessors — the SINGLE authority for reading the SK keys with the right
 // fallbacks. SettingsView writes via @AppStorage; RootView's computed vars delegate here (their
 // @AppStorage stays only as a render-invalidation trigger); ChatSession keeps stored copies it
 // refreshes from these on UserDefaults.didChangeNotification. One place owns each default. ----
-extension Mode         { static func from(_ raw: String) -> Mode { Mode(rawValue: raw) ?? .textText }
-                         static var current: Mode { from(UserDefaults.standard.string(forKey: SK.mode) ?? "") } }
-extension Submode      { static func from(_ raw: String) -> Submode { Submode(rawValue: raw) ?? .toggle }
-                         static var current: Submode { from(UserDefaults.standard.string(forKey: SK.submode) ?? "") } }
+extension AutoSend     { static var current: AutoSend { AutoSend(rawValue: UserDefaults.standard.string(forKey: SK.autoSend) ?? SK.defaultAutoSend) ?? .ifAlone } }
+extension AgentOutput  { static var current: AgentOutput { AgentOutput(rawValue: UserDefaults.standard.string(forKey: SK.agentOutput) ?? SK.defaultAgentOutput) ?? .text } }
+extension Submode      { static func from(_ raw: String) -> Submode { Submode(rawValue: raw) ?? .hold }
+                         static var current: Submode { from(UserDefaults.standard.string(forKey: SK.submode) ?? SK.defaultSubmode) } }
 extension Transcription { static func from(_ raw: String) -> Transcription { Transcription(rawValue: raw) ?? .after }
                           static var current: Transcription { from(UserDefaults.standard.string(forKey: SK.transcription) ?? "") } }
 extension ShotStyle    { static func from(_ raw: String) -> ShotStyle { ShotStyle(rawValue: raw) ?? .initiate } }
-extension ReminderMode { static var current: ReminderMode { ReminderMode(rawValue: UserDefaults.standard.string(forKey: SK.reminderMode) ?? SK.defaultReminderMode) ?? .before } }
+extension ReminderMode { static var current: ReminderMode { ReminderMode(rawValue: UserDefaults.standard.string(forKey: SK.reminderMode) ?? SK.defaultReminderMode) ?? .start } }
 extension SK {
+    // Bool keys: absent → the default (object(forKey:) is nil until the toggle is first written).
+    static var voiceInputOn: Bool   { (UserDefaults.standard.object(forKey: voiceInput) as? Bool) ?? defaultVoiceInput }
+    static var muteDictationOn: Bool { (UserDefaults.standard.object(forKey: muteDictation) as? Bool) ?? defaultMuteDictation }
     static var hotkeyValue: String     { UserDefaults.standard.string(forKey: hotkey) ?? defaultHotkey }
     static var speechLocaleValue: String { UserDefaults.standard.string(forKey: speechLocale) ?? defaultSpeechLocale }
     static var shotBindingValue: String { UserDefaults.standard.string(forKey: shotBinding) ?? defaultShotBinding }
@@ -141,8 +174,11 @@ func bindingSymbols(_ s: String) -> String {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 let mods = e.modifierFlags.intersection([.control, .option, .command, .shift])
-                if !mods.isEmpty { self.captured = mods }        // still holding — grow the chord
-                else if !self.captured.isEmpty { self.finish() }  // released → lock it in
+                // UNION, never assign: releasing a 2-modifier chord fires flagsChanged for each key,
+                // so `= mods` would shrink the set to whichever modifier is released last (⌥⌘ → "alt").
+                // formUnion keeps the chord monotonically growing across the whole hold.
+                if !mods.isEmpty { self.captured.formUnion(mods) }  // still holding — grow the chord
+                else if !self.captured.isEmpty { self.finish() }    // all released → lock it in
             }
             return e
         }
@@ -211,7 +247,8 @@ func bindingSymbols(_ s: String) -> String {
 // ---- Settings sheet (opened from the gear on BOTH home and chat) — one section per mode ----
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
-    @AppStorage(SK.submode) private var submodeRaw = Submode.toggle.rawValue
+    @EnvironmentObject var promptLib: PromptLib
+    @AppStorage(SK.submode) private var submodeRaw = SK.defaultSubmode
     @AppStorage(SK.transcription) private var transcriptionRaw = Transcription.after.rawValue
     @AppStorage(SK.hotkey) private var hotkey = SK.defaultHotkey
     @AppStorage(SK.shotBinding) private var shotBinding = SK.defaultShotBinding
@@ -219,32 +256,57 @@ struct SettingsView: View {
     @AppStorage(SK.copyBinding) private var copyBinding = SK.defaultCopyBinding
     @AppStorage(SK.speechLocale) private var speechLocaleID = SK.defaultSpeechLocale
     @AppStorage(SK.reminderMode) private var reminderModeRaw = SK.defaultReminderMode
+    @AppStorage(SK.voiceInput) private var voiceInputOn = SK.defaultVoiceInput
+    @AppStorage(SK.autoSend) private var autoSendRaw = SK.defaultAutoSend
+    @AppStorage(SK.muteDictation) private var muteDictating = SK.defaultMuteDictation
+    @AppStorage(SK.agentOutput) private var agentOutputRaw = SK.defaultAgentOutput
+    @AppStorage(SK.defaultSystemPrompt) private var defaultSystemPromptID = ""
+    @AppStorage(SK.defaultReminderPrompt) private var defaultReminderPromptID = ""
     @State private var speechLocales: [String] = []
+    @State private var confirmReset = false
     @StateObject private var rec = HotkeyRecorder()
     @StateObject private var shotRec = BindingRecorder()
     @StateObject private var copyRec = BindingRecorder()
 
     private var submode: Binding<Submode> { Binding(get: { .from(submodeRaw) }, set: { submodeRaw = $0.rawValue }) }
     private var transcription: Binding<Transcription> { Binding(get: { .from(transcriptionRaw) }, set: { transcriptionRaw = $0.rawValue }) }
+    private var autoSend: Binding<AutoSend> { Binding(get: { AutoSend(rawValue: autoSendRaw) ?? .ifAlone }, set: { autoSendRaw = $0.rawValue }) }
     private var shotStyle: Binding<ShotStyle> { Binding(get: { .from(shotStyleRaw) }, set: { shotStyleRaw = $0.rawValue }) }
     private var sym: String { hotkeySymbols(hotkey) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Settings").font(.title2.bold())
-            Text("YOUR INPUT · AGENT OUTPUT").font(.caption2.bold()).foregroundStyle(.secondary).tracking(1)
+            Text("DEFAULTS FOR NEW CHATS — each new chat starts with these; change any of them per-chat inside the chat itself (that won't affect these defaults). The shortcuts at the bottom are global.")
+                .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-            GroupBox("Text · Text") {
-                Text("Type your question, read the answer. No settings.")
-                    .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+            GroupBox("Default prompts") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Pre-fill a new chat's system prompt / reminder from your library. Deleting the chosen prompt reverts that to None.")
+                        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    promptDefaultPicker("System prompt", selection: $defaultSystemPromptID, kind: "system")
+                    promptDefaultPicker("Reminder", selection: $defaultReminderPromptID, kind: "reminder")
+                }.frame(maxWidth: .infinity, alignment: .leading)
             }
-            GroupBox("Reminder placement") {
+            GroupBox("Default agent output") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Picker("", selection: Binding(get: { AgentOutput(rawValue: agentOutputRaw) ?? .text },
+                                                  set: { if !$0.comingSoon { agentOutputRaw = $0.rawValue } })) {
+                        ForEach(AgentOutput.allCases, id: \.self) { o in
+                            Text(o.comingSoon ? "\(o.label) (soon)" : o.label).tag(o)
+                        }
+                    }.pickerStyle(.segmented).frame(maxWidth: 240)
+                    Text("How the tutor replies. Voice output is coming soon.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("Default reminder placement") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Where the reminder sits each turn. Nearer the answer = better adherence; earlier = faster (the engine pre-caches it while idle).")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Picker("", selection: Binding(get: { ReminderMode(rawValue: reminderModeRaw) ?? .before },
+                    Picker("", selection: Binding(get: { ReminderMode(rawValue: reminderModeRaw) ?? .start },
                                                   set: { reminderModeRaw = $0.rawValue })) {
                         ForEach(ReminderMode.allCases, id: \.self) { m in
                             Text("\(m.label) — \(m.blurb)").tag(m)
@@ -252,17 +314,24 @@ struct SettingsView: View {
                     }.pickerStyle(.radioGroup).labelsHidden()
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
-            GroupBox("Text · Voice") { comingSoon }
 
-            GroupBox("Voice · Text") {
+            GroupBox("Default voice input") {
                 VStack(alignment: .leading, spacing: 14) {
+                    Toggle("Enable voice input — arms the \(sym) chord (you can still type)", isOn: $voiceInputOn)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Default submode").font(.caption.bold()).foregroundStyle(.secondary)
+                        Text("Submode").font(.caption.bold()).foregroundStyle(.secondary)
                         Picker("", selection: submode) {
                             Text("Press \(sym) to interrupt & talk, again when finished").tag(Submode.toggle)
                             Text("Hold \(sym) to talk").tag(Submode.hold)
                         }.pickerStyle(.radioGroup).labelsHidden()
                     }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("When a dictation finishes").font(.caption.bold()).foregroundStyle(.secondary)
+                        Picker("", selection: autoSend) {
+                            ForEach(AutoSend.allCases, id: \.self) { Text("\($0.label) — \($0.blurb)").tag($0) }
+                        }.pickerStyle(.radioGroup).labelsHidden()
+                    }
+                    Toggle("Mute system audio while dictating", isOn: $muteDictating)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Transcription").font(.caption.bold()).foregroundStyle(.secondary)
                         Picker("", selection: transcription) {
@@ -270,44 +339,38 @@ struct SettingsView: View {
                             Text("Streaming — Apple on-device, live as you speak").tag(Transcription.stream)
                         }.pickerStyle(.radioGroup).labelsHidden()
                     }
-                    VStack(alignment: .leading, spacing: 4) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("Streaming language").font(.caption.bold()).foregroundStyle(.secondary)
                         Picker("", selection: $speechLocaleID) {
                             ForEach(speechLocales, id: \.self) { Text($0).tag($0) }
-                        }.labelsHidden().frame(maxWidth: 220)
-                        Text("Apple on-device (streaming mode only). Transcribe-after uses Parakeet (English).")
-                            .font(.caption2).foregroundStyle(.secondary)
+                        }.labelsHidden().pickerStyle(.menu).frame(width: 140)
+                        Spacer()
                     }
                     .task {
                         var locs = await AppleSpeech.supportedLocaleIDs()
                         if !locs.contains(speechLocaleID) { locs.insert(speechLocaleID, at: 0) }
                         speechLocales = locs
                     }
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Hotkey").font(.caption.bold()).foregroundStyle(.secondary)
-                        HStack(spacing: 10) {
-                            Button {
-                                if rec.recording { rec.cancel() } else { rec.start() }
-                            } label: {
-                                Text(rec.recording ? "Recording… press your chord" : sym)
-                                    .font(rec.recording ? .caption : .body.weight(.semibold))
-                                    .frame(minWidth: 60).padding(.vertical, 4).padding(.horizontal, 10)
-                                    .background(RoundedRectangle(cornerRadius: 6).fill(rec.recording ? Color.red.opacity(0.18) : Color.gray.opacity(0.14)))
-                            }.buttonStyle(.plain)
-                            if rec.recording, !rec.captured.isEmpty { Text(hotkeySymbols(hotkeyString(rec.captured))).font(.body.weight(.semibold)) }
-                            Text("a modifier chord — default ⌃⌥").font(.caption2).foregroundStyle(.secondary)
-                        }
-                    }
+                    Text("Apple on-device (streaming mode only). Transcribe-after uses Parakeet (English).")
+                        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
-            GroupBox("Voice · Voice") { comingSoon }
 
+            globalShortcutsBox
             captureBox
                 }
             }
-            HStack { Spacer(); Button("Done") { rec.cancel(); shotRec.cancel(); copyRec.cancel(); dismiss() }.keyboardShortcut(.defaultAction) }
+            HStack {
+                Button("Reset all settings…", role: .destructive) { confirmReset = true }
+                    .confirmationDialog("Reset every setting to its factory default?", isPresented: $confirmReset, titleVisibility: .visible) {
+                        Button("Reset all settings", role: .destructive) { resetAllSettings() }
+                        Button("Cancel", role: .cancel) {}
+                    } message: { Text("This resets the new-chat defaults, the dictation hotkey, and the capture shortcuts. It does NOT change your existing chats or saved prompts.") }
+                Spacer()
+                Button("Done") { rec.cancel(); shotRec.cancel(); copyRec.cancel(); dismiss() }.keyboardShortcut(.defaultAction)
+            }
         }
-        .padding(20).frame(width: 480, height: 640)
+        .padding(20).frame(minWidth: 460, idealWidth: 480, minHeight: 420, idealHeight: 660)
         .onAppear {
             rec.onFinish = { hotkey = $0 }
             copyRec.allowMouse = false
@@ -348,6 +411,60 @@ struct SettingsView: View {
         }
     }
 
+    // Dictation hotkey — GLOBAL (drives the one CGEventTap), so it's not a per-chat default.
+    private var globalShortcutsBox: some View {
+        GroupBox("Dictation hotkey — all chats") {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 10) {
+                    Button {
+                        if rec.recording { rec.cancel() } else { rec.start() }
+                    } label: {
+                        Text(rec.recording ? "Recording… press your chord" : sym)
+                            .font(rec.recording ? .caption : .body.weight(.semibold))
+                            .frame(minWidth: 60).padding(.vertical, 4).padding(.horizontal, 10)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(rec.recording ? Color.red.opacity(0.18) : Color.gray.opacity(0.14)))
+                    }.buttonStyle(.plain)
+                    if rec.recording, !rec.captured.isEmpty { Text(hotkeySymbols(hotkeyString(rec.captured))).font(.body.weight(.semibold)) }
+                    Spacer()
+                }
+                Text("A modifier chord (default ⌃⌥) — same in every chat. Press-to-toggle vs hold is the per-chat submode above.")
+                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // A "None + your saved prompts" menu bound to a SavedPrompt-id default key.
+    private func promptDefaultPicker(_ label: String, selection: Binding<String>, kind: String) -> some View {
+        HStack(spacing: 8) {
+            Text(label).font(.caption.bold()).foregroundStyle(.secondary).frame(width: 96, alignment: .leading)
+            Picker("", selection: selection) {
+                Text("None").tag("")
+                ForEach(promptLib.prompts.filter { $0.kind == kind }) { p in Text(p.name).tag(p.id.uuidString) }
+            }.labelsHidden().pickerStyle(.menu).frame(maxWidth: 220)
+            Spacer()
+        }
+    }
+
+    // Reset the DEFAULTS store + the global hotkey/capture bindings to their factory values. Existing
+    // chats (their own per-chat settings) and saved prompts are left untouched.
+    private func resetAllSettings() {
+        rec.cancel(); shotRec.cancel(); copyRec.cancel()
+        submodeRaw = SK.defaultSubmode
+        transcriptionRaw = Transcription.after.rawValue
+        hotkey = SK.defaultHotkey
+        shotBinding = SK.defaultShotBinding
+        shotStyleRaw = SK.defaultShotStyle
+        copyBinding = SK.defaultCopyBinding
+        speechLocaleID = SK.defaultSpeechLocale
+        reminderModeRaw = SK.defaultReminderMode
+        voiceInputOn = SK.defaultVoiceInput
+        autoSendRaw = SK.defaultAutoSend
+        muteDictating = SK.defaultMuteDictation
+        agentOutputRaw = SK.defaultAgentOutput
+        defaultSystemPromptID = ""
+        defaultReminderPromptID = ""
+    }
+
     private func bindingButton(_ r: BindingRecorder, current: String, prompt: String) -> some View {
         Button {
             if r.recording { r.cancel() } else { r.start() }
@@ -357,9 +474,5 @@ struct SettingsView: View {
                 .frame(minWidth: 60).padding(.vertical, 4).padding(.horizontal, 10)
                 .background(RoundedRectangle(cornerRadius: 6).fill(r.recording ? Color.red.opacity(0.18) : Color.gray.opacity(0.14)))
         }.buttonStyle(.plain)
-    }
-
-    private var comingSoon: some View {
-        Text("(Coming Soon)").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
     }
 }

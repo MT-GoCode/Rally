@@ -30,13 +30,8 @@ enum SaveTarget: String, Identifiable { case system, reminder; var id: String { 
 
     func load() {
         let fm = FileManager.default
-        var files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+        let files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
             .filter { $0.pathExtension == "json" }
-        if files.isEmpty {                       // first run → seed one built-in example so the menu isn't empty
-            write(SavedPrompt(name: "Default reminder", kind: "reminder", blocks: [Block(text: defaultReminderText)]))
-            files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
-                .filter { $0.pathExtension == "json" }
-        }
         prompts = files
             .compactMap { u in (try? Data(contentsOf: u)).flatMap { try? JSONDecoder().decode(SavedPrompt.self, from: $0) } }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -77,7 +72,7 @@ struct PromptLibrarySection: View {
             }
             HStack {
                 Button("+ New system prompt") { editing = SavedPrompt(name: "", kind: "system", blocks: [Block(text: "")]) }.font(.caption)
-                Button("+ New reminder") { editing = SavedPrompt(name: "", kind: "reminder", blocks: [Block(text: defaultReminderText)]) }.font(.caption)
+                Button("+ New reminder") { editing = SavedPrompt(name: "", kind: "reminder", blocks: [Block(text: "")]) }.font(.caption)
             }.padding(.top, 2)
         }
         .sheet(item: $editing) { p in PromptEditor(prompt: p) { lib.save($0) } }
