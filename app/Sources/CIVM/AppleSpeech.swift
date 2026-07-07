@@ -22,6 +22,7 @@ final class AppleSpeech: ObservableObject {
     private var resultsTask: Task<Void, Never>?
     private var finalized = AttributedString("")
     private var volatileText = AttributedString("")
+    private var tapInstalled = false             // tracks whether a tap is live on bus 0, so teardown is idempotent
 
     static func supportedLocaleIDs() async -> [String] {
         await SpeechTranscriber.supportedLocales.map { $0.identifier(.bcp47) }.sorted()
@@ -37,50 +38,77 @@ final class AppleSpeech: ObservableObject {
     }
 
     func start(localeID: String) async throws {
-        _ = await Self.authorize()          // prompt for Speech recognition on first use (separate TCC perm)
-        finalized = AttributedString(""); volatileText = AttributedString(""); partial = ""
-        let locale = Locale(identifier: localeID)
-        let t = SpeechTranscriber(locale: locale, transcriptionOptions: [],
-                                  reportingOptions: [.volatileResults], attributeOptions: [])
-        transcriber = t
-        try await Self.ensureModel(t, locale: locale)
+        // Speech-recognition TCC perm (separate from mic). If denied, fail cleanly rather than proceed
+        // and silently produce no transcription.
+        guard await Self.authorize() else { throw Err.notAuthorized }
+        do {
+            finalized = AttributedString(""); volatileText = AttributedString(""); partial = ""
+            let locale = Locale(identifier: localeID)
+            let t = SpeechTranscriber(locale: locale, transcriptionOptions: [],
+                                      reportingOptions: [.volatileResults], attributeOptions: [])
+            transcriber = t
+            try await Self.ensureModel(t, locale: locale)
 
-        let a = SpeechAnalyzer(modules: [t])
-        analyzer = a
-        guard let fmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [t]) else {
-            throw Err.noFormat
+            let a = SpeechAnalyzer(modules: [t])
+            analyzer = a
+            guard let fmt = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [t]) else {
+                throw Err.noFormat
+            }
+            let (seq, b) = AsyncStream<AnalyzerInput>.makeStream()
+            builder = b
+            try await a.start(inputSequence: seq)
+
+            // Results consumer — Task inherits @MainActor, so it updates @Published directly.
+            resultsTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    for try await r in t.results {
+                        self.ingest(r.text, isFinal: r.isFinal)
+                    }
+                } catch { /* analyzer finished / cancelled */ }
+            }
+
+            Self.pinBuiltInMic(engine)
+            let tapFmt = engine.inputNode.outputFormat(forBus: 0)
+            guard let converter = AVAudioConverter(from: tapFmt, to: fmt) else { throw Err.noFormat }
+            // Install the tap from a NONISOLATED context so the real-time audio-thread callback is NOT
+            // @MainActor-isolated (a closure made in this @MainActor method would trap the isolation
+            // assert when the audio thread invokes it — that was the crash). installTap removes any
+            // pre-existing tap first; mark tapInstalled so teardownAudio is idempotent.
+            Self.installTap(on: engine, tapFormat: tapFmt, converter: converter, analyzerFormat: fmt, into: b)
+            tapInstalled = true
+            engine.prepare()
+            try engine.start()
+        } catch {
+            // A superseded or failed start must not leak a running engine, an installed tap, or a live
+            // analyzer/results task — tear the whole thing down before rethrowing.
+            resultsTask?.cancel()
+            builder?.finish()
+            teardownAudio()
+            reset()
+            throw error
         }
-        let (seq, b) = AsyncStream<AnalyzerInput>.makeStream()
-        builder = b
-        try await a.start(inputSequence: seq)
-
-        // Results consumer — Task inherits @MainActor, so it updates @Published directly.
-        resultsTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                for try await r in t.results {
-                    self.ingest(r.text, isFinal: r.isFinal)
-                }
-            } catch { /* analyzer finished / cancelled */ }
-        }
-
-        Self.pinBuiltInMic(engine)
-        let tapFmt = engine.inputNode.outputFormat(forBus: 0)
-        guard let converter = AVAudioConverter(from: tapFmt, to: fmt) else { throw Err.noFormat }
-        // Install the tap from a NONISOLATED context so the real-time audio-thread callback is NOT
-        // @MainActor-isolated (a closure made in this @MainActor method would trap the isolation
-        // assert when the audio thread invokes it — that was the crash).
-        Self.installTap(on: engine, tapFormat: tapFmt, converter: converter, analyzerFormat: fmt, into: b)
-        engine.prepare()
-        try engine.start()
     }
 
     // Chord-up: stop capture, flush finals, return the whole transcript.
     func stop() async -> String {
-        teardownAudio()
+        teardownAudio()                           // always tear down capture, regardless of finalize outcome
         builder?.finish()
-        try? await analyzer?.finalizeAndFinishThroughEndOfInput()
-        await resultsTask?.value                  // let the tail final results land
+        var finalizeOK = false
+        do { try await analyzer?.finalizeAndFinishThroughEndOfInput(); finalizeOK = true }
+        catch { finalizeOK = false }
+        // Bound the tail wait: if finalize threw it may never close `transcriber.results`, so the
+        // consumer's `for try await` would hang forever and wedge the caller. Only wait (with a 2s cap)
+        // when finalize succeeded; otherwise skip straight to cancelling the consumer.
+        if finalizeOK, let rt = resultsTask {
+            await withTaskGroup(of: Void.self) { g in
+                g.addTask { await rt.value }                       // the tail final results landing
+                g.addTask { try? await Task.sleep(for: .seconds(2)) } // …raced against a timeout
+                _ = await g.next()                                // take whichever finishes first
+                g.cancelAll()
+            }
+        }
+        resultsTask?.cancel()                     // stop the consumer regardless (no-op if it already ended)
         let text = String(finalized.characters).trimmingCharacters(in: .whitespacesAndNewlines)
         reset()
         return text
@@ -104,7 +132,7 @@ final class AppleSpeech: ObservableObject {
 
     private func teardownAudio() {
         if engine.isRunning { engine.stop() }
-        engine.inputNode.removeTap(onBus: 0)
+        if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }   // only remove a tap we actually installed
     }
     private func reset() { analyzer = nil; transcriber = nil; builder = nil; resultsTask = nil }
 
@@ -125,6 +153,7 @@ final class AppleSpeech: ObservableObject {
     nonisolated private static func installTap(on engine: AVAudioEngine, tapFormat: AVAudioFormat,
                                                converter: AVAudioConverter, analyzerFormat: AVAudioFormat,
                                                into builder: AsyncStream<AnalyzerInput>.Continuation) {
+        engine.inputNode.removeTap(onBus: 0)   // never double-install on bus 0 (AVFoundation traps: 'nullptr == Tap()')
         engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { buf, _ in
             if let out = convert(buf, converter, analyzerFormat) {
                 builder.yield(AnalyzerInput(buffer: out))
@@ -185,5 +214,5 @@ final class AppleSpeech: ObservableObject {
         AudioObjectGetPropertyData(id, &a, 0, nil, &s, &t); return t
     }
 
-    enum Err: Error { case noFormat, unsupportedLocale }
+    enum Err: Error { case noFormat, unsupportedLocale, notAuthorized }
 }

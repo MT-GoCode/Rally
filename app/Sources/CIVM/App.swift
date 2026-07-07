@@ -399,6 +399,7 @@ struct RootView: View {
     @State private var systemOpen = true
     @State private var contextOpen = true
     @State private var reminderOpen = true
+    @State private var sourceShown: Set<UUID> = []   // messages flipped to raw-markdown (selectable) source view
 
     // ---- modes / voice settings (persisted; shared with the Settings sheet) ----
     // The @AppStorage vars stay purely as render-invalidation triggers; the computed values delegate
@@ -799,9 +800,13 @@ struct RootView: View {
     var textInputRegion: some View {
         VStack(spacing: 6) {
             if !session.pastedImages.isEmpty { thumbnailBar }
-            HStack {
-                TextField(session.pinned ? "ask about the pinned context…" : "ask anything…", text: $session.input)
-                    .textFieldStyle(.roundedBorder).disabled(!session.canCompose).onSubmit { session.send() }
+            HStack(alignment: .bottom) {
+                // Multi-line: vertical axis grows 1…6 lines. Enter sends; Shift+Enter inserts a newline
+                // (handled in the keyDown monitor below, since a vertical TextField makes Return a newline).
+                TextField(session.pinned ? "ask about the pinned context…" : "ask anything…",
+                          text: $session.input, axis: .vertical)
+                    .textFieldStyle(.roundedBorder).lineLimit(1...14)   // grows to 14 lines, then scrolls
+                    .disabled(!session.canCompose)
                     .focused($inputFocused)
                 Button(session.busy ? "Interrupt & Ask" : "Ask") { session.send() }
                     .disabled(!session.canSend)
@@ -824,6 +829,12 @@ struct RootView: View {
                    inputFocused,
                    NSPasteboard.general.availableType(from: [.png, .tiff]) != nil {
                     pasteChatImages(); return nil
+                }
+                // Return in the chat input: plain Enter sends (consume so no newline is inserted);
+                // Shift+Enter falls through to the vertical TextField, which inserts a newline.
+                if inputFocused, e.keyCode == 36 || e.keyCode == 76,      // Return / keypad Enter
+                   !e.modifierFlags.contains(.shift) {
+                    session.send(); return nil
                 }
                 return e
             }
@@ -955,7 +966,26 @@ struct RootView: View {
                     }
                 }
                 if !body.isEmpty {
-                    if isUser { Text(body) } else { MarkdownText(raw: body) }   // render markdown live
+                    // User text is its own source (highlight → copy = source). Agent text is rendered by
+                    // Textual (CoreText), whose partial selection can't map back to markdown — so a
+                    // per-message "View source" toggle swaps in the raw markdown as selectable monospace
+                    // text (highlight any part → copy = exact source). Right-click also copies full source.
+                    let showSrc = id.map { sourceShown.contains($0) } ?? false
+                    Group {
+                        if isUser || showSrc {
+                            Text(body).font(showSrc ? .system(size: 12, design: .monospaced) : .body)
+                        } else {
+                            MarkdownText(raw: body)
+                        }
+                    }
+                    .contextMenu {
+                        Button { copyText(body) } label: { Label("Copy source (markdown)", systemImage: "chevron.left.forwardslash.chevron.right") }
+                        if let id, !isUser {
+                            Button { toggleSource(id) } label: {
+                                Label(showSrc ? "View rendered" : "View source", systemImage: showSrc ? "eye" : "curlybraces")
+                            }
+                        }
+                    }
                 }
                 if let a = appendix { AppendixView(a) }              // distinct, collapsible footnote
                 if interrupted { Text("⎯ interrupted").font(.caption2).foregroundStyle(.secondary) }
@@ -972,6 +1002,10 @@ struct RootView: View {
     @ViewBuilder func bubbleMenu(id: UUID, body: String) -> some View {
         Menu {
             Button { copyText(body) } label: { Label("Copy", systemImage: "doc.on.doc") }
+            Button { toggleSource(id) } label: {
+                Label(sourceShown.contains(id) ? "View rendered" : "View source",
+                      systemImage: sourceShown.contains(id) ? "eye" : "curlybraces")
+            }
             Button(role: .destructive) { session.resetToHere(id) } label: {
                 Label("Reset to here", systemImage: "arrow.uturn.backward")
             }
@@ -985,6 +1019,10 @@ struct RootView: View {
     func copyText(_ s: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(s, forType: .string)
+    }
+
+    func toggleSource(_ id: UUID) {
+        if sourceShown.contains(id) { sourceShown.remove(id) } else { sourceShown.insert(id) }
     }
 
     // ---- chat-input image paste (⌘V) → the session's pasted-images staging bar ----

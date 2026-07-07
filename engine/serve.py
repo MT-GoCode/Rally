@@ -348,9 +348,12 @@ def _do_pin(job):
         kv = make_prompt_cache(model)
         # encode images in small batches, then prefill the KV in chunks (one image per chunk, text in
         # PREFILL_STEP pieces) — both cap the memory peak. No generated token, so the KV is exactly pin_len.
-        pv = _per_turn_pixels(paths) if paths else None
-        feats = _batch_encode_images(pv) if pv is not None else None
         with MLX_LOCK:
+            # _batch_encode_images is a full vision-tower forward and must be serialized against the
+            # Parakeet voice thread's MLX ops (the old one-shot pin ran the vision encode inside
+            # stream_generate under the lock), so encode INSIDE the lock, before _pin_prefill.
+            pv = _per_turn_pixels(paths) if paths else None
+            feats = _batch_encode_images(pv) if pv is not None else None
             _pin_prefill(kv, input_ids, pv, feats)
     else:
         kv, pin_len = make_prompt_cache(model), 0
@@ -466,6 +469,10 @@ def _do_prefill(job):
         open_list = _strip_open(ids)               # drop trailing <end_of_turn> → user turn stays OPEN
         pin_len = st["pin_len"]
         lcp = _lcp(PF["ids"] or [], open_list)      # conversation-token reuse (past the frozen pin)
+        if per_turn_paths:
+            # per_pv must match the image placeholders in the fed tokens: with per-turn images their
+            # placeholders sit in the reused prefix, so re-feed the whole conversation past the pin.
+            lcp = 0
         if lcp >= len(open_list):
             PF["ids"] = open_list                   # nothing new to feed (partial unchanged/shorter)
             job.result = {"fed": len(open_list)}; return
@@ -516,6 +523,10 @@ def _do_precache(job):
         target, pv = _precache_target(job.params["messages"], job.params["reminder"], job.params["mode"])
         pin_len = st["pin_len"]
         lcp = _lcp(PF["ids"] or [], target)
+        if pv is not None:
+            # pv must match the image placeholders in the fed tokens: with per-turn images their
+            # placeholders sit in the reused prefix, so re-feed the whole target past the pin.
+            lcp = 0
         if lcp < len(target):
             trim_kv(st["kv"], pin_len + lcp)
             feed = mx.array([target[lcp:]])
@@ -544,6 +555,13 @@ def _do_generate(job):
         # match lands right after the previous user message — ~[last ai + new user + reminder] re-feeds.
         pf = PF["ids"] or []
         lcp_conv = _lcp(pf, conv_ids)
+        if per_turn_paths:
+            # per_pv holds pixels for ALL per-turn chat images, whose placeholder tokens live in the
+            # reused prefix. Cross-turn LCP reuse would feed a tail with no image placeholders while
+            # per_pv still carries those pixels → masked_scatter shape mismatch. Disable conversation
+            # reuse (pin stays reused via trim_kv below) so feed_list = conv_ids carries every image
+            # placeholder that per_pv describes. Text-only chats (per_turn_paths empty) stay cached.
+            lcp_conv = 0
         trim_kv(st["kv"], pin_len + lcp_conv)
         feed_list = conv_ids[lcp_conv:]
         if not feed_list:                    # nothing new (shouldn't happen — genprompt differs each turn)

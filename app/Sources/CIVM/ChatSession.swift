@@ -133,6 +133,10 @@ enum VoiceState: Equatable {
     // chord/overlay and reports state; the app runs Apple while listening and finalizes on chord-up. ----
     private let apple = AppleSpeech()
     private var appleRunning = false
+    // Serializes the AppleSpeech lifecycle: every start/stop/cancel chains onto the previous one
+    // (await prev.value first) so a fast chord can't interleave them at their await points — which
+    // would race a start()'s installTap against a teardown/reset and crash AVFoundation (fix A).
+    private var voiceTask: Task<Void, Never>? = nil
 
     // ---- settings: STORED copies refreshed from the shared accessors on didChangeNotification
     // (fix C/E). No per-render UserDefaults lookups — the old computed getters were a hot loop. ----
@@ -143,6 +147,8 @@ enum VoiceState: Equatable {
     private var shotBinding: String = SK.shotBindingValue
     private var shotStyleRaw: String = SK.shotStyleValue
     private var copyBinding: String = SK.copyBindingValue
+    private var reminderModeStored: ReminderMode = .current
+    private var modeSwitchTask: Task<Void, Never>? = nil   // in-flight re-cache after a mode switch
 
     // ---- cache gate / status (derive from store.chat + caching state) ----
     // engine currently holds a pin for THIS chat (maybe a stale version — that still allows chatting)
@@ -283,7 +289,10 @@ enum VoiceState: Equatable {
         // Cutting off a turn that never produced a token (e.g. still pinning) is just a normal ask.
         if interrupting && prevHadOutput { um.isInterruption = true }
         store.chat.messages.append(um)
-        busy = true; streaming = ""; precache = ""      // new turn: consumes the warmed cache, hide the chip
+        busy = true; streaming = ""      // new turn: consumes the warmed cache
+        await modeSwitchTask?.value       // if a reminder-mode switch is still re-warming the cache, wait
+        modeSwitchTask = nil
+        precache = ""                     // hide the chip now that the switch re-cache (if any) is done
         if !pinned { await pinNow() }           // pin on demand (caching first isn't required)
         do {
             let meta = try await engine.chat(messages: buildEngineMessages(), reminder: store.chat.reminder,
@@ -350,6 +359,13 @@ enum VoiceState: Equatable {
         askTask?.cancel()
         streaming = ""; busy = false
         store.chat.messages = Array(store.chat.messages.prefix(through: i))
+        // the truncated turn's per-message accounting no longer describes any live turn — clear it so the
+        // tokenLine breakdown/chip reflect the shortened conversation. Leave pinnedTokens: the pin is
+        // unchanged (fix C).
+        lastReused = 0; lastNew = 0; lastPinned = 0; lastTtft = 0
+        anewParts = []
+        precache = ""
+        store.chat.chatTokens = 0
         store.save()
     }
 
@@ -408,6 +424,11 @@ enum VoiceState: Equatable {
         mode = m; submode = sm; transcription = tr
         hotkey = hk; shotBinding = sb; shotStyleRaw = ss; copyBinding = cb
         if configDirty { postVoiceConfig() }
+        // reminder placement changed (via the Settings picker OR the in-chat control) → re-warm the
+        // cache with the new mode. Idempotent: setReminderMode already bumped reminderModeStored when
+        // the in-chat control fired, so this only fires for the Settings-picker path.
+        let rm = ReminderMode.current
+        if rm != reminderModeStored { setReminderMode(rm) }
     }
 
     // While Apple streams, prefill Gemma's KV from the growing partial (debounced) so the final ask
@@ -428,15 +449,24 @@ enum VoiceState: Equatable {
     }
 
     // Switch reminder placement mid-chat: persist it, then re-warm the cache with the new mode so the
-    // next message stays instant. The chip shows caching → ready.
+    // next message stays instant. The chip shows caching → ready. The re-cache is tracked in
+    // modeSwitchTask so the NEXT send() waits for it (else the /chat races the /precache and re-feeds
+    // the reminder). Idempotent via reminderModeStored so the in-chat control and the Settings picker
+    // (which both write SK.reminderMode) don't double-fire.
     func setReminderMode(_ m: ReminderMode) {
+        reminderModeStored = m
         UserDefaults.standard.set(m.rawValue, forKey: SK.reminderMode)
         guard engine.ready, !store.chat.messages.isEmpty else { return }
         precache = "working"
-        Task { [weak self] in
+        let t = Task { [weak self] in
             guard let self else { return }
             await self.engine.precache(messages: self.buildEngineMessages(), reminder: self.store.chat.reminder, reminderMode: m.rawValue)
-            self.precache = "done"
+        }
+        modeSwitchTask = t
+        Task { [weak self] in                       // chip: working → ready (separate, so send() waits only on `t`)
+            await t.value
+            guard let self else { return }
+            if self.precache == "working" { self.precache = "done" }
             try? await Task.sleep(for: .seconds(1.4))
             if self.precache == "done" { self.precache = "" }
         }
@@ -477,13 +507,32 @@ enum VoiceState: Equatable {
             case .listening where !appleRunning:
                 appleRunning = true; livePartial = ""; preSent = 0
                 let loc = SK.speechLocaleValue
-                Task { try? await self.apple.start(localeID: loc) }
+                let prev = voiceTask                        // chain onto any in-flight lifecycle op (fix A)
+                voiceTask = Task { [weak self] in
+                    await prev?.value
+                    guard let self else { return }
+                    do {
+                        try await self.apple.start(localeID: loc)
+                    } catch {
+                        // start() failed (perm denied / no format / …): don't leave a false running
+                        // state. AppleSpeech.start already tore itself down; reset our voice state and
+                        // route to the idle/cancel path so the chord doesn't silently no-op (fix B).
+                        NSLog("[Rally] AppleSpeech.start failed: \(error.localizedDescription)")
+                        self.appleRunning = false; self.livePartial = ""; self.preSent = 0
+                        self.voiceState = .idle
+                        await self.apple.cancel()           // idempotent belt-and-suspenders teardown
+                    }
+                }
                 startPrefillLoop()                          // prefill Gemma from Apple's partials as you talk
             case .ready where appleRunning && p.seq != voiceSeq:
                 voiceSeq = p.seq; appleRunning = false      // stops the prefill loop
-                Task {
+                let seq = p.seq
+                let prev = voiceTask                        // wait for the pending start() before stopping (fix A)
+                voiceTask = Task { [weak self] in
+                    await prev?.value
+                    guard let self else { return }
                     let text = await self.apple.stop()
-                    await self.engine.voiceAck(seq: p.seq)
+                    await self.engine.voiceAck(seq: seq)
                     self.preSent = 0                        // dictation over → clear live count (→ "reused" after /chat)
                     guard !text.isEmpty else { return }
                     let (pre, imgs) = self.drainQueuedCaptures()
@@ -491,7 +540,11 @@ enum VoiceState: Equatable {
                 }
             case .idle where appleRunning:                  // ESC / cancel
                 appleRunning = false; livePartial = ""; preSent = 0
-                Task { await self.apple.cancel() }
+                let prev = voiceTask                        // wait for the pending start() before cancelling (fix A)
+                voiceTask = Task { [weak self] in
+                    await prev?.value
+                    await self?.apple.cancel()
+                }
             default: break
             }
             return
