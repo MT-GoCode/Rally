@@ -23,12 +23,10 @@ Endpoints (localhost; JSON; ndjson where noted):
   POST /new               -> drop the pinned cache
   POST /voice/config      -> {voiceEnabled, captureEnabled, submode, streaming, key,
                              shot:{binding,style}, copy:{binding}}   (legacy "enabled"==voiceEnabled)
-  POST /voice/context     -> {messages, reminder}  (base transcript for streaming prefill)
   GET  /voice/poll        -> {state, partial, final, seq, perm, captures:[{kind,data|text}]}
   POST /voice/ack         -> {seq}
   POST /voice/captures-ack-> {count}  (drop the first `count` drained capture events)
-  POST /voice/inject      -> {text} (final->ready) | {partial} (streaming prefill)
-                             | {capture:{kind:"text"|"image", text|data}}  [test hook]
+  POST /voice/inject      -> {text} (final->ready) | {capture:{kind:"text"|"image", text|data}}  [test hook]
 
 Block shape (interro-verbatim): {"type":"text","text":..} |
   {"type":"image","source":{"type":"base64","media_type":..,"data":..}}
@@ -73,14 +71,16 @@ MLX_LOCK = threading.Lock()                # serialize Gemma <-> parakeet GPU wo
 GEMMA_Q = queue.Queue()                    # jobs for the single Gemma worker thread
 
 st = {}                                    # pinned chat: kv, pin_len, ctx_content, ctx_paths, tmpdir, system
-PF = {"ids": None}                         # streaming-prefill state (Gemma-worker-owned): token id
-                                           #   list currently in the KV past the pin, or None (pin only)
+PF = {"ids": None}                         # streaming-prefill: token-id list currently fed past the pin
+PRECACHE = {"state": "idle"}               # post-response KV warm-up for the NEXT message: idle|working|done
+                                           # (Apple partials prefill Gemma while you talk; /chat LCP-reuses it)
 
 # ---- voice state machine (shared; guarded by VLOCK) ----
+# Streaming submode = Apple SpeechTranscriber (Swift-side); Python only drives the overlay + reports
+# chord state. Transcribe-after submode = Parakeet BATCH here. No Python streaming/prefill anymore.
 VLOCK = threading.Lock()
 VOICE = {"enabled": False, "submode": "toggle", "streaming": False, "key": "ctrl+alt",
          "state": "idle", "partial": "", "final": None, "seq": 0, "perm": True}
-VOICE_CTX = {"messages": [], "reminder": None}   # base transcript for streaming prefill
 
 # ---- capture shortcuts (screenshot + copy-to-chat); config guarded by VLOCK ----
 # The tap is active whenever a chat is open in ANY mode (voice OR capture enabled). "enabled" here
@@ -101,6 +101,14 @@ VOICE_Q = queue.Queue()  # commands for the voice thread: ("start",streaming)/("
 
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
+
+
+def _free_mem():
+    """Release MLX's Metal buffer pool back to the OS. After a big transient (the pin's vision encode +
+    prefill), MLX holds the freed buffers in its cache — get_active_memory stays low but the PROCESS
+    footprint sits at the peak. clear_cache() returns them so Activity Monitor drops back to ~weights+KV."""
+    try: (getattr(mx, "clear_cache", None) or getattr(getattr(mx, "metal", None), "clear_cache", lambda: None))()
+    except Exception: pass
 
 
 def load_model():
@@ -167,6 +175,66 @@ def trim_kv(kv, n):
                 c.offset = n
 
 
+# ---- batched image encoding: cap the pin-time memory peak ----
+# Encoding ALL context images through the vision tower at once is the transient memory spike at pin
+# time (measured: 18GB steady → 28.7GB peak for a 34-image paper). We encode them a few at a time and
+# hand the finished features to the pin via stream_generate's vision_cache, so the pin's forward never
+# runs the tower on all images together. The features are identical to encoding-all-at-once, so the
+# resulting KV — and all cross-turn caching / precache built on it — is byte-for-byte unchanged.
+VISION_BATCH = int(os.environ.get("CIVM_VISION_BATCH", "4"))
+# Chunked prefill: process a long pinned prompt this-many tokens at a time instead of one giant
+# forward (a 9k-token pin was the memory peak). Caps LM activation to one chunk; KV is identical.
+PREFILL_STEP = int(os.environ.get("CIVM_PREFILL_STEP", "512"))
+
+
+def _batch_encode_images(pv):
+    """vision_tower + embed_vision over pixel_values, VISION_BATCH images at a time, concatenated."""
+    n = int(pv.shape[0])
+    if n <= VISION_BATCH:
+        f = model.encode_image(pv); mx.eval(f); return f
+    parts = []
+    for i in range(0, n, VISION_BATCH):
+        f = model.encode_image(pv[i:i + VISION_BATCH]); mx.eval(f); parts.append(f)
+    # encode_image returns [1, images*tokens_per_image, hidden]; join along the token axis.
+    return mx.concatenate(parts, axis=1)
+
+
+def _img_token_id():
+    return getattr(config, "image_token_id", None) or \
+           getattr(getattr(config, "text_config", config), "image_token_id", -1)
+
+
+def _pin_prefill(kv, input_ids, pv, feats):
+    """Build the pinned KV by pushing the prompt through the LM in CHUNKS instead of one 9k-token
+    forward (that single forward's activations were the ~10GB memory spike). Each whole image is its
+    OWN chunk — so its bidirectional attention stays intact — and text goes in PREFILL_STEP-token
+    chunks; cross-image/text attention is causal via the growing cache. mx.eval() after each chunk
+    frees that chunk's activations, capping the peak at ~one chunk's worth. The KV is identical to a
+    single forward (same masks, same order), so caching quality is unchanged."""
+    img_id = _img_token_id()
+    emb = model.get_input_embeddings(input_ids=input_ids, pixel_values=pv, cached_image_features=feats)
+    inputs_embeds, pli = emb.inputs_embeds, emb.per_layer_inputs
+    ids = input_ids.flatten().tolist()
+    is_img = [t == img_id for t in ids]
+    mm_full = mx.array([[1 if b else 0 for b in is_img]], dtype=mx.int32)   # image spans → bidirectional
+    lm = model.language_model.model
+    N = len(ids); start = 0
+    while start < N:
+        if is_img[start]:                       # a whole contiguous image run = one chunk (keep it intact)
+            end = start + 1
+            while end < N and is_img[end]:
+                end += 1
+        else:                                   # a text run, chunked to PREFILL_STEP
+            end = start + 1
+            while end < N and not is_img[end] and (end - start) < PREFILL_STEP:
+                end += 1
+        # full mm ids up to `end` so the bidirectional overlay sees each image's whole block
+        h = lm(inputs_embeds=inputs_embeds[:, start:end], per_layer_inputs=pli,
+               cache=kv, mm_token_type_ids=mm_full[:, :end])
+        mx.eval(h)                              # force this chunk's forward + free its activations
+        start = end
+
+
 def _mlx_messages(messages, tmpdir, paths):
     """App messages [{role,content:[block]}] -> mlx messages; per-turn images -> tmpdir (paths appended)."""
     out = []
@@ -200,17 +268,6 @@ def _per_turn_pixels(paths):
     inp = prepare_inputs(processor, images=paths, prompts=prompt,
                          image_token_index=getattr(config, "image_token_index", None))
     return inp.get("pixel_values")
-
-
-def _lcp(a, b):
-    """Longest common prefix length of two token-id lists."""
-    if not a or not b:
-        return 0
-    n = min(len(a), len(b))
-    i = 0
-    while i < n and a[i] == b[i]:
-        i += 1
-    return i
 
 
 def _reminder_content(reminder, tmpdir, paths):
@@ -251,6 +308,8 @@ def gemma_worker():
                 _do_generate(job)
             elif job.kind == "prefill":
                 _do_prefill(job)
+            elif job.kind == "precache":
+                _do_precache(job)
         except Exception as e:
             import traceback
             log("worker ERR", traceback.format_exc())
@@ -280,39 +339,194 @@ def _do_pin(job):
     msgs = build_messages(d.get("system"), ctx_content, [])
     if msgs:
         pin_prompt = prompt_str(msgs, len(paths), add_gen=False)
-        pin_len = int(token_ids(pin_prompt, paths).shape[-1])
+        input_ids = token_ids(pin_prompt, paths)
+        pin_len = int(input_ids.shape[-1])
         if pin_len > TOKEN_LIMIT:
             shutil.rmtree(tmpdir, ignore_errors=True)
             job.result = {"ok": False, "overLimit": True, "tokens": pin_len}
             return
         kv = make_prompt_cache(model)
+        # encode images in small batches, then prefill the KV in chunks (one image per chunk, text in
+        # PREFILL_STEP pieces) — both cap the memory peak. No generated token, so the KV is exactly pin_len.
+        pv = _per_turn_pixels(paths) if paths else None
+        feats = _batch_encode_images(pv) if pv is not None else None
         with MLX_LOCK:
-            for _ in stream_generate(model, processor, pin_prompt, image=paths or None,
-                                     prompt_cache=kv, max_tokens=1, temperature=0.0):
-                pass
-        trim_kv(kv, pin_len)       # drop the 1 primed token -> cache holds exactly the prefix
+            _pin_prefill(kv, input_ids, pv, feats)
     else:
         kv, pin_len = make_prompt_cache(model), 0
     _drop_pin()
     st.update(kv=kv, pin_len=pin_len, ctx_content=ctx_content, ctx_paths=paths,
               tmpdir=tmpdir, system=d.get("system"))
     PF["ids"] = None
+    _free_mem()                # release the pin's transient buffers so the process drops to ~weights+KV
     job.result = {"ok": True, "overLimit": False, "tokens": pin_len}
 
 
-def _build_full(messages, reminder):
-    """Render [pin prefix + messages(+reminder on last user)] -> (full_ids mx, per_turn_paths, tmpdir).
-    per-turn images (in messages OR reminder) written to a per-request tmpdir, ordered AFTER pinned."""
+def _bos_id():
+    tok = getattr(processor, "tokenizer", processor)
+    return getattr(tok, "bos_token_id", None)
+
+
+def _render_ids(mlx_msgs, paths, add_gen):
+    """Tokenize conversation-only mlx messages (no system/ctx), drop the leading <bos> so the ids are
+    exactly the tokens that follow the pinned [system+ctx+ACK] prefix. Deterministic (pure text)."""
+    prompt = prompt_str(mlx_msgs, len(paths), add_gen=add_gen)
+    ids = token_ids(prompt, paths).flatten().tolist()
+    bos = _bos_id()
+    if bos is not None and ids and ids[0] == bos:
+        ids = ids[1:]
+    return ids
+
+
+def _place_reminder(mlx_msgs, rem_content, mode):
+    """Reminder placement — the latency/adherence trade-off:
+    'after' (aka 'last'): AFTER the last user msg — best recency, but on the next turn's critical path.
+    'before': BEFORE the last user msg — precacheable (precedes the unknown question), still recent.
+    'start':  BEFORE the FIRST user msg — cached once for the whole chat, fastest, weakest recency."""
+    if not rem_content:
+        return mlx_msgs
+    if mode in ("before", "start"):
+        order = range(len(mlx_msgs) - 1, -1, -1) if mode == "before" else range(len(mlx_msgs))
+        sep = [{"type": "text", "text": "\n\n"}]
+        for i in order:
+            if mlx_msgs[i]["role"] == "user":
+                mlx_msgs[i] = {"role": "user", "content": list(rem_content) + sep + list(mlx_msgs[i]["content"])}
+                return mlx_msgs
+        return mlx_msgs
+    return _append_reminder(mlx_msgs, rem_content)
+
+
+def _conv_ids(messages, reminder, mode="last"):
+    """Tokenize ONLY the conversation (messages + reminder placed per `mode`) with turn markers — the
+    tokens that FOLLOW the pinned [system+ctx+ACK] prefix in the KV.
+
+    We do NOT re-render the multimodal context here. Its image-token expansion is NOT reproducible
+    run-to-run, so re-tokenizing the whole prompt drifts the pin boundary and shatters cross-turn
+    reuse (the match kept landing inside the context images). Rendering the conversation alone and
+    dropping the leading <bos> yields exactly the tokens that sit after the ACK — pure text (plus any
+    per-turn chat images), which tokenizes deterministically, so the prefix match is stable.
+
+    Returns (conv_ids: list[int], per_turn_pixels, per_turn_paths, tmpdir)."""
     tmpdir = tempfile.mkdtemp(prefix="civm-turn-")
     per_turn_paths = []
     mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
     rem_content = _reminder_content(reminder, tmpdir, per_turn_paths)
-    mlx_msgs = _append_reminder(mlx_msgs, rem_content)
-    all_paths = st["ctx_paths"] + per_turn_paths
-    full_msgs = build_messages(st["system"], st["ctx_content"], mlx_msgs)
-    prompt = prompt_str(full_msgs, len(all_paths), add_gen=True)
-    full_ids = token_ids(prompt, all_paths)
-    return full_ids, per_turn_paths, tmpdir
+    mlx_msgs = _place_reminder(mlx_msgs, rem_content, mode)
+    ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=True)   # conversation only (no system/ctx)
+    per_pv = _per_turn_pixels(per_turn_paths)
+    return ids, per_pv, per_turn_paths, tmpdir
+
+
+def _lcp(a, b):
+    """Longest common prefix length of two token-id lists."""
+    n = min(len(a or []), len(b or [])); i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+_EOT = {"id": "unset"}
+def _eot_id():
+    if _EOT["id"] == "unset":
+        tok = getattr(processor, "tokenizer", processor)
+        try: _EOT["id"] = tok.convert_tokens_to_ids("<end_of_turn>")
+        except Exception: _EOT["id"] = None
+    return _EOT["id"]
+
+
+def _strip_open(ids_list):
+    """Drop the trailing '<end_of_turn>' so the last user turn stays OPEN — a strict prefix of the
+    final turn's tokens (so /chat's LCP reuse matches through the dictated text)."""
+    eot = _eot_id()
+    if eot is not None:
+        for i in range(len(ids_list) - 1, -1, -1):
+            if ids_list[i] == eot:
+                return ids_list[:i]
+    return ids_list
+
+
+def _do_prefill(job):
+    """Streaming prefill (Apple partial → Gemma KV): feed [messages + OPEN user(partial)] past the
+    pin, incrementally. max_tokens=0 = clean prefill (no generated token pollutes the sliding cache);
+    the user turn is kept OPEN (no <end_of_turn>) so /chat reuses it exactly. Returns fed-past-pin."""
+    if not st.get("kv"):
+        job.result = {"fed": 0}; return
+    partial = job.params["partial"]
+    messages = job.params["messages"]
+    tmpdir = tempfile.mkdtemp(prefix="civm-pf-")
+    try:
+        per_turn_paths = []
+        mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
+        mlx_msgs = mlx_msgs + [{"role": "user", "content": [{"type": "text", "text": partial}]}]
+        prompt = prompt_str(mlx_msgs, len(per_turn_paths), add_gen=False)   # conversation only (no system/ctx)
+        ids = token_ids(prompt, per_turn_paths).flatten().tolist()
+        bos = _bos_id()
+        if bos is not None and ids and ids[0] == bos:
+            ids = ids[1:]
+        open_list = _strip_open(ids)               # drop trailing <end_of_turn> → user turn stays OPEN
+        pin_len = st["pin_len"]
+        lcp = _lcp(PF["ids"] or [], open_list)      # conversation-token reuse (past the frozen pin)
+        if lcp >= len(open_list):
+            PF["ids"] = open_list                   # nothing new to feed (partial unchanged/shorter)
+            job.result = {"fed": len(open_list)}; return
+        trim_kv(st["kv"], pin_len + lcp)            # a revised partial diverged → drop the wrong tail
+        feed = mx.array([open_list[lcp:]])
+        per_pv = _per_turn_pixels(per_turn_paths)
+        with MLX_LOCK:
+            for _ in stream_generate(model, processor, "", input_ids=feed, pixel_values=per_pv,
+                                     prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
+                pass
+        PF["ids"] = open_list
+        job.result = {"fed": len(open_list)}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _precache_target(messages, reminder, mode):
+    """The token sequence the KV should hold BEFORE the next user message arrives (`messages` already
+    includes the just-generated answer). 'last' mode → clean history through the answer. 'before'
+    mode → clean history + an OPEN user turn holding just the reminder (so only the next question is
+    left to feed). Returns (target_ids, per_turn_pixels)."""
+    tmpdir = tempfile.mkdtemp(prefix="civm-pc-")
+    try:
+        paths = []
+        mlx = _mlx_messages(messages, tmpdir, paths)
+        if mode == "before":
+            rem = _reminder_content(reminder, tmpdir, paths)
+            if rem:
+                mlx = mlx + [{"role": "user", "content": list(rem) + [{"type": "text", "text": "\n\n"}]}]
+            ids = _strip_open(_render_ids(mlx, paths, add_gen=False))   # + open user turn (reminder only)
+        elif mode == "start":
+            mlx = _place_reminder(mlx, _reminder_content(reminder, tmpdir, paths), "start")
+            ids = _render_ids(mlx, paths, add_gen=False)                # reminder pinned on Q1, through answer
+        else:  # after/last
+            ids = _render_ids(mlx, paths, add_gen=False)                # clean history; reminder rides next Q
+        return ids, _per_turn_pixels(paths)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _do_precache(job):
+    """Warm the KV for the NEXT message the instant the current answer finishes (idle time). Feeds
+    only the divergent tail past what's already cached, so the next /chat re-feeds ~just the question."""
+    if not st.get("kv"):
+        PRECACHE["state"] = "idle"; return
+    PRECACHE["state"] = "working"
+    try:
+        target, pv = _precache_target(job.params["messages"], job.params["reminder"], job.params["mode"])
+        pin_len = st["pin_len"]
+        lcp = _lcp(PF["ids"] or [], target)
+        if lcp < len(target):
+            trim_kv(st["kv"], pin_len + lcp)
+            feed = mx.array([target[lcp:]])
+            with MLX_LOCK:
+                for _ in stream_generate(model, processor, "", input_ids=feed, pixel_values=pv,
+                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
+                    pass
+        PF["ids"] = target                     # next /chat's LCP reuses everything up to the question
+    finally:
+        PRECACHE["state"] = "done"
+        _free_mem()
 
 
 def _do_generate(job):
@@ -321,22 +535,55 @@ def _do_generate(job):
         return
     messages = job.params["messages"]
     reminder = job.params["reminder"]
-    full_ids, per_turn_paths, tmpdir = _build_full(messages, reminder)
+    mode = job.params.get("mode") or "last"
+    conv_ids, per_pv, per_turn_paths, tmpdir = _conv_ids(messages, reminder, mode)
     try:
-        full_list = full_ids.flatten().tolist()
-        pin_len = st["pin_len"]
-        # prefill reuse: trim to the longest common prefix with what's already fed (>= pin).
-        lcp = max(_lcp(PF["ids"] or [], full_list), pin_len)
-        trim_kv(st["kv"], lcp)
-        feed_ids = full_ids[:, lcp:]
-        per_pv = _per_turn_pixels(per_turn_paths)
-        reused = lcp - pin_len       # tokens past pin reused from streaming prefill
-        new_tokens = int(feed_ids.shape[-1])
+        pin_len = st["pin_len"]              # frozen physical length of the pinned [system+ctx+ACK] KV
+        # Cross-turn reuse on the CONVERSATION tokens only (pure text past the pin → deterministic).
+        # LCP against last turn's conversation tokens; the reminder rides the last user turn so the
+        # match lands right after the previous user message — ~[last ai + new user + reminder] re-feeds.
+        pf = PF["ids"] or []
+        lcp_conv = _lcp(pf, conv_ids)
+        trim_kv(st["kv"], pin_len + lcp_conv)
+        feed_list = conv_ids[lcp_conv:]
+        if not feed_list:                    # nothing new (shouldn't happen — genprompt differs each turn)
+            feed_list = conv_ids[-1:]; lcp_conv = len(conv_ids) - 1
+            trim_kv(st["kv"], pin_len + lcp_conv)
+        feed_ids = mx.array([feed_list])
+        reused = lcp_conv                    # conversation tokens reused from the cross-turn cache
+        new_tokens = len(feed_list)
+        # Breakdown of what was ACTUALLY forward-passed this turn (the feed tail), IN ORDER, summing
+        # to new_tokens. A piece only counts if it's genuinely in the fed tail — a cached reminder or
+        # cached last-reply contributes 0 (that's the whole point of the reminder modes).
+        def _txt(bl): return "".join(b.get("text", "") for b in (bl or []) if b.get("type") == "text")
+        _tok = getattr(processor, "tokenizer", processor)
+        def _n(s):
+            try: return len(_tok.encode(s)) if s else 0
+            except Exception: return 0
+        try: fed_text = _tok.decode(feed_list)
+        except Exception: fed_text = ""
+        def _fed(s): return bool(s.strip()) and s.strip()[:60] in fed_text
+        rem_txt = REMINDER if reminder is None else _txt(reminder)
+        user_txt = _txt(messages[-1]["content"]) if messages and messages[-1].get("role") == "user" else ""
+        ai_txt = _txt(messages[-2]["content"]) if len(messages) >= 2 and messages[-2].get("role") == "assistant" else ""
+        rem_n = _n(rem_txt) if _fed(rem_txt) else 0
+        ai_n = _n(ai_txt) if _fed(ai_txt) else 0
+        user_n = _n(user_txt) if _fed(user_txt) else 0
+        parts = []                           # in forward-pass order
+        if ai_n: parts.append(("last reply", ai_n))
+        if mode == "before" and rem_n: parts.append(("reminder", rem_n))
+        if user_n: parts.append(("your msg", user_n))
+        if mode not in ("before", "start") and rem_n: parts.append(("reminder", rem_n))
+        struct_n = max(0, new_tokens - sum(n for _, n in parts))   # turn markers / gen prompt (NOT the model appendix)
+        if struct_n: parts.append(("structure", struct_n))
+        anew_parts = [{"label": l, "n": n} for l, n in parts]
         gen = stream_generate(model, processor, "", input_ids=feed_ids,
                               pixel_values=per_pv, prompt_cache=st["kv"],
                               max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
         ttft, last, start = None, None, time.time()
         gen_count = 0
+        gen_ids = []                             # sampled token ids (to record the KV's physical tail)
+        answer = []                              # delta texts (to reconstruct the answer for precache)
         while True:
             if job.cancelled:
                 try: gen.close()
@@ -350,97 +597,37 @@ def _do_generate(job):
             if ttft is None:
                 ttft = time.time() - start
             gen_count = chunk.generation_tokens or gen_count   # running total (every chunk)
+            tok = getattr(chunk, "token", None)
+            if tok is not None:
+                gen_ids.append(int(tok))
             if chunk.text:
                 last = chunk
+                answer.append(chunk.text)
                 job.q.put(("delta", chunk.text))
+        # CACHE ACROSS TURNS: the KV past the pin now physically holds [conv_ids + gen_ids]. Record
+        # those conversation tokens so the NEXT /chat reuses all of them and re-feeds only the
+        # divergent tail. Preserved on interrupt too (the history up to the interruption stays cached).
+        PF["ids"] = conv_ids + gen_ids
         if not job.cancelled:
-            chat_tokens = (len(full_list) - pin_len) + gen_count
+            chat_tokens = len(conv_ids) + gen_count
             meta = {"done": True, "ttft": round(ttft or 0, 3), "gen_s": round(time.time() - start, 2),
                     "new_tokens": new_tokens, "chat_tokens": int(chat_tokens), "pinned": pin_len,
-                    "reused": int(reused), "gen_tps": round(getattr(last, "generation_tps", 0) or 0, 1)}
+                    "reused": int(reused), "gen_tps": round(getattr(last, "generation_tps", 0) or 0, 1),
+                    "anew_parts": anew_parts, "mode": mode}
             job.q.put(("done", meta))
+            # PRECACHE: warm the KV for the next message NOW (idle time). Reconstruct the clean answer
+            # exactly as the app stores it (text before @@APPENDIX@@, trimmed) so next turn's history matches.
+            ans = "".join(answer).split("@@APPENDIX@@")[0].strip()
+            if ans:
+                msgs2 = messages + [{"role": "assistant", "content": [{"type": "text", "text": ans}]}]
+                PRECACHE["state"] = "working"    # flip immediately (the job may sit behind others briefly)
+                GEMMA_Q.put(Job("precache", messages=msgs2, reminder=reminder, mode=mode))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        PF["ids"] = None            # a full turn was fed; next utterance re-prefills cleanly from pin
+        _free_mem()
 
 
-def _do_prefill(job):
-    """Streaming prefill: feed [messages + OPEN user(partial)] tokens past the pin, incrementally.
-    Uses max_tokens=0 for a clean prefill (no spurious generated token in the sliding-window cache)
-    and keeps the user turn OPEN (strips the trailing <end_of_turn>) so /chat's LCP reuse is exact."""
-    if not st.get("kv"):
-        return
-    partial = job.params["partial"]
-    messages = job.params["messages"]
-    tmpdir = tempfile.mkdtemp(prefix="civm-pf-")
-    try:
-        per_turn_paths = []
-        mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
-        mlx_msgs = mlx_msgs + [{"role": "user", "content": [{"type": "text", "text": partial}]}]
-        all_paths = st["ctx_paths"] + per_turn_paths
-        full_msgs = build_messages(st["system"], st["ctx_content"], mlx_msgs)
-        prompt = prompt_str(full_msgs, len(all_paths), add_gen=False)
-        ids_list = token_ids(prompt, all_paths).flatten().tolist()
-        open_list = _strip_open(ids_list)
-        pin_len = st["pin_len"]
-        lcp = max(_lcp(PF["ids"] or [], open_list), pin_len)
-        if lcp >= len(open_list):
-            PF["ids"] = open_list          # nothing new to feed
-            return
-        trim_kv(st["kv"], lcp)
-        feed = mx.array([open_list[lcp:]])
-        per_pv = _per_turn_pixels(per_turn_paths)
-        t0 = time.time()
-        with MLX_LOCK:                      # per prefill batch (SPEC)
-            for _ in stream_generate(model, processor, "", input_ids=feed, pixel_values=per_pv,
-                                     prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
-                pass
-        PF["ids"] = open_list
-        # live-computation proof: tail -f serve.log while dictating to watch tokens land in the KV
-        log(f"prefill +{len(open_list) - lcp} tok ({len(open_list) - pin_len} past pin) in {time.time() - t0:.2f}s")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def _strip_open(ids_list):
-    """Drop the trailing '<end_of_turn>\\n' so the last user turn stays OPEN (rotating-cache-safe)."""
-    eot = _eot_id()
-    if eot is not None:
-        for i in range(len(ids_list) - 1, -1, -1):
-            if ids_list[i] == eot:
-                return ids_list[:i]
-    return ids_list
-
-
-_EOT = {"id": "unset"}
-def _eot_id():
-    if _EOT["id"] == "unset":
-        tok = getattr(processor, "tokenizer", processor)
-        try:
-            _EOT["id"] = tok.convert_tokens_to_ids("<end_of_turn>")
-        except Exception:
-            _EOT["id"] = None
-    return _EOT["id"]
-
-
-# ---------------- voice state machine (shared logic; mic AND /voice/inject) ----------------
-def _enqueue_prefill(partial):
-    if not VOICE["streaming"] or not st.get("kv"):
-        return
-    with VLOCK:
-        msgs = list(VOICE_CTX["messages"])
-    GEMMA_Q.put(Job("prefill", partial=partial, messages=msgs))
-
-
-def voice_on_partial(text):
-    with VLOCK:
-        if VOICE["state"] not in ("listening",):
-            VOICE["state"] = "listening"
-        VOICE["partial"] = text or ""
-    OVL_Q.put(("show", V.RED))
-    _enqueue_prefill(text or "")
-
-
+# ---------------- voice state machine ----------------
 def voice_on_final(text):
     text = (text or "").strip()
     if not text:                      # nothing transcribed → straight back to idle, dot gone
@@ -530,7 +717,7 @@ def voice_thread():
         rec = V.Rec()
     except Exception as e:
         log(f"mic init failed: {e}")
-    stream = {"s": None}
+    active_streaming = {"on": False}   # is the current listen session a (Apple-owned) streaming one?
     poll_dt = 0.3
     while True:
         try:
@@ -538,26 +725,21 @@ def voice_thread():
         except queue.Empty:
             cmd = None
         m = parakeet["model"]
-        # streaming: while listening, pull new audio, feed parakeet, publish growing partial.
-        # Resample the WHOLE buffer to 16k each poll and feed only the new 16k tail — avoids the
-        # per-chunk filter edge artifacts of resampling each increment independently.
-        if stream["s"] is not None and rec is not None and rec.on:
-            try:
-                audio16 = V.resample_16k(rec.snapshot(), rec.sr)
-                fed = stream.get("fed", 0)
-                if len(audio16) > fed:
-                    stream["fed"] = len(audio16)
-                    stream["s"].add(audio16[fed:])
-                    txt = stream["s"].text()
-                    if txt and txt != VOICE.get("partial"):
-                        voice_on_partial(txt)
-            except Exception as e:
-                log(f"stream transcribe error: {e}")
         if cmd is None:
             continue
         kind = cmd[0]
         if kind == "start":
             streaming = cmd[1]
+            # STREAMING submode: the Swift app owns audio + transcription via Apple SpeechTranscriber.
+            # Python only drives the overlay + reports the chord state; it does NOT open the mic.
+            if streaming:
+                active_streaming["on"] = True
+                with VLOCK:
+                    VOICE["state"] = "listening"; VOICE["partial"] = ""; VOICE["final"] = None
+                OVL_Q.put(("show", V.RED))
+                continue
+            # TRANSCRIBE-AFTER submode: Python captures the built-in mic → Parakeet BATCH at stop.
+            active_streaming["on"] = False
             if rec is None or m is None:
                 OVL_Q.put(("flash", V.YELLOW, 0.6))   # not ready
                 continue
@@ -566,33 +748,33 @@ def voice_thread():
                 with VLOCK:
                     VOICE["state"] = "listening"; VOICE["partial"] = ""; VOICE["final"] = None
                 OVL_Q.put(("show", V.RED))
-                if streaming:
-                    stream["s"] = V.Stream(m, MLX_LOCK)
-                    stream["fed"] = 0
             except Exception as e:
                 log(f"mic start failed: {e}")
                 OVL_Q.put(("flash", V.YELLOW, 1.0))
         elif kind == "stop":
+            if active_streaming["on"]:
+                # streaming chord-up: signal the app to FINALIZE its Apple transcript (state=ready,
+                # bumped seq). The app reads Apple's text (not VOICE["final"]); its ack resets us to
+                # idle. ESC instead routes to "cancel" → voice_cancel → idle (app discards).
+                active_streaming["on"] = False
+                OVL_Q.put(("hide",))
+                with VLOCK:
+                    VOICE["seq"] += 1
+                    VOICE["state"] = "ready"; VOICE["partial"] = ""; VOICE["final"] = ""
+                continue
             if rec is None or not rec.on:
                 continue
             voice_processing()
             audio, sr = rec.stop(), rec.sr
-            if stream["s"] is not None:
-                try: stream["s"].close()
-                except Exception: pass
-                stream["s"] = None
             try:
                 text = V.transcribe_batch(m, audio, sr) if m is not None else ""
             except Exception as e:
                 log(f"transcribe failed: {e}"); text = ""
             voice_on_final(text)
         elif kind == "cancel":
+            active_streaming["on"] = False
             if rec is not None and rec.on:
                 rec.stop()
-            if stream["s"] is not None:
-                try: stream["s"].close()
-                except Exception: pass
-                stream["s"] = None
             voice_cancel()
 
 
@@ -617,6 +799,7 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, {"loaded": gemma_ready.is_set(),
                                     "model": os.path.basename(MODEL_PATH),
                                     "parakeet": parakeet["model"] is not None,
+                                    "precache": PRECACHE["state"],
                                     "ctxWindow": CTX_WINDOW})
         if self.path == "/voice/poll":
             with VLOCK:
@@ -655,7 +838,9 @@ class H(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("content-type", "application/x-ndjson")
                 self.end_headers()
-                job = Job("generate", messages=messages, reminder=body.get("reminder"))
+                PRECACHE["state"] = "idle"     # a new turn begins; clear the previous "done" flag
+                job = Job("generate", messages=messages, reminder=body.get("reminder"),
+                          mode=body.get("reminderMode") or "last")
                 GEMMA_Q.put(job)
                 while True:
                     kind, payload = job.q.get()
@@ -702,11 +887,27 @@ class H(BaseHTTPRequestHandler):
                     CAPTURE["copy_parsed"] = V.parse_binding(CAPTURE["copy_binding"])
                 return self._json(200, {"ok": True, "perm": VOICE["perm"]})
 
-            if self.path == "/voice/context":
+            if self.path == "/voice/prefill":
+                # Apple partial → prefill Gemma's KV while the user talks. {messages, partial} →
+                # {fed} = tokens now sitting past the pin (live "pre-sent" count for the UI).
                 d = self._body()
-                with VLOCK:
-                    VOICE_CTX["messages"] = d.get("messages") or []
-                    VOICE_CTX["reminder"] = d.get("reminder")
+                if not st.get("kv"):
+                    return self._json(200, {"fed": 0})
+                job = Job("prefill", messages=d.get("messages") or [], partial=str(d.get("partial") or ""))
+                GEMMA_Q.put(job)
+                job.done.wait()
+                return self._json(200, job.result or {"fed": 0})
+
+            if self.path == "/precache":
+                # re-warm the KV for the next message with a (possibly new) reminder mode. Used when
+                # the user switches reminder placement mid-chat — the chip shows caching → ready.
+                d = self._body()
+                if not st.get("kv"):
+                    return self._json(200, {"ok": True})
+                PRECACHE["state"] = "working"
+                job = Job("precache", messages=d.get("messages") or [], reminder=d.get("reminder"),
+                          mode=d.get("reminderMode") or "last")
+                GEMMA_Q.put(job); job.done.wait()
                 return self._json(200, {"ok": True})
 
             if self.path == "/voice/ack":
@@ -735,10 +936,7 @@ class H(BaseHTTPRequestHandler):
                 if "text" in d:
                     voice_on_final(str(d.get("text") or ""))
                     return self._json(200, {"ok": True, "state": "ready"})
-                if "partial" in d:
-                    voice_on_partial(str(d.get("partial") or ""))
-                    return self._json(200, {"ok": True, "state": "listening"})
-                return self._json(400, {"error": "need text, partial, or capture"})
+                return self._json(400, {"error": "need text or capture"})
 
             self._json(404, {"error": "not found"})
         except Exception as e:
@@ -755,9 +953,20 @@ class Server(ThreadingHTTPServer):   # ThreadingHTTPServer already mixes in Thre
     allow_reuse_address = True
 
 
-def serve_http():
+def bind_server():
+    """Bind :PORT NOW, before the 16GB model loads. If the port is taken (another engine already
+    running — e.g. a second app instance), exit IMMEDIATELY rather than loading weights and then
+    lingering headless holding memory. Fail-fast is what makes a duplicate launch harmless."""
+    try:
+        return Server(("127.0.0.1", PORT), H)
+    except OSError as e:
+        log(f"port {PORT} already in use ({e}) — another engine is running; exiting.")
+        os._exit(0)
+
+
+def serve_http(server):
     log(f"engine HTTP ready on :{PORT}")
-    Server(("127.0.0.1", PORT), H).serve_forever()
+    server.serve_forever()
 
 
 # ---------------- parent watchdog (unchanged intent) ----------------
@@ -910,10 +1119,11 @@ def _apply_tap_event(ev):
 
 def main():
     watch_parent()
+    server = bind_server()   # claim the port BEFORE loading 16GB — a duplicate launch exits here, instantly
     # background workers (Gemma loads inside its worker; parakeet after, in the voice thread)
     threading.Thread(target=gemma_worker, daemon=True).start()
     threading.Thread(target=voice_thread, daemon=True).start()
-    threading.Thread(target=serve_http, daemon=True).start()
+    threading.Thread(target=lambda: serve_http(server), daemon=True).start()
 
     # AppKit main runloop (accessory app): overlay + tap-queue NSTimer. Degrade gracefully headless.
     try:

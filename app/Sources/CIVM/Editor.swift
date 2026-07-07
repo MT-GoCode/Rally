@@ -1,4 +1,22 @@
 import AppKit
+import PDFKit
+
+// Rasterize a PDF into the content-block stream: "Page 1" text + page image, "Page 2" + image, …
+// (same interleaved shape as CONTEXT/the Sipser seed, so the model can see + reference each page).
+func pdfToBlocks(_ url: URL) -> [Block] {
+    guard let doc = PDFDocument(url: url) else { return [] }
+    var out: [Block] = []
+    for i in 0..<doc.pageCount {
+        guard let page = doc.page(at: i) else { continue }
+        let b = page.bounds(for: .mediaBox)
+        // render at 2× for legibility; imageToBase64 downscales/JPEGs anything oversized.
+        let img = page.thumbnail(of: NSSize(width: b.width * 2, height: b.height * 2), for: .mediaBox)
+        guard let tiff = img.tiffRepresentation, let (b64, mt) = imageToBase64(tiff) else { continue }
+        out.append(Block(text: "Page \(i + 1)"))
+        out.append(Block(mediaType: mt, data: b64))
+    }
+    return out
+}
 
 extension Block {
     // decode an image block's base64 to an NSImage for inline display (nil for text blocks).

@@ -29,7 +29,7 @@ struct Block: Codable, Identifiable, Equatable {
 // A single transcript message on the wire: role + interleaved content blocks (text | image).
 struct ChatMessage: Encodable { let role: String; let content: [Block] }
 // {messages, reminder} — the shape POST /chat and POST /voice/context both take.
-struct ChatReq: Encodable { let messages: [ChatMessage]; let reminder: [Block] }
+struct ChatReq: Encodable { let messages: [ChatMessage]; let reminder: [Block]; let reminderMode: String }
 // A capture event pushed by the engine's screenshot / copy-to-chat shortcuts.
 struct Capture: Decodable { var kind: String; var data: String?; var text: String? }   // kind: "image" | "text"
 // GET /voice/poll payload (captures = the events channel, drained by /voice/captures-ack).
@@ -70,6 +70,20 @@ enum Model {
 
     func stop() { proc?.terminate() }
 
+    // POST /precache — re-warm the KV for the next message with a (new) reminder mode.
+    func precache(messages: [ChatMessage], reminder: [Block], reminderMode: String) async {
+        struct Req: Encodable { let messages: [ChatMessage]; let reminder: [Block]; let reminderMode: String }
+        let body = (try? JSONEncoder().encode(Req(messages: messages, reminder: reminder, reminderMode: reminderMode))) ?? Data("{}".utf8)
+        _ = try? await post("/precache", body: body, timeout: 30)
+    }
+
+    // Read the engine's post-response precache state ("idle"|"working"|"done") from /health.
+    func precacheState() async -> String {
+        guard let d = try? await get("/health"),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return "idle" }
+        return j["precache"] as? String ?? "idle"
+    }
+
     // Poll /health until BOTH models load (Gemma first → ready; parakeet loads after → parakeet).
     private func pollHealth() async {
         for _ in 0..<600 {
@@ -101,11 +115,12 @@ enum Model {
     // question as the last element); `reminder` rides on the tail of the last user message. Streams
     // token deltas via onDelta; returns the final `{done,…}` meta line. Cancel by cancelling the calling
     // Task — the bytes loop throws and the closed connection tells the engine to stop generating.
-    func chat(messages: [ChatMessage], reminder: [Block], onDelta: @escaping (String) -> Void) async throws -> [String: Any] {
+    func chat(messages: [ChatMessage], reminder: [Block], reminderMode: String,
+              onDelta: @escaping (String) -> Void) async throws -> [String: Any] {
         var req = URLRequest(url: URL(string: base + "/chat")!)
         req.httpMethod = "POST"; req.timeoutInterval = 120
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.httpBody = try JSONEncoder().encode(ChatReq(messages: messages, reminder: reminder))
+        req.httpBody = try JSONEncoder().encode(ChatReq(messages: messages, reminder: reminder, reminderMode: reminderMode))
         var meta: [String: Any] = [:]
         let (bytes, _) = try await URLSession.shared.bytes(for: req)
         for try await line in bytes.lines {
@@ -136,10 +151,14 @@ enum Model {
         let body = (try? JSONSerialization.data(withJSONObject: ["count": count])) ?? Data("{}".utf8)
         _ = try? await post("/voice/captures-ack", body: body, timeout: 5)
     }
-    // POST /voice/context — the current clean transcript (for streaming prefill; cheap no-op otherwise).
-    func voiceContext(messages: [ChatMessage], reminder: [Block]) async {
-        let body = (try? JSONEncoder().encode(ChatReq(messages: messages, reminder: reminder))) ?? Data("{}".utf8)
-        _ = try? await post("/voice/context", body: body, timeout: 5)
+    // POST /voice/prefill — prefill Gemma's KV with the in-progress Apple transcript while the user
+    // talks. Returns the token count now sitting past the pin (the live "pre-sent" number).
+    func voicePrefill(messages: [ChatMessage], partial: String) async -> Int {
+        struct Req: Encodable { let messages: [ChatMessage]; let partial: String }
+        let body = (try? JSONEncoder().encode(Req(messages: messages, partial: partial))) ?? Data("{}".utf8)
+        guard let d = try? await post("/voice/prefill", body: body, timeout: 10),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return 0 }
+        return j["fed"] as? Int ?? 0
     }
     // GET /voice/poll — app polls ~10Hz while in Voice·Text.
     func voicePoll() async throws -> VoicePoll {

@@ -287,41 +287,9 @@ def transcribe_batch(model, audio, sr):
             pass
 
 
-class Stream:
-    """Wraps parakeet transcribe_stream: feed 16k float chunks, read growing .text.
-
-    parakeet-mlx 0.5.1: `with model.transcribe_stream(...) as s: s.add_audio(mx16k); s.result.text`.
-    add_audio takes a 1-D mx.array of 16kHz float samples (any chunk size)."""
-    def __init__(self, model, mlx_lock=None):
-        import mlx.core as mx
-        self.mx = mx
-        self.model = model
-        self.lock = mlx_lock
-        self._cm = model.transcribe_stream(context_size=(256, 256), depth=1)
-        self.s = self._cm.__enter__()
-
-    def add(self, audio16k_float):
-        """Feed a chunk of 16kHz float samples (numpy). MLX lock held per chunk (SPEC)."""
-        if audio16k_float is None or len(audio16k_float) == 0:
-            return
-        arr = self.mx.array(np.asarray(audio16k_float, dtype='float32'))
-        if self.lock is not None:
-            with self.lock:
-                self.s.add_audio(arr)
-        else:
-            self.s.add_audio(arr)
-
-    def text(self):
-        try:
-            return (self.s.result.text or '').strip()
-        except Exception:
-            return ''
-
-    def close(self):
-        try:
-            self._cm.__exit__(None, None, None)
-        except Exception:
-            pass
+# NOTE: parakeet-mlx `transcribe_stream` is intentionally NOT used. Its per-chunk mel normalization
+# on an offline checkpoint hallucinates filler tokens ("mm/yeah/you"); live streaming is now Apple
+# SpeechTranscriber (Swift). Python keeps only Parakeet BATCH transcribe (transcribe-after submode).
 
 
 # ---------- screenshot capture (screencapture) + copy-to-chat (⌘C synth + pasteboard) ----------

@@ -53,6 +53,13 @@ enum VoiceState: Equatable {
         self.engine = engine
         self.store = store
 
+        // mirror Apple's live transcript into the shared livePartial while streaming.
+        apple.$partial.receive(on: DispatchQueue.main)
+            .sink { [weak self] p in MainActor.assumeIsolated {
+                guard let self, self.appleRunning else { return }
+                if self.livePartial != p { self.livePartial = p }
+            } }.store(in: &cancellables)
+
         // ---- observe own inputs (fix A) — replaces the view's onChange relays ----
         // engine readiness: post config once it flips ready (mirrors onChange(engine.ready){ if r }).
         // receive(on:) defers the sink past @Published's willSet so it reads the SETTLED engine.ready
@@ -91,7 +98,14 @@ enum VoiceState: Equatable {
     // ---- in-flight turn (ask pipeline) ----
     @Published private(set) var busy = false
     @Published private(set) var streaming = ""
-    @Published private(set) var lastReused = 0   // /chat meta "reused" — streaming-prefill proof
+    // per-message accounting from the last /chat done meta — explicit cache-vs-new breakdown.
+    @Published private(set) var lastReused = 0    // history tokens reused from the cross-turn KV cache
+    @Published private(set) var lastNew = 0       // tokens actually fed/processed anew this message
+    @Published private(set) var lastPinned = 0    // pinned prefix (system+context) — always reused
+    @Published private(set) var lastTtft = 0.0    // measured time-to-first-token (s), from the actual run
+    // composition of the anew tokens, IN forward-pass order, summing to lastNew (engine-computed).
+    @Published private(set) var anewParts: [(label: String, n: Int)] = []
+    @Published private(set) var precache = ""     // "" hidden · "working" caching next msg · "done"
     private var prevHadOutput = false             // did the turn we just cancelled produce any text?
     // AskPipeline (mode-agnostic): one in-flight turn; interrupts cancel it and stack a new one.
     private var askTask: Task<Void, Never>? = nil
@@ -112,7 +126,13 @@ enum VoiceState: Equatable {
     // ---- Voice·Text live state (from GET /voice/poll) ----
     @Published private(set) var voiceState: VoiceState = .idle
     @Published private(set) var livePartial = ""
+    @Published private(set) var preSent = 0        // tokens prefilled into Gemma so far this utterance (live)
     private var voiceSeq = -1
+
+    // ---- Apple SpeechTranscriber (streaming submode; on-device, Swift-side). Python drives the
+    // chord/overlay and reports state; the app runs Apple while listening and finalizes on chord-up. ----
+    private let apple = AppleSpeech()
+    private var appleRunning = false
 
     // ---- settings: STORED copies refreshed from the shared accessors on didChangeNotification
     // (fix C/E). No per-render UserDefaults lookups — the old computed getters were a hot loop. ----
@@ -263,27 +283,31 @@ enum VoiceState: Equatable {
         // Cutting off a turn that never produced a token (e.g. still pinning) is just a normal ask.
         if interrupting && prevHadOutput { um.isInterruption = true }
         store.chat.messages.append(um)
-        repostContext()                         // transcript changed → re-stage for the next voice turn (SPEC: post whenever it changes)
-        busy = true; streaming = ""
+        busy = true; streaming = ""; precache = ""      // new turn: consumes the warmed cache, hide the chip
         if !pinned { await pinNow() }           // pin on demand (caching first isn't required)
         do {
-            let meta = try await engine.chat(messages: buildEngineMessages(), reminder: store.chat.reminder) { self.streaming += $0 }
+            let meta = try await engine.chat(messages: buildEngineMessages(), reminder: store.chat.reminder,
+                                              reminderMode: ReminderMode.current.rawValue) { self.streaming += $0 }
             if Task.isCancelled {               // interrupted right as the stream ended
                 stashInterrupted(); return
             }
             store.chat.messages.append(Msg(role: "assistant", text: streaming))
             if let ct = meta["chat_tokens"] as? Int { store.chat.chatTokens = ct }
             if let pt = meta["pinned"] as? Int, pt > 0 { store.chat.pinnedTokens = pt }
-            lastReused = meta["reused"] as? Int ?? 0   // streaming-prefill proof: tokens already in KV at send
+            lastReused = meta["reused"] as? Int ?? 0
+            lastNew = meta["new_tokens"] as? Int ?? 0
+            lastPinned = meta["pinned"] as? Int ?? 0
+            lastTtft = meta["ttft"] as? Double ?? 0
+            anewParts = (meta["anew_parts"] as? [[String: Any]] ?? [])
+                .map { (label: $0["label"] as? String ?? "", n: $0["n"] as? Int ?? 0) }
             streaming = ""; busy = false; store.save()
-            repostContext()                     // transcript changed → re-stage for the next voice turn
+            watchPrecache()                     // engine is now warming the KV for the next message
         } catch {
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
                 stashInterrupted()              // the interrupting turn keeps busy=true
             } else {
                 store.chat.messages.append(Msg(role: "assistant", text: "⚠ \(error.localizedDescription)"))
                 streaming = ""; busy = false; store.save()
-                repostContext()
             }
         }
     }
@@ -298,9 +322,10 @@ enum VoiceState: Equatable {
         // no repost here: every stash is immediately followed by the successor turn's append + repost.
     }
 
-    // The clean transcript for the engine: last 24 messages, images as blocks, interruption prefix added HERE only.
+    // The clean transcript for the engine: the FULL conversation (no truncation), images as blocks,
+    // interruption prefix added HERE only. Cross-turn KV reuse keeps this cheap regardless of length.
     private func buildEngineMessages() -> [ChatMessage] {
-        store.chat.messages.suffix(24).map { m in
+        store.chat.messages.map { m in
             var blocks: [Block] = []
             let t = m.isInterruption ? "@@INTERRUPTION@@: " + m.text : m.text
             if !t.isEmpty { blocks.append(Block(text: t)) }
@@ -314,7 +339,18 @@ enum VoiceState: Equatable {
     // feedback stay in the view; this owns the store write and the engine re-post.)
     func commitReminder(_ blocks: [Block]) {
         store.chat.reminder = blocks; store.save()
-        repostContext()
+    }
+
+    // Truncate the transcript to everything up to AND including the given message (a "reset to here"
+    // on an agent reply): drop all later turns, persist, and re-stage the streaming-prefill context.
+    // Engine chat is app-owned+stateless, so no /pin or /new is needed — the next ask sends the
+    // shortened transcript. A turn in flight is cancelled first.
+    func resetToHere(_ id: UUID) {
+        guard let i = store.chat.messages.firstIndex(where: { $0.id == id }) else { return }
+        askTask?.cancel()
+        streaming = ""; busy = false
+        store.chat.messages = Array(store.chat.messages.prefix(through: i))
+        store.save()
     }
 
     // ---- capture staging intents (fix E) — clipboard/timeline UI hands finished Blocks in ----
@@ -345,7 +381,6 @@ enum VoiceState: Equatable {
             resetForChatSwitch()
             pinOutcome = .none                       // chat B must not show chat A's "cache failed: …" (fix 5)
         }
-        repostContext()                             // re-stage the transcript on every activation (also covers reopening the same chat)
         if kind == .opened { cache() }              // opening evicts the old KV, re-pins this chat
     }
 
@@ -361,12 +396,6 @@ enum VoiceState: Equatable {
             key: hotkey,
             shotBinding: shotBinding, shotStyle: shotStyleRaw, copyBinding: copyBinding) }
     }
-    // Self-gated (fix A): posts only in Voice·Text, so every caller is a plain call — no mode checks.
-    private func postVoiceContext() async {
-        guard mode == .voiceText else { return }
-        await engine.voiceContext(messages: buildEngineMessages(), reminder: store.chat.reminder)
-    }
-    private func repostContext() { Task { await self.postVoiceContext() } }
 
     // Refresh stored setting copies from the shared accessors; post config if any config-relevant key
     // changed, and re-post context on a mode change (self-gated). Diffing keeps unrelated defaults
@@ -376,11 +405,58 @@ enum VoiceState: Equatable {
         let hk = SK.hotkeyValue, sb = SK.shotBindingValue, ss = SK.shotStyleValue, cb = SK.copyBindingValue
         let configDirty = m != mode || sm != submode || tr != transcription
             || hk != hotkey || sb != shotBinding || ss != shotStyleRaw || cb != copyBinding
-        let modeChanged = m != mode
         mode = m; submode = sm; transcription = tr
         hotkey = hk; shotBinding = sb; shotStyleRaw = ss; copyBinding = cb
         if configDirty { postVoiceConfig() }
-        if modeChanged { repostContext() }
+    }
+
+    // While Apple streams, prefill Gemma's KV from the growing partial (debounced) so the final ask
+    // is near-instant. Reports the live token count fed past the pin. Runs until appleRunning clears.
+    private func startPrefillLoop() {
+        Task { [weak self] in
+            var lastPosted = ""
+            while let self, self.appleRunning {
+                try? await Task.sleep(for: .milliseconds(350))
+                guard self.appleRunning else { break }
+                let partial = self.apple.partial
+                if partial.isEmpty || partial == lastPosted { continue }
+                lastPosted = partial
+                let fed = await self.engine.voicePrefill(messages: self.buildEngineMessages(), partial: partial)
+                if self.appleRunning { self.preSent = fed }
+            }
+        }
+    }
+
+    // Switch reminder placement mid-chat: persist it, then re-warm the cache with the new mode so the
+    // next message stays instant. The chip shows caching → ready.
+    func setReminderMode(_ m: ReminderMode) {
+        UserDefaults.standard.set(m.rawValue, forKey: SK.reminderMode)
+        guard engine.ready, !store.chat.messages.isEmpty else { return }
+        precache = "working"
+        Task { [weak self] in
+            guard let self else { return }
+            await self.engine.precache(messages: self.buildEngineMessages(), reminder: self.store.chat.reminder, reminderMode: m.rawValue)
+            self.precache = "done"
+            try? await Task.sleep(for: .seconds(1.4))
+            if self.precache == "done" { self.precache = "" }
+        }
+    }
+
+    // After a reply the engine warms the KV for the next message; mirror it in the bottom-right chip.
+    private func watchPrecache() {
+        Task { [weak self] in
+            guard let self else { return }
+            self.precache = "working"
+            for _ in 0..<50 {                      // ~5s cap
+                try? await Task.sleep(for: .milliseconds(100))
+                if self.busy || self.precache.isEmpty { return }   // a new turn took over
+                let s = await self.engine.precacheState()
+                if s == "done" { self.precache = "done"; break }
+                if s == "idle" { self.precache = ""; return }
+            }
+            try? await Task.sleep(for: .seconds(1.4))
+            if self.precache == "done" { self.precache = "" }       // fade the "done" chip
+        }
     }
 
     private func handleVoicePoll(_ p: VoicePoll) async {
@@ -392,8 +468,37 @@ enum VoiceState: Equatable {
         guard Mode.current == .voiceText else { return }    // fresh read: never auto-send a tick after leaving Voice·Text
         let vs = VoiceState(wire: p.state)
         if voiceState != vs { voiceState = vs }             // dedupe: no 10Hz invalidation storm at idle (fix E)
+
+        // STREAMING submode: Apple (Swift) owns audio+transcription. Python's poll state is just the
+        // chord signal — listening → run Apple; ready (chord-up) → finalize+send Apple's text; idle
+        // while running (ESC) → discard.
+        if Transcription.current == .stream {
+            switch vs {
+            case .listening where !appleRunning:
+                appleRunning = true; livePartial = ""; preSent = 0
+                let loc = SK.speechLocaleValue
+                Task { try? await self.apple.start(localeID: loc) }
+                startPrefillLoop()                          // prefill Gemma from Apple's partials as you talk
+            case .ready where appleRunning && p.seq != voiceSeq:
+                voiceSeq = p.seq; appleRunning = false      // stops the prefill loop
+                Task {
+                    let text = await self.apple.stop()
+                    await self.engine.voiceAck(seq: p.seq)
+                    self.preSent = 0                        // dictation over → clear live count (→ "reused" after /chat)
+                    guard !text.isEmpty else { return }
+                    let (pre, imgs) = self.drainQueuedCaptures()
+                    self.ask(text: pre.isEmpty ? text : pre + "\n" + text, images: imgs)
+                }
+            case .idle where appleRunning:                  // ESC / cancel
+                appleRunning = false; livePartial = ""; preSent = 0
+                Task { await self.apple.cancel() }
+            default: break
+            }
+            return
+        }
+
+        // TRANSCRIBE-AFTER submode: Parakeet (Python) produces the final; consume it.
         if livePartial != p.partial { livePartial = p.partial }
-        // When a final transcript is ready, auto-send it (interrupts if busy), ack it once by seq.
         if vs == .ready, p.seq != voiceSeq,
            let f = p.final, !f.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             voiceSeq = p.seq

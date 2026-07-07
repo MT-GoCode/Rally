@@ -5,11 +5,13 @@ import UniformTypeIdentifiers
 import AVFoundation
 import ApplicationServices
 import IOKit.hid
+import Speech
 
 // One-shot TCC prompts for everything the voice-agent future needs. Safe to re-run —
 // macOS only shows each dialog while the permission is undecided.
 func requestAgentPerms() {
     AVCaptureDevice.requestAccess(for: .audio) { _ in }                                   // Microphone
+    SFSpeechRecognizer.requestAuthorization { _ in }                                      // Speech recognition (Apple streaming)
     // literal key == kAXTrustedCheckOptionPrompt (the CFString global isn't Swift-6 concurrency-safe)
     _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) // Accessibility
     _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)                                  // Input Monitoring
@@ -281,7 +283,7 @@ struct BlockStream: View {
         VStack(alignment: .leading, spacing: 4) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
-                    ForEach($blocks) { $b in row($b) }
+                    ForEach(blocks) { blk in row(blk.id) }
                     if blocks.isEmpty {
                         Text("empty — type, paste, or drop images").font(.caption).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -301,6 +303,7 @@ struct BlockStream: View {
                 Button("+ Text") { blocks.append(Block(text: "")) }.font(.caption2)
                 Button("+ Image…") { pickImages() }.font(.caption2)
                 Button("Paste") { paste() }.font(.caption2)
+                Button("PDF…") { loadPDF() }.font(.caption2)
                 Button("JSON…") { loadJSON() }.font(.caption2)
                 if !blocks.isEmpty { Button("clear") { blocks = [] }.font(.caption2) }
                 Spacer()
@@ -320,20 +323,28 @@ struct BlockStream: View {
 
     var textChars: Int { blocks.reduce(0) { $0 + ($1.text?.count ?? 0) } }
 
-    @ViewBuilder func row(_ b: Binding<Block>) -> some View {
+    // Row is addressed by ID and looks the block up each access — deleting it returns a safe default
+    // instead of index-crashing (the ForEach($blocks) element-binding read a freed index → SIGTRAP).
+    @ViewBuilder func row(_ id: UUID) -> some View {
+        let blk = blocks.first(where: { $0.id == id })
+        let textBinding = Binding<String>(
+            get: { blocks.first(where: { $0.id == id })?.text ?? "" },
+            set: { nv in if let i = blocks.firstIndex(where: { $0.id == id }) { blocks[i].text = nv } })
         HStack(alignment: .top, spacing: 6) {
-            if b.wrappedValue.type == "text" {
-                TextField("text…", text: Binding(get: { b.wrappedValue.text ?? "" }, set: { b.wrappedValue.text = $0 }), axis: .vertical)
-                    .textFieldStyle(.plain).font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(.primary).lineLimit(1...)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else if let ns = b.wrappedValue.nsImage {
-                Image(nsImage: ns).resizable().scaledToFit()
-                    .frame(maxWidth: .infinity, maxHeight: 220, alignment: .leading)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.25)))
+            if let blk {
+                if blk.type == "text" {
+                    TextField("text…", text: textBinding, axis: .vertical)
+                        .textFieldStyle(.plain).font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.primary).lineLimit(1...)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if let ns = blk.nsImage {
+                    Image(nsImage: ns).resizable().scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: 220, alignment: .leading)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.25)))
+                }
             }
-            Button { blocks.removeAll { $0.id == b.wrappedValue.id } } label: {
+            Button { blocks.removeAll { $0.id == id } } label: {
                 Image(systemName: "xmark.circle.fill")
             }.buttonStyle(.plain).foregroundStyle(.secondary.opacity(0.6))
         }
@@ -348,6 +359,15 @@ struct BlockStream: View {
         let p = NSOpenPanel(); p.allowsMultipleSelection = true; p.canChooseDirectories = false
         p.allowedContentTypes = [.image]
         if p.runModal() == .OK { p.urls.forEach { addImage($0) } }
+    }
+
+    // Load a PDF → one "Page N" text + page-image block per page, replacing this box's contents.
+    func loadPDF() {
+        let p = NSOpenPanel(); p.allowsMultipleSelection = false; p.canChooseDirectories = false
+        p.allowedContentTypes = [.pdf]
+        guard p.runModal() == .OK, let u = p.url else { return }
+        let pages = pdfToBlocks(u)
+        if !pages.isEmpty { blocks = pages }
     }
 
     // Load THIS box from a JSON file: a bare [blocks] array, or a {"system":…,"context":…,"reminder":…}
@@ -387,6 +407,7 @@ struct RootView: View {
     @AppStorage(SK.submode) private var submodeRaw = Submode.toggle.rawValue
     @AppStorage(SK.transcription) private var transcriptionRaw = Transcription.after.rawValue
     @AppStorage(SK.hotkey) private var hotkey = SK.defaultHotkey
+    @AppStorage(SK.reminderMode) private var reminderModeRaw = SK.defaultReminderMode
     var mode: Mode { .from(modeRaw) }
     var submode: Submode { .from(submodeRaw) }
     var transcription: Transcription { .from(transcriptionRaw) }
@@ -422,12 +443,44 @@ struct RootView: View {
         return session.estOverLimit ? "est. ~\(n) tok — over the 200K limit" : "est. ~\(n) tok"
     }
 
-    // "{pinned} pinned + {chat} chat = {total} tok" — from /pin and the last /chat done meta.
-    // "⚡N pre-fed" appears after a streamed dictation: N tokens were already in the KV at send.
+    // Two lines: the running context size, and an explicit per-message cache-vs-new breakdown from
+    // the ACTUAL last run (pinned + history reused = read from cache; new = processed anew; + TTFT).
+    // Quick reminder-placement switch, right in the chat (mirrors the Settings picker). Changing it
+    // re-warms the cache with the new mode (the precache chip shows caching → ready). Default lives
+    // in Settings; this is the fast in-chat toggle.
+    @ViewBuilder var reminderModeControl: some View {
+        Menu {
+            ForEach(ReminderMode.allCases, id: \.self) { m in
+                Button {
+                    reminderModeRaw = m.rawValue
+                    session.setReminderMode(m)
+                } label: {
+                    if ReminderMode(rawValue: reminderModeRaw) == m { Label(m.label, systemImage: "checkmark") }
+                    else { Text(m.label) }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "text.insert").font(.system(size: 9))
+                Text("reminder: \(ReminderMode(rawValue: reminderModeRaw)?.label ?? "")").font(.caption2)
+            }.foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton).fixedSize().menuIndicator(.hidden)
+    }
+
     var tokenLine: some View {
         let p = store.chat.pinnedTokens ?? 0, c = store.chat.chatTokens
-        return Text("\(p) pinned + \(c) chat = \(p + c) tok\(session.lastReused > 0 ? "  ·  ⚡\(session.lastReused) pre-fed while you spoke" : "")")
-            .font(.caption2).foregroundStyle(.secondary)
+        let cached = session.lastPinned + session.lastReused
+        return VStack(alignment: .leading, spacing: 1) {
+            Text("\(p) pinned + \(c) chat = \(p + c) tok\(session.preSent > 0 ? "  ·  ⚡\(session.preSent) pre-sent" : "")")
+            if session.lastNew > 0 || session.lastTtft > 0 {
+                Text("last msg: \(cached) read from cache · \(session.lastNew) processed anew · TTFT \(String(format: "%.2f", session.lastTtft))s")
+                    .foregroundStyle(session.lastTtft > 1.5 ? .orange : .secondary)
+                if !session.anewParts.isEmpty {
+                    Text("  anew = " + session.anewParts.map { "\($0.n) \($0.label)" }.joined(separator: " + "))
+                }
+            }
+        }.font(.caption2).foregroundStyle(.secondary)
     }
 
     var body: some View {
@@ -647,7 +700,7 @@ struct RootView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
                         ForEach(store.chat.messages) { m in
-                            messageBubble(role: m.role, text: m.text, interrupted: m.interrupted, isInterruption: m.isInterruption, images: m.content)
+                            messageBubble(id: m.id, role: m.role, text: m.text, interrupted: m.interrupted, isInterruption: m.isInterruption, images: m.content)
                         }
                         if session.busy { messageBubble(role: "assistant", text: session.streaming.isEmpty ? "…" : session.streaming) }
                         Color.clear.frame(height: 1).id(chatBottomID)      // stable bottom anchor for auto-scroll
@@ -657,9 +710,28 @@ struct RootView: View {
                 .onChange(of: store.chat.id) { _, _ in scrollDown(proxy, animated: false) }
                 .onChange(of: store.chat.messages.count) { _, _ in scrollDown(proxy) }
                 .onChange(of: session.streaming.count / 40) { _, _ in scrollDown(proxy, animated: false) }   // throttle: ~every 40 streamed chars
+                .overlay(alignment: .bottomTrailing) { precacheChip.padding(10) }
             }
             Divider()
             if mode == .voiceText { voiceInputRegion } else { textInputRegion }
+        }
+    }
+
+    // Bottom-right status: the engine warming the KV for the next message after each reply.
+    @ViewBuilder var precacheChip: some View {
+        if !session.precache.isEmpty {
+            let done = session.precache == "done"
+            HStack(spacing: 5) {
+                if done { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+                else { ProgressView().controlSize(.mini) }
+                Text(done ? "cache ready" : "caching most recent…").font(.caption2)
+            }
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().stroke(.secondary.opacity(0.2)))
+            .foregroundStyle(.secondary)
+            .transition(.opacity)
+            .animation(.easeInOut(duration: 0.2), value: session.precache)
         }
     }
 
@@ -734,7 +806,10 @@ struct RootView: View {
                 Button(session.busy ? "Interrupt & Ask" : "Ask") { session.send() }
                     .disabled(!session.canSend)
             }
-            tokenLine.frame(maxWidth: .infinity, alignment: .leading)
+            HStack(alignment: .bottom) {
+                tokenLine.frame(maxWidth: .infinity, alignment: .leading)
+                reminderModeControl
+            }
         }
         .padding(10)
         .onPasteCommand(of: [.image, .png, .tiff]) { _ in pasteChatImages() }
@@ -852,7 +927,7 @@ struct RootView: View {
         if open.wrappedValue { BlockStream(blocks: blocks, jsonKey: key) }
     }
 
-    @ViewBuilder func messageBubble(role: String, text: String, interrupted: Bool = false,
+    @ViewBuilder func messageBubble(id: UUID? = nil, role: String, text: String, interrupted: Bool = false,
                                     isInterruption: Bool = false, images: [Block] = []) -> some View {
         let parts = text.components(separatedBy: "@@APPENDIX@@")
         let body = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -888,8 +963,28 @@ struct RootView: View {
             .textSelection(.enabled).padding(10)
             .background(bg)
             .clipShape(RoundedRectangle(cornerRadius: 12))
+            // triple-dot on a committed AGENT reply: copy it, or reset the chat back to it.
+            if !isUser, let id { bubbleMenu(id: id, body: body) }
             if !isUser { Spacer(minLength: 40) }
         }
+    }
+
+    @ViewBuilder func bubbleMenu(id: UUID, body: String) -> some View {
+        Menu {
+            Button { copyText(body) } label: { Label("Copy", systemImage: "doc.on.doc") }
+            Button(role: .destructive) { session.resetToHere(id) } label: {
+                Label("Reset to here", systemImage: "arrow.uturn.backward")
+            }
+        } label: {
+            Image(systemName: "ellipsis").font(.caption).foregroundStyle(.secondary)
+                .frame(width: 22, height: 22).contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+    }
+
+    func copyText(_ s: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(s, forType: .string)
     }
 
     // ---- chat-input image paste (⌘V) → the session's pasted-images staging bar ----

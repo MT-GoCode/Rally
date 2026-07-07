@@ -7,6 +7,18 @@ enum Mode: String, CaseIterable { case textText = "text-text", textVoice = "text
 enum Submode: String { case toggle, hold, vad }           // Voice·Text hotkey behaviour
 enum Transcription: String { case after, stream }          // after = accurate; stream = faster
 enum ShotStyle: String, CaseIterable { case initiate, hold }  // screenshot: press-to-initiate vs press&hold-drag
+// Where the reminder sits each turn — the latency ⇄ adherence trade-off (engine pre-caches accordingly).
+enum ReminderMode: String, CaseIterable {
+    case start, before, after
+    var label: String { self == .start ? "At chat start" : self == .before ? "Before question" : "After question" }
+    var blurb: String {
+        switch self {
+        case .start:  return "Fastest. Reminder cached once at the start — weakest adherence late in a chat."
+        case .before: return "Fast. Reminder pre-sent before each question, stays recent."
+        case .after:  return "Best adherence. Reminder rides after the question — on the response's critical path."
+        }
+    }
+}
 
 // UserDefaults keys (shared by the modes bar, the input regions, and the Settings sheet).
 enum SK {
@@ -18,6 +30,10 @@ enum SK {
     static let defaultShotBinding = "cmd+shift+2"    // ⌘⇧2
     static let defaultShotStyle = ShotStyle.initiate.rawValue
     static let defaultCopyBinding = "ctrl+alt+c"     // ⌃⌥C
+    static let speechLocale = "civm.speechLocale"    // Apple streaming-transcription language (BCP-47)
+    static let defaultSpeechLocale = "en-US"
+    static let reminderMode = "civm.reminderMode"    // reminder placement (latency ⇄ adherence)
+    static let defaultReminderMode = ReminderMode.before.rawValue
 }
 
 // ---- shared settings accessors — the SINGLE authority for reading the SK keys with the right
@@ -31,8 +47,10 @@ extension Submode      { static func from(_ raw: String) -> Submode { Submode(ra
 extension Transcription { static func from(_ raw: String) -> Transcription { Transcription(rawValue: raw) ?? .after }
                           static var current: Transcription { from(UserDefaults.standard.string(forKey: SK.transcription) ?? "") } }
 extension ShotStyle    { static func from(_ raw: String) -> ShotStyle { ShotStyle(rawValue: raw) ?? .initiate } }
+extension ReminderMode { static var current: ReminderMode { ReminderMode(rawValue: UserDefaults.standard.string(forKey: SK.reminderMode) ?? SK.defaultReminderMode) ?? .before } }
 extension SK {
     static var hotkeyValue: String     { UserDefaults.standard.string(forKey: hotkey) ?? defaultHotkey }
+    static var speechLocaleValue: String { UserDefaults.standard.string(forKey: speechLocale) ?? defaultSpeechLocale }
     static var shotBindingValue: String { UserDefaults.standard.string(forKey: shotBinding) ?? defaultShotBinding }
     static var shotStyleValue: String  { UserDefaults.standard.string(forKey: shotStyle) ?? defaultShotStyle }
     static var copyBindingValue: String { UserDefaults.standard.string(forKey: copyBinding) ?? defaultCopyBinding }
@@ -199,6 +217,9 @@ struct SettingsView: View {
     @AppStorage(SK.shotBinding) private var shotBinding = SK.defaultShotBinding
     @AppStorage(SK.shotStyle) private var shotStyleRaw = SK.defaultShotStyle
     @AppStorage(SK.copyBinding) private var copyBinding = SK.defaultCopyBinding
+    @AppStorage(SK.speechLocale) private var speechLocaleID = SK.defaultSpeechLocale
+    @AppStorage(SK.reminderMode) private var reminderModeRaw = SK.defaultReminderMode
+    @State private var speechLocales: [String] = []
     @StateObject private var rec = HotkeyRecorder()
     @StateObject private var shotRec = BindingRecorder()
     @StateObject private var copyRec = BindingRecorder()
@@ -219,6 +240,18 @@ struct SettingsView: View {
                 Text("Type your question, read the answer. No settings.")
                     .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
             }
+            GroupBox("Reminder placement") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Where the reminder sits each turn. Nearer the answer = better adherence; earlier = faster (the engine pre-caches it while idle).")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Picker("", selection: Binding(get: { ReminderMode(rawValue: reminderModeRaw) ?? .before },
+                                                  set: { reminderModeRaw = $0.rawValue })) {
+                        ForEach(ReminderMode.allCases, id: \.self) { m in
+                            Text("\(m.label) — \(m.blurb)").tag(m)
+                        }
+                    }.pickerStyle(.radioGroup).labelsHidden()
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
             GroupBox("Text · Voice") { comingSoon }
 
             GroupBox("Voice · Text") {
@@ -233,9 +266,22 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Transcription").font(.caption.bold()).foregroundStyle(.secondary)
                         Picker("", selection: transcription) {
-                            Text("Transcribe after finished — more accurate").tag(Transcription.after)
-                            Text("Streaming — less accurate but faster response times").tag(Transcription.stream)
+                            Text("Transcribe after finished — Parakeet, most accurate").tag(Transcription.after)
+                            Text("Streaming — Apple on-device, live as you speak").tag(Transcription.stream)
                         }.pickerStyle(.radioGroup).labelsHidden()
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Streaming language").font(.caption.bold()).foregroundStyle(.secondary)
+                        Picker("", selection: $speechLocaleID) {
+                            ForEach(speechLocales, id: \.self) { Text($0).tag($0) }
+                        }.labelsHidden().frame(maxWidth: 220)
+                        Text("Apple on-device (streaming mode only). Transcribe-after uses Parakeet (English).")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .task {
+                        var locs = await AppleSpeech.supportedLocaleIDs()
+                        if !locs.contains(speechLocaleID) { locs.insert(speechLocaleID, at: 0) }
+                        speechLocales = locs
                     }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Hotkey").font(.caption.bold()).foregroundStyle(.secondary)
