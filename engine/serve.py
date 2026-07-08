@@ -79,6 +79,24 @@ PF = {"ids": None}                         # streaming-prefill: token-id list cu
 PRECACHE = {"state": "idle"}               # post-response KV warm-up for the NEXT message: idle|working|done
                                            # (Apple partials prefill Gemma while you talk; /chat LCP-reuses it)
 
+# Real per-operation progress the UI polls via GET /progress. Written by the single Gemma worker from
+# INSIDE its loops (per image batch / per prefill chunk / per turn / per token). PROG_LOCK is a tiny,
+# separate lock (NEVER MLX_LOCK) so the HTTP thread reads it while the worker holds the GPU — this works
+# precisely because the worker is single-threaded, so it's the sole writer publishing its own progress.
+PROG_LOCK = threading.Lock()
+PROGRESS = {"op": "idle", "stage": "", "done": 0, "total": 0, "frac": 0.0, "label": "", "seq": 0}
+
+def _prog(op=None, stage=None, done=None, total=None, label=None, bump=False):
+    with PROG_LOCK:
+        if bump:              PROGRESS["seq"] += 1
+        if op    is not None: PROGRESS["op"]    = op
+        if stage is not None: PROGRESS["stage"] = stage
+        if done  is not None: PROGRESS["done"]  = int(done)
+        if total is not None: PROGRESS["total"] = int(total)
+        if label is not None: PROGRESS["label"] = label
+        d, t = PROGRESS["done"], PROGRESS["total"]
+        PROGRESS["frac"] = (d / t) if t else 0.0
+
 # ---- voice state machine (shared; guarded by VLOCK) ----
 # Streaming submode = Apple SpeechTranscriber (Swift-side); Python only drives the overlay + reports
 # chord state. Transcribe-after submode = Parakeet BATCH here. No Python streaming/prefill anymore.
@@ -269,6 +287,8 @@ def _batch_encode_images(pv):
     parts = []
     for i in range(0, n, VISION_BATCH):
         f = model.encode_image(pv[i:i + VISION_BATCH]); mx.eval(f); parts.append(f)
+        mx.clear_cache()                                    # return this batch's buffers to the OS (pin-only; not decode)
+        _prog(done=min(i + VISION_BATCH, n))                # per-batch image progress (caller set op/stage/total)
     # encode_image returns [1, images*tokens_per_image, hidden]; join along the token axis.
     return mx.concatenate(parts, axis=1)
 
@@ -306,7 +326,9 @@ def _pin_prefill(kv, input_ids, pv, feats):
         h = lm(inputs_embeds=inputs_embeds[:, start:end], per_layer_inputs=pli,
                cache=kv, mm_token_type_ids=mm_full[:, :end])
         mx.eval(h)                              # force this chunk's forward + free its activations
+        mx.clear_cache()                        # return the chunk's buffers to the OS so the footprint stays flat
         start = end
+        _prog(stage="prefill", done=end, total=N)   # per-chunk prefill progress
 
 
 def _mlx_messages(messages, tmpdir, paths):
@@ -395,6 +417,7 @@ def gemma_worker():
             except Exception:
                 pass
         finally:
+            _prog(op="idle", stage="", done=0, total=0, label="")   # op→idle between jobs
             job.done.set()
 
 
@@ -407,6 +430,8 @@ def _drop_pin():
 
 def _do_pin(job):
     d = job.params["body"]
+    _prog(op="pin", stage="reading", done=0, total=0, label="reading context", bump=True)
+    _mem_reset_peak()                          # so mem_peak_gb reflects THIS pin's transient (chunking check)
     tmpdir = tempfile.mkdtemp(prefix="civm-")
     paths = []
     # images placed in the SYSTEM box are folded into the visual context so the model sees them.
@@ -429,7 +454,10 @@ def _do_pin(job):
             # Parakeet voice thread's MLX ops (the old one-shot pin ran the vision encode inside
             # stream_generate under the lock), so encode INSIDE the lock, before _pin_prefill.
             pv = _per_turn_pixels(paths) if paths else None
+            if pv is not None:
+                _prog(stage="encode", done=0, total=len(paths), label=f"encoding {len(paths)} images")
             feats = _batch_encode_images(pv) if pv is not None else None
+            _prog(stage="prefill", done=0, total=pin_len, label="prefilling context")
             _pin_prefill(kv, input_ids, pv, feats)
     else:
         kv, pin_len = make_prompt_cache(model), 0
@@ -437,8 +465,9 @@ def _do_pin(job):
     st.update(kv=kv, pin_len=pin_len, ctx_content=ctx_content, ctx_paths=paths,
               tmpdir=tmpdir, system=d.get("system"), conv_start=0, stream_start=0)   # fresh pin → window restarts at turn 0
     PF["ids"] = None
+    peak = _mem()[1]
     _free_mem()                # release the pin's transient buffers so the process drops to ~weights+KV
-    job.result = {"ok": True, "overLimit": False, "tokens": pin_len}
+    job.result = {"ok": True, "overLimit": False, "tokens": pin_len, "mem_peak_gb": peak}
 
 
 def _bos_id():
@@ -716,6 +745,7 @@ def _stream_replay(messages, reminder, mode, trigger, target):
     tmproot = tempfile.mkdtemp(prefix="civm-rp-")
     try:
         for b in range(len(starts) - 1):
+            _prog(op="reconcile", stage="replay", done=b, total=len(starts) - 1, label=f"replaying turn {b + 1}/{len(starts) - 1}")
             paths = []
             seg_ids = _render_ids(_mlx_messages(messages[starts[b]:starts[b + 1]], tmproot, paths), paths, add_gen=False)
             pv = _per_turn_pixels(paths)
@@ -744,6 +774,7 @@ def _do_reconcile(job):
     if not st.get("kv"):
         PRECACHE["state"] = "idle"; job.result = {}; return
     PRECACHE["state"] = "working"
+    _prog(op="reconcile", stage="rebuilding", done=0, total=0, label="rebuilding conversation cache", bump=True)
     _mem_reset_peak()
     try:
         messages = job.params["messages"]; reminder = job.params["reminder"]; mode = job.params["mode"]
@@ -839,6 +870,7 @@ def _do_generate(job):
         struct_n = max(0, new_tokens - sum(n for _, n in parts))   # turn markers / gen prompt (NOT the model appendix)
         if struct_n: parts.append(("structure", struct_n))
         anew_parts = [{"label": l, "n": n} for l, n in parts]
+        _prog(op="generate", stage="prefill", done=0, total=new_tokens, label="prefilling", bump=True)
         gen = stream_generate(model, processor, "", input_ids=feed_ids,
                               pixel_values=per_pv, prompt_cache=st["kv"],
                               max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
@@ -858,7 +890,9 @@ def _do_generate(job):
                     break
             if ttft is None:
                 ttft = time.time() - start
+                _prog(stage="decode", done=0, total=0, label="generating")   # total=0 → indeterminate + live count
             gen_count = chunk.generation_tokens or gen_count   # running total (every chunk)
+            _prog(done=gen_count, label=f"{gen_count} tok")
             tok = getattr(chunk, "token", None)
             if tok is not None:
                 gen_ids.append(int(tok))
@@ -1067,6 +1101,12 @@ class H(BaseHTTPRequestHandler):
                                     "parakeet": parakeet["model"] is not None,
                                     "precache": PRECACHE["state"],
                                     "ctxWindow": CTX_WINDOW})
+        if self.path == "/progress":
+            # Real per-op progress for the UI's cache HUD. Runs on a separate HTTP thread, reads the
+            # worker's live counter under the tiny PROG_LOCK (never MLX_LOCK) → answers while the GPU is busy.
+            with PROG_LOCK:
+                snap = dict(PROGRESS)              # copy under the fast lock…
+            return self._json(200, snap)           # …serialize/send outside it
         if self.path == "/voice/poll":
             with VLOCK:
                 out = {"state": VOICE["state"], "partial": VOICE["partial"],
