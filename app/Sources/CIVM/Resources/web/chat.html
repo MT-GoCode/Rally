@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="katex.min.css">
+<link rel="stylesheet" href="highlight-github-dark.css">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: #1e1e1e; color: #e6e6e6;
+    font: 14px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif;
+    -webkit-user-select: text; -webkit-font-smoothing: antialiased;
+    overflow-y: scroll; overflow-x: hidden;
+  }
+  #messages { padding: 14px; max-width: 100%; }
+  .row { display: flex; margin: 0 0 14px; }
+  .row.user { justify-content: flex-end; }
+  .row.assistant { justify-content: flex-start; }
+  .bubble { padding: 8px 12px; border-radius: 12px; max-width: 82%; overflow-wrap: anywhere; }
+  .user .bubble { background: rgba(10,132,255,0.22); }
+  .assistant .bubble { background: rgba(160,160,160,0.15); max-width: 92%; }
+  .interruption .bubble { background: rgba(255,159,10,0.20); }
+  .intlabel { font-size: 8px; font-weight: 700; letter-spacing: .5px; color: #ff9f0a; margin-bottom: 4px; }
+  .bubble p:first-child { margin-top: 0; } .bubble p:last-child { margin-bottom: 0; }
+  .bubble pre { background: #0d0d0d; border-radius: 8px; padding: 10px; overflow-x: auto; }
+  .bubble code { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12.5px; }
+  .bubble :not(pre) > code { background: rgba(160,160,160,0.20); padding: 1px 4px; border-radius: 4px; }
+  .bubble table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; }
+  .bubble th, .bubble td { border: 1px solid rgba(160,160,160,0.35); padding: 5px 9px; text-align: left; }
+  .bubble th { background: rgba(160,160,160,0.12); }
+  .bubble blockquote { border-left: 3px solid rgba(160,160,160,0.4); margin: 6px 0; padding-left: 10px; color: #bdbdbd; }
+  .bubble img.inline { max-height: 120px; border-radius: 6px; margin: 4px 6px 0 0; vertical-align: top; }
+  .bubble a { color: #4aa3ff; }
+  .row.selected .bubble { outline: 2px solid #0a84ff; outline-offset: 1px; }
+  .divider { display: flex; align-items: center; gap: 8px; color: #8a8a8a; font-size: 9px; margin: 6px 2px 14px; }
+  .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: rgba(160,160,160,0.3); }
+  .appendix { margin-top: 8px; font-size: 12px; color: #9a9a9a; }
+  .appendix summary { cursor: pointer; color: #7a7a7a; }
+  .src { white-space: pre-wrap; font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="messages"></div>
+<script src="markdown-it.min.js"></script>
+<script src="highlight.min.js"></script>
+<script src="katex.min.js"></script>
+<script src="katex-auto-render.min.js"></script>
+<script>
+const md = window.markdownit({
+  html: false, linkify: true, breaks: false,
+  highlight: (str, lang) => {
+    try { if (lang && hljs.getLanguage(lang)) return hljs.highlight(str, {language: lang}).value; } catch (e) {}
+    return md.utils.escapeHtml(str);
+  }
+});
+const KATEX = { delimiters: [
+  {left:"$$", right:"$$", display:true}, {left:"\\[", right:"\\]", display:true},
+  {left:"$", right:"$", display:false}, {left:"\\(", right:"\\)", display:false}
+], throwOnError:false };
+
+const container = document.getElementById("messages");
+let MSGS = [], CONV_START = -1, SHOW_SRC = {};   // SHOW_SRC[index] = raw source toggle
+
+function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function renderBubbleBody(el, text) {
+  const parts = text.split("@@APPENDIX@@");
+  const body = (parts[0] || "").trim();
+  el.innerHTML = md.render(body);
+  try { renderMathInElement(el, KATEX); } catch(e) {}
+  if (parts.length > 1) {
+    try {
+      const j = JSON.parse(parts[1].slice(parts[1].indexOf("{")));
+      const items = (j.deferred||[]).map(d=>d.item).filter(Boolean).concat(j.training||[]);
+      if (items.length) {
+        const d = document.createElement("details"); d.className = "appendix";
+        d.innerHTML = "<summary>notes</summary>" + items.map(i=>"<div>• "+esc(i)+"</div>").join("");
+        el.appendChild(d);
+      }
+    } catch(e) {}
+  }
+}
+
+function render(msgs, convStart) {
+  MSGS = msgs || MSGS; CONV_START = (convStart===undefined? CONV_START : convStart);
+  container.innerHTML = "";
+  MSGS.forEach((m, i) => {
+    if (CONV_START > 0 && i === CONV_START) {
+      const dv = document.createElement("div"); dv.className = "divider";
+      dv.textContent = "earlier turns are out of context"; container.appendChild(dv);
+    }
+    const row = document.createElement("div");
+    row.className = "row " + (m.role === "user" ? "user" : "assistant") + (m.isInterruption ? " interruption" : "");
+    if (m.selected) row.className += " selected";
+    const bub = document.createElement("div"); bub.className = "bubble";
+    if (m.isInterruption) { const l=document.createElement("div"); l.className="intlabel"; l.textContent="INTERRUPTED TO ADD"; bub.appendChild(l); }
+    if (m.images && m.images.length) {
+      const strip=document.createElement("div");
+      m.images.forEach(src=>{ const im=document.createElement("img"); im.className="inline"; im.src=src; strip.appendChild(im); });
+      bub.appendChild(strip);
+    }
+    const bodyEl = document.createElement("div");
+    if (m.role === "user" || SHOW_SRC[i]) { bodyEl.className="src"; bodyEl.textContent = m.text.split("@@APPENDIX@@")[0].trim(); }
+    else { renderBubbleBody(bodyEl, m.text); }
+    bub.appendChild(bodyEl);
+    if (m.interrupted) { const c=document.createElement("div"); c.style.cssText="font-size:11px;color:#8a8a8a"; c.textContent="⎯ interrupted"; bub.appendChild(c); }
+    row.appendChild(bub); container.appendChild(row);
+  });
+  scrollToBottom();
+}
+
+// Streaming: keep the last assistant bubble live without re-rendering the whole list.
+let streamEl = null;
+function beginStream() {
+  const row=document.createElement("div"); row.className="row assistant";
+  const bub=document.createElement("div"); bub.className="bubble";
+  streamEl=document.createElement("div"); bub.appendChild(streamEl); row.appendChild(bub); container.appendChild(row);
+  scrollToBottom();
+}
+function setStream(text){ if(!streamEl) beginStream(); renderBubbleBody(streamEl, text || "…"); scrollToBottom(); }
+function endStream(){ streamEl=null; }
+
+function setSelected(idx){ MSGS.forEach((m,i)=>m.selected=(i===idx)); render(); if(idx>=0){ const r=container.querySelectorAll(".row")[idx]; if(r) r.scrollIntoView({block:"center"}); } }
+function toggleSource(idx){ SHOW_SRC[idx]=!SHOW_SRC[idx]; render(); }
+function atBottom(){ return window.innerHeight + window.scrollY >= document.body.scrollHeight - 60; }
+function scrollToBottom(){ window.scrollTo(0, document.body.scrollHeight); }
+
+// Swift bridge entry point (single JSON message → dispatch)
+window.rally = { render, setStream, endStream, setSelected, toggleSource, scrollToBottom };
+</script>
+</body>
+</html>

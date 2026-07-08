@@ -193,14 +193,13 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
         // noticeable moment, which must NEVER freeze the UI. Transition immediately + show a spinner;
         // the real content swaps in when the decode finishes.
         let url = dir.appendingPathComponent("\(id).json")
-        openSeq &+= 1; let mySeq = openSeq   // request token — a slower earlier decode must not overwrite a later open
         loadingChat = true
         chat = Chat(name: "Loading…")        // placeholder so the chat pane isn't showing the previous chat
         screen = .chat
         Task.detached(priority: .userInitiated) { [weak self] in
             let c = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Chat.self, from: $0) }
             await MainActor.run {
-                guard let self, self.openSeq == mySeq else { return }   // a newer open() superseded this one → drop it
+                guard let self else { return }
                 self.loadingChat = false
                 guard let c else { self.screen = .home; return }
                 self.chat = c
@@ -208,7 +207,6 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
             }
         }
     }
-    private var openSeq = 0
     func goHome() { save(thenRefresh: true); screen = .home }   // refresh the sidebar AFTER the save write lands
     func startNew() {
         var c = Chat()
@@ -758,43 +756,15 @@ struct RootView: View {
             }
             Divider()
             CacheHUDView(session: session, engine: engine, store: store)   // isolated: progress ticks re-render only this
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        // Render only the trailing `visibleCount` messages so NO chat size can freeze layout
-                        // (the markdown/CoreText parse is main-thread). Older turns load on demand — this is a
-                        // pure VIEW window, independent of the KV cache window (the "out of context" line).
-                        let msgs = store.chat.messages
-                        let startIdx = max(0, msgs.count - session.visibleCount)
-                        if startIdx > 0 {
-                            Button { session.loadEarlier() } label: {
-                                Label("Load \(startIdx) earlier message\(startIdx == 1 ? "" : "s")", systemImage: "chevron.up.circle")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }.buttonStyle(.plain).padding(.vertical, 4)
-                        }
-                        // Enumerate only the VISIBLE slice (msgs[startIdx...]) so the render never allocates
-                        // an O(all-messages) array; `idx` stays the absolute message index for the boundary line.
-                        ForEach(Array(msgs[startIdx...].enumerated()), id: \.element.id) { off, m in
-                            let idx = startIdx + off
-                            if let cs = session.convStart, cs == idx, cs > 0 { contextBoundaryLine }
-                            messageBubble(id: m.id, role: m.role, text: m.text, interrupted: m.interrupted, isInterruption: m.isInterruption, images: m.content)
-                        }
-                        // Streaming bubble is its OWN leaf: it reads session.streaming (+ follow-scroll)
-                        // internally, so a per-token update never re-evaluates this message list.
-                        StreamingBubble(session: session, onGrow: { scrollDown(proxy, animated: false) }) {
-                            messageBubble(role: "assistant", text: $0)
-                        }
-                        Color.clear.frame(height: 1).id(chatBottomID)      // stable bottom anchor for auto-scroll
-                    }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .onAppear { scrollDown(proxy, animated: false) }
-                .onChange(of: store.chat.id) { _, _ in scrollDown(proxy, animated: false) }
-                .onChange(of: store.chat.messages.count) { _, _ in scrollDown(proxy) }
-                .onChange(of: session.selectedMessageID) { _, id in   // keep the keyboard-selected reply on screen
-                    if let id { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) } }
-                }
+            // The transcript is now a single WKWebView (markdown-it/KaTeX/highlight, all off the main
+            // thread). `.id(store.chat.id)` recreates it (fresh web process) per chat and tears down the old
+            // one → bounded memory, no beachball. Reads session.streaming/busy so the live reply updates —
+            // cheap now, since the heavy render happens in the web process, not here.
+            ChatWebView(messagesJSON: conversationJSON(store.chat.messages),
+                        convStart: session.convStart ?? -1,
+                        streamingText: session.streaming, isBusy: session.busy)
+                .id(store.chat.id)
                 .overlay(alignment: .bottomTrailing) { precacheChip.padding(10) }
-            }
             Divider()
             inputRegion
         }

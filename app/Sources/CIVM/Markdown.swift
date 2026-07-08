@@ -1,36 +1,23 @@
 import SwiftUI
-import SwiftStreamingMarkdown
+import Textual
 
 // ---------------------------------------------------------------------------
-// GFM Markdown + LaTeX math → SwiftUI, rendered by Microsoft's SwiftStreamingMarkdown:
-// lightweight SwiftUI (no per-block NSViews), parsing runs ASYNC (its MarkdownView parses in
-// .task(id:text) off the render path) and rendering is incremental — so a heavy chat full of
-// tables/math no longer beachballs the main thread the way Textual's synchronous CoreText NSView
-// layout did (the old renderer was THE open-time freeze; sampled to StructuredText.placeSubviews).
-// Tables, fenced+highlighted code, lists, blockquotes, and LaTeX all supported. Streaming replies
-// stay smooth. The @@APPENDIX@@ split lives in the caller (messageBubble); Appendix below.
+// GFM Markdown + LaTeX math → SwiftUI via Textual (MarkdownUI author's successor, CoreText, no
+// WebView). Tables, fenced+highlighted code, lists, blockquotes, and inline/display math ($…$, $$…$$)
+// render VISIBLY. (SwiftStreamingMarkdown was tried and reverted: its theme colors live in an asset
+// catalog that SPM's `swift build` never compiles into our hand-built .app → all text rendered
+// invisible; it's also NSTextView-per-paragraph, i.e. heavy.) The open-time cost of Textual is
+// contained by the bounded message window + collapsed context pane, not by the renderer.
+// The @@APPENDIX@@ split lives in the caller (messageBubble); Appendix below.
 // ---------------------------------------------------------------------------
 
-// The model emits inline math as $…$, but SwiftStreamingMarkdown recognizes \(…\) inline (+ $$…$$ /
-// \[…\] block). Protect $$blocks$$, convert remaining $…$ → \(…\), then restore the blocks.
-func normalizeMath(_ s: String) -> String {
-    guard s.contains("$") else { return s }
-    let sentinel = "\u{E000}BLOCKMATH\u{E000}"
-    var t = s.replacingOccurrences(of: "$$", with: sentinel)
-    if let re = try? NSRegularExpression(pattern: "\\$([^\\n$]+?)\\$") {
-        t = re.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: (t as NSString).length),
-                                        withTemplate: "\\\\($1\\\\)")
-    }
-    return t.replacingOccurrences(of: sentinel, with: "$$")
-}
-
-// Equatable so SwiftUI skips re-evaluating when `raw` is unchanged (keeps the committed history from
-// re-rendering when an unrelated @Observable value ticks). Used via `.equatable()` at the call site.
+// Equatable so SwiftUI skips re-evaluating (and Textual skips re-parsing) when `raw` is unchanged.
 struct MarkdownText: View, Equatable {
     let raw: String
     nonisolated static func == (a: MarkdownText, b: MarkdownText) -> Bool { a.raw == b.raw }
     var body: some View {
-        MarkdownView(text: normalizeMath(raw))
+        StructuredText(markdown: raw, syntaxExtensions: [.math])
+            .textual.structuredTextStyle(.gitHub)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
