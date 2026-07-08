@@ -1,7 +1,7 @@
 import Foundation
 
 // Content block — the interro-verbatim stream shape (text | base64 image).
-struct Block: Codable, Identifiable, Equatable {
+struct Block: Codable, Identifiable, Equatable, Sendable {
     var id = UUID()
     var type: String            // "text" | "image"
     var text: String?           // for text
@@ -27,9 +27,12 @@ struct Block: Codable, Identifiable, Equatable {
 
 // Spawns + talks to the local Python MLX engine over localhost.
 // A single transcript message on the wire: role + interleaved content blocks (text | image).
-struct ChatMessage: Encodable { let role: String; let content: [Block] }
-// {messages, reminder} — the shape POST /chat and POST /voice/context both take.
-struct ChatReq: Encodable { let messages: [ChatMessage]; let reminder: [Block]; let reminderMode: String }
+struct ChatMessage: Encodable, Sendable { let role: String; let content: [Block] }
+// {messages, reminder, reminderMode + bounded-cache budget/mode} — POST /chat and /precache take this.
+struct ChatReq: Encodable, Sendable {
+    let messages: [ChatMessage]; let reminder: [Block]; let reminderMode: String
+    var trimTrigger: Int? = nil; var trimTarget: Int? = nil; var recacheMode: String? = nil
+}
 // A capture event pushed by the engine's screenshot / copy-to-chat shortcuts.
 struct Capture: Decodable { var kind: String; var data: String?; var text: String? }   // kind: "image" | "text"
 // GET /voice/poll payload (captures = the events channel, drained by /voice/captures-ack).
@@ -70,11 +73,24 @@ enum Model {
 
     func stop() { proc?.terminate() }
 
-    // POST /precache — re-warm the KV for the next message with a (new) reminder mode.
-    func precache(messages: [ChatMessage], reminder: [Block], reminderMode: String) async {
-        struct Req: Encodable { let messages: [ChatMessage]; let reminder: [Block]; let reminderMode: String }
-        let body = (try? JSONEncoder().encode(Req(messages: messages, reminder: reminder, reminderMode: reminderMode))) ?? Data("{}".utf8)
-        _ = try? await post("/precache", body: body, timeout: 30)
+    // POST /precache — re-warm the KV for the next message (new reminder mode / bounded-cache budget).
+    func precache(messages: [ChatMessage], reminder: [Block], reminderMode: String,
+                  trimTrigger: Int, trimTarget: Int, recacheMode: String) async {
+        let req = ChatReq(messages: messages, reminder: reminder, reminderMode: reminderMode,
+                          trimTrigger: trimTrigger, trimTarget: trimTarget, recacheMode: recacheMode)
+        _ = try? await post("/precache", body: await Self.encodeOffMain(req), timeout: 60)
+    }
+
+    // POST /reconcile — rebuild the conversation cache to be correct for the current settings (chat open
+    // / content or setting change). Returns the out-of-context boundary (conv_start), nil on failure.
+    func reconcile(messages: [ChatMessage], reminder: [Block], reminderMode: String,
+                   trimTrigger: Int, trimTarget: Int, recacheMode: String) async -> (convStart: Int, convTokens: Int)? {
+        let req = ChatReq(messages: messages, reminder: reminder, reminderMode: reminderMode,
+                          trimTrigger: trimTrigger, trimTarget: trimTarget, recacheMode: recacheMode)
+        guard let d = try? await post("/reconcile", body: await Self.encodeOffMain(req), timeout: 120),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let cs = j["conv_start"] as? Int else { return nil }
+        return (cs, j["conv_tokens"] as? Int ?? 0)   // both, so the HUD gauge populates on open (not just after a send)
     }
 
     // Read the engine's post-response precache state ("idle"|"working"|"done") from /health.
@@ -100,12 +116,19 @@ enum Model {
         if !ready { status = "engine did not become ready (see serve.log)" }
     }
 
+    // Encode OFF the main thread — a transcript with base64 images is expensive to serialize and must
+    // never hitch the UI. (Engine is @MainActor, so a plain encode here would run on main.)
+    nonisolated static func encodeOffMain<T: Encodable & Sendable>(_ v: T) async -> Data {
+        await Task.detached(priority: .userInitiated) { (try? JSONEncoder().encode(v)) ?? Data("{}".utf8) }.value
+    }
+
     // POST /new — drop the current pin; the engine installs its EMPTY baseline (pin_len=0). Instant.
     func reset() async { _ = try? await post("/new", body: Data("{}".utf8), timeout: 30) }
 
     // POST /pin — returns (tokens, overLimit). Long (vision tower runs once).
     func pin(system: [Block], context: [Block]) async throws -> (Int, Bool) {
-        let body = try JSONEncoder().encode(["system": system, "context": context, "history": [Block]()])
+        struct PinReq: Encodable, Sendable { let system: [Block]; let context: [Block]; let history: [Block] }
+        let body = await Self.encodeOffMain(PinReq(system: system, context: context, history: []))
         let d = try await post("/pin", body: body, timeout: 900)
         let j = try JSONSerialization.jsonObject(with: d) as? [String: Any] ?? [:]
         return (j["tokens"] as? Int ?? 0, j["overLimit"] as? Bool ?? false)
@@ -116,11 +139,13 @@ enum Model {
     // token deltas via onDelta; returns the final `{done,…}` meta line. Cancel by cancelling the calling
     // Task — the bytes loop throws and the closed connection tells the engine to stop generating.
     func chat(messages: [ChatMessage], reminder: [Block], reminderMode: String,
+              trimTrigger: Int, trimTarget: Int, recacheMode: String,
               onDelta: @escaping (String) -> Void) async throws -> [String: Any] {
         var req = URLRequest(url: URL(string: base + "/chat")!)
         req.httpMethod = "POST"; req.timeoutInterval = 120
         req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.httpBody = try JSONEncoder().encode(ChatReq(messages: messages, reminder: reminder, reminderMode: reminderMode))
+        req.httpBody = await Self.encodeOffMain(ChatReq(messages: messages, reminder: reminder, reminderMode: reminderMode,
+                                                        trimTrigger: trimTrigger, trimTarget: trimTarget, recacheMode: recacheMode))
         var meta: [String: Any] = [:]
         let (bytes, _) = try await URLSession.shared.bytes(for: req)
         for try await line in bytes.lines {
@@ -138,13 +163,20 @@ enum Model {
     // voiceEnabled gates the voice chord (Voice·Text only); captureEnabled gates the screenshot/copy
     // bindings (active whenever a chat is open, ANY mode). Bindings are engine strings ("cmd+1"/"mouse3").
     func voiceConfig(voiceEnabled: Bool, captureEnabled: Bool, submode: String, streaming: Bool,
-                     key: String, shotBinding: String, shotStyle: String, copyBinding: String) async {
+                     key: String, shotBinding: String, shotStyle: String, copyBinding: String,
+                     hotkeyMode: String) async {
         let body = (try? JSONSerialization.data(withJSONObject: [
             "voiceEnabled": voiceEnabled, "captureEnabled": captureEnabled,
-            "submode": submode, "streaming": streaming, "key": key,
+            "submode": submode, "streaming": streaming, "key": key, "hotkeyMode": hotkeyMode,
             "shot": ["binding": shotBinding, "style": shotStyle],
             "copy": ["binding": copyBinding]])) ?? Data("{}".utf8)
         _ = try? await post("/voice/config", body: body, timeout: 5)
+    }
+    // POST /trigger — external hotkey (the app's RegisterEventHotKey, or a Karabiner CLI) drives the
+    // voice/capture state machines. kind: chord_down|chord_up|cancel|shot|copy.
+    func trigger(_ kind: String) async {
+        let body = (try? JSONSerialization.data(withJSONObject: ["kind": kind])) ?? Data("{}".utf8)
+        _ = try? await post("/trigger", body: body, timeout: 3)
     }
     // POST /voice/captures-ack — drop the first `count` captures we just drained from a poll.
     func voiceCapturesAck(count: Int) async {

@@ -56,9 +56,12 @@ struct ChatSettings: Codable, Equatable {
     var muteDictation = true
     var transcription = Transcription.after.rawValue
     var speechLocale = "en-US"
+    var cacheTrigger = 5000                 // X: trim conversation cache when it exceeds this
+    var cacheTarget = 3000                  // Y: …down to this (hysteresis)
+    var recacheMode = RecacheMode.recent.rawValue
 
     init() {}
-    enum CodingKeys: String, CodingKey { case agentOutput, reminderMode, voiceInput, submode, autoSend, muteDictation, transcription, speechLocale }
+    enum CodingKeys: String, CodingKey { case agentOutput, reminderMode, voiceInput, submode, autoSend, muteDictation, transcription, speechLocale, cacheTrigger, cacheTarget, recacheMode }
     init(from d: Decoder) throws {   // per-field lenient: a new field added later won't wipe saved settings
         let c = try d.container(keyedBy: CodingKeys.self)
         if let v = try? c.decode(String.self, forKey: .agentOutput)   { agentOutput = v }
@@ -69,6 +72,9 @@ struct ChatSettings: Codable, Equatable {
         if let v = try? c.decode(Bool.self,   forKey: .muteDictation) { muteDictation = v }
         if let v = try? c.decode(String.self, forKey: .transcription) { transcription = v }
         if let v = try? c.decode(String.self, forKey: .speechLocale)  { speechLocale = v }
+        if let v = try? c.decode(Int.self,    forKey: .cacheTrigger)  { cacheTrigger = v }
+        if let v = try? c.decode(Int.self,    forKey: .cacheTarget)   { cacheTarget = v }
+        if let v = try? c.decode(String.self, forKey: .recacheMode)   { recacheMode = v }
     }
 
     var agentOutputV: AgentOutput   { AgentOutput(rawValue: agentOutput) ?? .text }
@@ -76,6 +82,10 @@ struct ChatSettings: Codable, Equatable {
     var submodeV: Submode           { Submode(rawValue: submode) ?? .hold }
     var autoSendV: AutoSend         { AutoSend(rawValue: autoSend) ?? .ifAlone }
     var transcriptionV: Transcription { Transcription(rawValue: transcription) ?? .after }
+    var recacheModeV: RecacheMode   { RecacheMode(rawValue: recacheMode) ?? .recent }
+    // clamped budget the engine is actually told (trigger ≤ cap, target < trigger)
+    var trimTrigger: Int { max(200, min(cacheTrigger, SK.cacheTriggerCap)) }
+    var trimTarget: Int  { max(100, min(cacheTarget, trimTrigger - 1)) }
 
     // Snapshot the current DEFAULTS store (SK.*) — used when a NEW chat is created.
     static func fromDefaults() -> ChatSettings {
@@ -88,6 +98,9 @@ struct ChatSettings: Codable, Equatable {
         s.muteDictation = SK.muteDictationOn
         s.transcription = Transcription.current.rawValue
         s.speechLocale = SK.speechLocaleValue
+        s.cacheTrigger = SK.cacheTriggerValue
+        s.cacheTarget = SK.cacheTargetValue
+        s.recacheMode = RecacheMode.current.rawValue
         return s
     }
 }
@@ -148,6 +161,7 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
     @Published var screen: Screen = .home
     @Published var chat = Chat()
     @Published var stubs: [ChatStub] = []
+    @Published var loadingChat = false        // decoding a chat off-main → UI shows a spinner, never freezes
     // what the engine's ONE global KV currently holds (chat + content version)
     @Published var enginePinnedChat: UUID? = nil
     @Published var enginePinnedHash: Int? = nil
@@ -161,7 +175,12 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
     func save() {
         // don't litter home with pristine empty chats
         guard !(chat.messages.isEmpty && nonEmpty(chat.system).isEmpty && nonEmpty(chat.context).isEmpty) else { return }
-        if let d = try? JSONEncoder().encode(chat) { try? d.write(to: dir.appendingPathComponent("\(chat.id).json")) }
+        // Encode + write OFF the main thread (a big chat with base64 images can take real time) so a
+        // save after every turn never hitches the UI. Snapshot the value type first.
+        let snapshot = chat, url = dir.appendingPathComponent("\(chat.id).json")
+        Task.detached(priority: .utility) {
+            if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url) }
+        }
     }
 
     func refreshStubs() {
@@ -176,9 +195,23 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
             .sorted { ($0.mtime ?? .distantPast) > ($1.mtime ?? .distantPast) }
     }
     func open(_ id: UUID) {
-        guard let d = try? Data(contentsOf: dir.appendingPathComponent("\(id).json")),
-              let c = try? JSONDecoder().decode(Chat.self, from: d) else { return }
-        chat = c; screen = .chat; activated.send(.opened)
+        // Decode OFF the main thread — a large saved chat (many messages + base64 images) can take a
+        // noticeable moment, which must NEVER freeze the UI. Transition immediately + show a spinner;
+        // the real content swaps in when the decode finishes.
+        let url = dir.appendingPathComponent("\(id).json")
+        loadingChat = true
+        chat = Chat(name: "Loading…")        // placeholder so the chat pane isn't showing the previous chat
+        screen = .chat
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let c = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Chat.self, from: $0) }
+            await MainActor.run {
+                guard let self else { return }
+                self.loadingChat = false
+                guard let c else { self.screen = .home; return }
+                self.chat = c
+                self.activated.send(.opened)
+            }
+        }
     }
     func goHome() { save(); refreshStubs(); screen = .home }
     func startNew() {
@@ -371,8 +404,8 @@ struct BlockStream: View {
                         .textFieldStyle(.plain).font(.system(size: 12, design: .monospaced))
                         .foregroundStyle(.primary).lineLimit(1...)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                } else if let ns = blk.nsImage {
-                    Image(nsImage: ns).resizable().scaledToFit()
+                } else if blk.type == "image" {
+                    AsyncBlockImage(block: blk) { $0.resizable().scaledToFit() }
                         .frame(maxWidth: .infinity, maxHeight: 220, alignment: .leading)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.25)))
@@ -440,6 +473,10 @@ struct RootView: View {
     // separate DEFAULTS store (SK.*), consulted only when a new chat is created. Only the hotkey +
     // capture bindings are process-global (they drive the one CGEventTap), so hotkey stays @AppStorage.
     @AppStorage(SK.hotkey) private var hotkey = SK.defaultHotkey
+    // Conversation-cache budget/mode are GLOBAL (apply to every chat live) — the ⋯ menu edits the same keys as Settings.
+    @AppStorage(SK.cacheTrigger) private var gCacheTrigger = SK.defaultCacheTrigger
+    @AppStorage(SK.cacheTarget) private var gCacheTarget = SK.defaultCacheTarget
+    @AppStorage(SK.recacheMode) private var gRecacheMode = SK.defaultRecacheMode
     var cs: ChatSettings { store.chat.settings }         // the open chat's live settings (read by the input UI)
     var submode: Submode { cs.submodeV }
     var transcription: Transcription { cs.transcriptionV }
@@ -737,10 +774,22 @@ struct RootView: View {
                 inputOutputBar
             }
             Divider()
+            cacheHUD                                // always-visible background-cache pipeline status
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
-                        ForEach(store.chat.messages) { m in
+                        // Render only the trailing `visibleCount` messages so NO chat size can freeze layout
+                        // (the markdown/CoreText parse is main-thread). Older turns load on demand — this is a
+                        // pure VIEW window, independent of the KV cache window (the "out of context" line).
+                        let startIdx = max(0, store.chat.messages.count - session.visibleCount)
+                        if startIdx > 0 {
+                            Button { session.loadEarlier() } label: {
+                                Label("Load \(startIdx) earlier message\(startIdx == 1 ? "" : "s")", systemImage: "chevron.up.circle")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }.buttonStyle(.plain).padding(.vertical, 4)
+                        }
+                        ForEach(Array(store.chat.messages.enumerated()).suffix(session.visibleCount), id: \.element.id) { idx, m in
+                            if let cs = session.convStart, cs == idx, cs > 0 { contextBoundaryLine }
                             messageBubble(id: m.id, role: m.role, text: m.text, interrupted: m.interrupted, isInterruption: m.isInterruption, images: m.content)
                         }
                         if session.busy { messageBubble(role: "assistant", text: session.streaming.isEmpty ? "…" : session.streaming) }
@@ -789,6 +838,62 @@ struct RootView: View {
     }
 
     // Bottom-right status: the engine warming the KV for the next message after each reply.
+    // Prominent, ALWAYS-VISIBLE status of the whole background cache pipeline: engine load → context pin
+    // (with progress) → conversation-cache warm/reconcile → ready. Decoupled from the work itself — it
+    // only reads @Published state, so it stays live even while the engine is busy.
+    var cacheHUD: some View {
+        let st = cacheHUDStage
+        return HStack(spacing: 8) {
+            if st.busy { ProgressView().controlSize(.mini).scaleEffect(0.8) }
+            else { Image(systemName: st.icon).font(.system(size: 11)).foregroundStyle(st.color) }
+            Text(st.text).font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+            if session.caching || session.cacheProgress > 0 { cacheProgressBar }
+            Spacer(minLength: 8)
+            // Live conversation-cache usage vs budget — always visible so the current behavior is obvious.
+            if let ct = session.convTokens {
+                let trig = session.trimTrigger
+                HStack(spacing: 4) {
+                    Image(systemName: "gauge.with.dots.needle.33percent").font(.system(size: 9))
+                    Text("\(ct)/\(trig) tok").font(.system(size: 9, weight: .medium))
+                    if let cvs = session.convStart, cvs > 0 {
+                        Text("· \(cvs) dropped").font(.system(size: 9)).foregroundStyle(.orange)
+                    }
+                }.foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 5)
+        .background(st.busy ? Color.accentColor.opacity(0.06) : Color.clear)
+        .overlay(alignment: .bottom) { Divider() }
+        .animation(.easeInOut(duration: 0.2), value: st.text)
+    }
+    // (icon, text, busy, color) for the current pipeline stage — ordered by precedence.
+    var cacheHUDStage: (icon: String, text: String, busy: Bool, color: Color) {
+        if !engine.ready                { return ("hourglass", engine.status, true, .secondary) }
+        if store.loadingChat            { return ("hourglass", "loading chat…", true, .secondary) }
+        if session.caching              { return ("externaldrive.badge.plus", "caching context (system + reference)…", true, .accentColor) }
+        if session.precache == "working"{ return ("arrow.triangle.2.circlepath", "warming conversation cache…", true, .accentColor) }
+        if session.busy                 { return ("bubble.left.and.text.bubble.right", "generating…", true, .accentColor) }
+        if session.precache == "done"   { return ("checkmark.seal.fill", "cache ready", false, .green) }
+        switch session.cacheState {
+        case .overLimit, .failed:       return ("exclamationmark.triangle.fill", cacheStatusText, false, .red)
+        case .cached(let t):            return ("checkmark.seal.fill", "cached ✓ · \(t) tok context", false, .green)
+        case .changed:                  return ("pencil.circle", "context changed — re-cache to apply", false, .orange)
+        case .nothingToCache:           return ("checkmark.seal", "ready — just ask", false, .secondary)
+        default:                        return ("circle", cacheStatusText, false, .secondary)
+        }
+    }
+
+    // Boundary between turns that are OUT of the conversation cache (above) and in-context (below).
+    // Position is engine-determined (session.convStart); hidden until known (nil on a fresh open).
+    var contextBoundaryLine: some View {
+        HStack(spacing: 8) {
+            VStack { Divider() }
+            Text("earlier turns are out of context").font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.secondary).fixedSize().tracking(0.5)
+            VStack { Divider() }
+        }.padding(.vertical, 2).opacity(0.75)
+    }
+
     @ViewBuilder var precacheChip: some View {
         if !session.precache.isEmpty {
             let done = session.precache == "done"
@@ -907,8 +1012,37 @@ struct RootView: View {
                     .disabled(!cs.voiceInput || cs.transcriptionV != .stream)
                 }
             }
+            Divider()
+            VStack(alignment: .leading, spacing: 5) {
+                Text("CONVERSATION CACHE").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
+                // LIVE readout — what's happening right now
+                HStack(spacing: 5) {
+                    Image(systemName: "gauge.with.dots.needle.33percent").font(.system(size: 10)).foregroundStyle(Color.accentColor)
+                    if let ct = session.convTokens {
+                        Text("\(ct) / \(session.trimTrigger) tok in cache").font(.caption2.weight(.medium))
+                        if let cvs = session.convStart, cvs > 0 {
+                            Text("· \(cvs) turn\(cvs == 1 ? "" : "s") dropped").font(.caption2).foregroundStyle(.orange)
+                        }
+                    } else { Text("bounded to \(session.trimTrigger) tok").font(.caption2).foregroundStyle(.secondary) }
+                }
+                HStack(spacing: 10) {
+                    Stepper("Trim at \(gCacheTrigger)", value: Binding(get: { gCacheTrigger }, set: { session.setCacheTrigger($0) }),
+                            in: 200...SK.cacheTriggerCap, step: 200)
+                    Stepper("to \(gCacheTarget)", value: Binding(get: { gCacheTarget }, set: { session.setCacheTarget($0) }),
+                            in: 100...max(101, gCacheTrigger - 1), step: 100)
+                }.font(.caption2).controlSize(.mini)
+                Label("Ongoing: oldest turns re-roped out instantly (no recompute).", systemImage: "bolt.fill")
+                    .font(.system(size: 9)).foregroundStyle(.green).labelStyle(.titleAndIcon)
+                HStack(spacing: 6) {
+                    Text("On reopen:").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary)
+                    Picker("", selection: Binding(get: { RecacheMode(rawValue: gRecacheMode) ?? .recent }, set: { session.setRecacheMode($0) })) {
+                        ForEach(RecacheMode.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }.pickerStyle(.segmented).labelsHidden().controlSize(.mini).frame(width: 190)
+                }
+                Text((RecacheMode(rawValue: gRecacheMode) ?? .recent).blurb).font(.system(size: 9)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .padding(14).frame(width: 320)
+        .padding(14).frame(width: 340)
         .task {
             var locs = await AppleSpeech.supportedLocaleIDs()
             if !locs.contains(cs.speechLocale) { locs.insert(cs.speechLocale, at: 0) }
@@ -1046,11 +1180,10 @@ struct RootView: View {
             HStack(spacing: 8) {
                 ForEach(session.pastedImages) { b in
                     ZStack(alignment: .topTrailing) {
-                        if let ns = b.nsImage {
-                            Image(nsImage: ns).resizable().scaledToFill().frame(width: 54, height: 54)
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.25)))
-                        }
+                        AsyncBlockImage(block: b) { $0.resizable().scaledToFill() }
+                            .frame(width: 54, height: 54)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(.secondary.opacity(0.25)))
                         Button { session.removePastedImage(id: b.id) } label: {
                             Image(systemName: "xmark.circle.fill").font(.system(size: 14))
                         }.buttonStyle(.plain).foregroundStyle(.white, .black.opacity(0.55)).padding(2)
@@ -1096,11 +1229,10 @@ struct RootView: View {
                 if !images.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
-                            ForEach(images) { b in
-                                if let ns = b.nsImage {
-                                    Image(nsImage: ns).resizable().scaledToFit().frame(maxHeight: 120)
-                                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                                }
+                            ForEach(images.filter { $0.type == "image" }) { b in
+                                AsyncBlockImage(block: b) { $0.resizable().scaledToFit() }
+                                    .frame(maxHeight: 120)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6))
                             }
                         }
                     }

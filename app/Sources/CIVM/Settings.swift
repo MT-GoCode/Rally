@@ -39,11 +39,37 @@ enum ReminderMode: String, CaseIterable {
     }
 }
 
+// How the conversation cache is rebuilt when you REOPEN a chat (a resume-only choice). Live/ongoing
+// dropping ALWAYS re-ropes (near-instant, keeps the smear) regardless of this — no recompute mid-chat.
+enum RecacheMode: String, CaseIterable {
+    case recent, streaming
+    var label: String { self == .recent ? "Recent (cheap)" : "Streaming (replay)" }
+    var blurb: String {
+        self == .recent
+        ? "On reopen: prefill just the recent window. Fast, but the live “smear” of older turns is discarded."
+        : "On reopen: replay the whole chat to rebuild the smear. Slower to reopen, higher fidelity."
+    }
+}
+
+// How Rally receives its global dictation/capture hotkeys (a GLOBAL, non-per-chat setting). NEITHER
+// installs a system-wide event tap, so neither interferes with other apps / Karabiner.
+enum HotkeyMode: String, CaseIterable {
+    case selfContained = "self", karabiner
+    var label: String { self == .selfContained ? "Self-contained" : "Karabiner (CLI)" }
+    var blurb: String {
+        self == .selfContained
+        ? "Built-in shortcuts via the OS (a real key + modifiers, e.g. ⌃⌥Space). Works out of the box; zero interference. No modifier-only chords."
+        : "The app registers NO keys — wire your own keys to the `rally` CLI in Karabiner. Most bulletproof, but needs Karabiner set up."
+    }
+}
+
 // UserDefaults keys (shared by the input/output bar, the input region, and the Settings sheet).
 enum SK {
     static let submode = "civm.voiceSubmode", transcription = "civm.transcription", hotkey = "civm.hotkey"
     static let sidebarCollapsed = "civm.sidebarCollapsed"
-    static let defaultHotkey = "ctrl+alt"
+    static let defaultHotkey = "ctrl+alt+space"        // self-contained needs a REAL key (RegisterEventHotKey)
+    static let hotkeyMode = "civm.hotkeyMode"
+    static let defaultHotkeyMode = HotkeyMode.selfContained.rawValue
     static let defaultSubmode = Submode.hold.rawValue
     // Default system / reminder PROMPTS filled on new-chat creation — a SavedPrompt id, or "" = none.
     static let defaultSystemPrompt = "civm.defaultSystemPrompt", defaultReminderPrompt = "civm.defaultReminderPrompt"
@@ -64,6 +90,11 @@ enum SK {
     static let defaultSpeechLocale = "en-US"
     static let reminderMode = "civm.reminderMode"    // reminder placement (latency ⇄ adherence)
     static let defaultReminderMode = ReminderMode.start.rawValue
+    // Bounded conversation cache: trim when conv+reminder cache exceeds cacheTrigger (X) tokens, down to
+    // cacheTarget (Y). recacheMode = how the drop / resume is rebuilt (recent vs streaming).
+    static let cacheTrigger = "civm.cacheTrigger", cacheTarget = "civm.cacheTarget", recacheMode = "civm.recacheMode"
+    static let defaultCacheTrigger = 5000, defaultCacheTarget = 3000, cacheTriggerCap = 50000
+    static let defaultRecacheMode = RecacheMode.recent.rawValue
 }
 
 // ---- shared settings accessors — the SINGLE authority for reading the SK keys with the right
@@ -78,7 +109,12 @@ extension Transcription { static func from(_ raw: String) -> Transcription { Tra
                           static var current: Transcription { from(UserDefaults.standard.string(forKey: SK.transcription) ?? "") } }
 extension ShotStyle    { static func from(_ raw: String) -> ShotStyle { ShotStyle(rawValue: raw) ?? .initiate } }
 extension ReminderMode { static var current: ReminderMode { ReminderMode(rawValue: UserDefaults.standard.string(forKey: SK.reminderMode) ?? SK.defaultReminderMode) ?? .start } }
+extension RecacheMode  { static var current: RecacheMode { RecacheMode(rawValue: UserDefaults.standard.string(forKey: SK.recacheMode) ?? SK.defaultRecacheMode) ?? .recent } }
+extension HotkeyMode   { static var current: HotkeyMode { HotkeyMode(rawValue: UserDefaults.standard.string(forKey: SK.hotkeyMode) ?? SK.defaultHotkeyMode) ?? .selfContained } }
 extension SK {
+    // Clamp: trigger in [target+1 … cap]; target in [100 … trigger-1]. Absent → the coded defaults.
+    static var cacheTriggerValue: Int { let v = (UserDefaults.standard.object(forKey: cacheTrigger) as? Int) ?? defaultCacheTrigger; return max(200, min(v, cacheTriggerCap)) }
+    static var cacheTargetValue: Int { let t = cacheTriggerValue; let v = (UserDefaults.standard.object(forKey: cacheTarget) as? Int) ?? defaultCacheTarget; return max(100, min(v, t - 1)) }
     // Bool keys: absent → the default (object(forKey:) is nil until the toggle is first written).
     static var voiceInputOn: Bool   { (UserDefaults.standard.object(forKey: voiceInput) as? Bool) ?? defaultVoiceInput }
     static var muteDictationOn: Bool { (UserDefaults.standard.object(forKey: muteDictation) as? Bool) ?? defaultMuteDictation }
@@ -262,9 +298,13 @@ struct SettingsView: View {
     @AppStorage(SK.agentOutput) private var agentOutputRaw = SK.defaultAgentOutput
     @AppStorage(SK.defaultSystemPrompt) private var defaultSystemPromptID = ""
     @AppStorage(SK.defaultReminderPrompt) private var defaultReminderPromptID = ""
+    @AppStorage(SK.cacheTrigger) private var cacheTrigger = SK.defaultCacheTrigger
+    @AppStorage(SK.cacheTarget) private var cacheTarget = SK.defaultCacheTarget
+    @AppStorage(SK.recacheMode) private var recacheModeRaw = SK.defaultRecacheMode
+    @AppStorage(SK.hotkeyMode) private var hotkeyModeRaw = SK.defaultHotkeyMode
     @State private var speechLocales: [String] = []
     @State private var confirmReset = false
-    @StateObject private var rec = HotkeyRecorder()
+    @StateObject private var hkRec = BindingRecorder()      // voice hotkey: a real key + modifiers (self-contained)
     @StateObject private var shotRec = BindingRecorder()
     @StateObject private var copyRec = BindingRecorder()
 
@@ -272,7 +312,7 @@ struct SettingsView: View {
     private var transcription: Binding<Transcription> { Binding(get: { .from(transcriptionRaw) }, set: { transcriptionRaw = $0.rawValue }) }
     private var autoSend: Binding<AutoSend> { Binding(get: { AutoSend(rawValue: autoSendRaw) ?? .ifAlone }, set: { autoSendRaw = $0.rawValue }) }
     private var shotStyle: Binding<ShotStyle> { Binding(get: { .from(shotStyleRaw) }, set: { shotStyleRaw = $0.rawValue }) }
-    private var sym: String { hotkeySymbols(hotkey) }
+    private var sym: String { bindingSymbols(hotkey) }   // voice hotkey is now a full key+mods binding
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -311,6 +351,22 @@ struct SettingsView: View {
                         ForEach(ReminderMode.allCases, id: \.self) { m in
                             Text("\(m.label) — \(m.blurb)").tag(m)
                         }
+                    }.pickerStyle(.radioGroup).labelsHidden()
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GroupBox("Default conversation cache") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Bounds how much conversation+reminder sits in the KV cache. When it exceeds the trigger, oldest whole turns are dropped to the target. Defaults for NEW chats — change the current chat live in its ⋯ menu. (Set tiny, e.g. 600/300, to see it trim fast.)")
+                        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 12) {
+                        Stepper("Trim at \(cacheTrigger) tok", value: $cacheTrigger, in: 200...SK.cacheTriggerCap, step: 500)
+                        Stepper("down to \(cacheTarget) tok", value: $cacheTarget, in: 100...max(101, cacheTrigger - 1), step: 500)
+                    }.font(.caption)
+                    Label("Ongoing chats always drop instantly via re-rope (no recompute). This choice is only how a chat is rebuilt when REOPENED:", systemImage: "bolt.fill")
+                        .font(.caption2).foregroundStyle(.secondary).labelStyle(.titleAndIcon).fixedSize(horizontal: false, vertical: true)
+                    Picker("", selection: Binding(get: { RecacheMode(rawValue: recacheModeRaw) ?? .recent },
+                                                  set: { recacheModeRaw = $0.rawValue })) {
+                        ForEach(RecacheMode.allCases, id: \.self) { m in Text("\(m.label) — \(m.blurb)").tag(m) }
                     }.pickerStyle(.radioGroup).labelsHidden()
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -367,17 +423,17 @@ struct SettingsView: View {
                         Button("Cancel", role: .cancel) {}
                     } message: { Text("This resets the new-chat defaults, the dictation hotkey, and the capture shortcuts. It does NOT change your existing chats or saved prompts.") }
                 Spacer()
-                Button("Done") { rec.cancel(); shotRec.cancel(); copyRec.cancel(); dismiss() }.keyboardShortcut(.defaultAction)
+                Button("Done") { hkRec.cancel(); shotRec.cancel(); copyRec.cancel(); dismiss() }.keyboardShortcut(.defaultAction)
             }
         }
         .padding(20).frame(minWidth: 460, idealWidth: 480, minHeight: 420, idealHeight: 660)
         .onAppear {
-            rec.onFinish = { hotkey = $0 }
+            hkRec.allowMouse = false; hkRec.onFinish = { hotkey = $0 }   // voice hotkey = key+mods
             copyRec.allowMouse = false
             shotRec.onFinish = { shotBinding = $0 }
             copyRec.onFinish = { copyBinding = $0 }
         }
-        .onDisappear { rec.cancel(); shotRec.cancel(); copyRec.cancel() }
+        .onDisappear { hkRec.cancel(); shotRec.cancel(); copyRec.cancel() }
     }
 
     // ---- Capture: screenshot + copy-to-chat shortcuts (work in any mode while a chat is open) ----
@@ -413,22 +469,29 @@ struct SettingsView: View {
 
     // Dictation hotkey — GLOBAL (drives the one CGEventTap), so it's not a per-chat default.
     private var globalShortcutsBox: some View {
-        GroupBox("Dictation hotkey — all chats") {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 10) {
-                    Button {
-                        if rec.recording { rec.cancel() } else { rec.start() }
-                    } label: {
-                        Text(rec.recording ? "Recording… press your chord" : sym)
-                            .font(rec.recording ? .caption : .body.weight(.semibold))
-                            .frame(minWidth: 60).padding(.vertical, 4).padding(.horizontal, 10)
-                            .background(RoundedRectangle(cornerRadius: 6).fill(rec.recording ? Color.red.opacity(0.18) : Color.gray.opacity(0.14)))
-                    }.buttonStyle(.plain)
-                    if rec.recording, !rec.captured.isEmpty { Text(hotkeySymbols(hotkeyString(rec.captured))).font(.body.weight(.semibold)) }
-                    Spacer()
-                }
-                Text("A modifier chord (default ⌃⌥) — same in every chat. Press-to-toggle vs hold is the per-chat submode above.")
+        let mode = HotkeyMode(rawValue: hotkeyModeRaw) ?? .selfContained
+        return GroupBox("Global hotkeys — all chats") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("How Rally receives its dictation/capture keys. Neither mode installs a system-wide event tap, so neither steals keys from other apps or Karabiner.")
                     .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Picker("", selection: Binding(get: { mode }, set: { hotkeyModeRaw = $0.rawValue })) {
+                    ForEach(HotkeyMode.allCases, id: \.self) { m in Text("\(m.label) — \(m.blurb)").tag(m) }
+                }.pickerStyle(.radioGroup).labelsHidden()
+                if mode == .selfContained {
+                    HStack(spacing: 10) {
+                        Text("Dictation").font(.caption.bold()).foregroundStyle(.secondary)
+                        bindingButton(hkRec, current: hotkey, prompt: "press a real key + modifiers")
+                        Text("a real key + modifiers, e.g. ⌃⌥Space (no modifier-only chords)").font(.caption2).foregroundStyle(.secondary)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Map keys in Karabiner to these commands:").font(.caption2).foregroundStyle(.secondary)
+                        Text("rally toggle   ·   rally cancel   ·   rally shot   ·   rally copy")
+                            .font(.system(.caption2, design: .monospaced))
+                        Text("Hold-to-talk: `rally down` on key-down + `rally up` on key-up.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
             }.frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -448,10 +511,11 @@ struct SettingsView: View {
     // Reset the DEFAULTS store + the global hotkey/capture bindings to their factory values. Existing
     // chats (their own per-chat settings) and saved prompts are left untouched.
     private func resetAllSettings() {
-        rec.cancel(); shotRec.cancel(); copyRec.cancel()
+        hkRec.cancel(); shotRec.cancel(); copyRec.cancel()
         submodeRaw = SK.defaultSubmode
         transcriptionRaw = Transcription.after.rawValue
         hotkey = SK.defaultHotkey
+        hotkeyModeRaw = SK.defaultHotkeyMode
         shotBinding = SK.defaultShotBinding
         shotStyleRaw = SK.defaultShotStyle
         copyBinding = SK.defaultCopyBinding
@@ -463,6 +527,9 @@ struct SettingsView: View {
         agentOutputRaw = SK.defaultAgentOutput
         defaultSystemPromptID = ""
         defaultReminderPromptID = ""
+        cacheTrigger = SK.defaultCacheTrigger
+        cacheTarget = SK.defaultCacheTarget
+        recacheModeRaw = SK.defaultRecacheMode
     }
 
     private func bindingButton(_ r: BindingRecorder, current: String, prompt: String) -> some View {

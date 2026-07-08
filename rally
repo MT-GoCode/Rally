@@ -1,0 +1,28 @@
+#!/bin/bash
+# rally — drive Rally's dictation/capture with ZERO event tap. Map keys to this in Karabiner (or any
+# launcher). Rally installs no global key handling in "Karabiner" hotkey mode, so nothing is intercepted.
+#
+# Usage:
+#   rally toggle     # press-to-talk toggle (start, then again to stop)  [submode: toggle]
+#   rally down       # chord down  — start dictation                     [submode: hold: on key_down]
+#   rally up         # chord up    — stop dictation                      [submode: hold: on key_up]
+#   rally cancel     # discard the current dictation (like ESC)
+#   rally shot       # screenshot to chat
+#   rally copy       # copy selection to chat
+#
+# Karabiner (hold-to-talk) example — map fn to Rally dictation:
+#   "from": { "key_code": "fn" },
+#   "to":            [{ "shell_command": "/usr/local/bin/rally down" }],
+#   "to_after_key_up":[{ "shell_command": "/usr/local/bin/rally up" }]
+set -euo pipefail
+PORT="${RALLY_PORT:-5177}"
+case "${1:-}" in
+  toggle|down) kind=chord_down ;;
+  up)          kind=chord_up ;;
+  cancel|esc)  kind=cancel ;;
+  shot)        kind=shot ;;
+  copy)        kind=copy ;;
+  *) echo "usage: rally <toggle|down|up|cancel|shot|copy>" >&2; exit 1 ;;
+esac
+curl -s -m 2 -X POST "http://127.0.0.1:${PORT}/trigger" \
+     -H 'content-type: application/json' -d "{\"kind\":\"${kind}\"}" >/dev/null || true

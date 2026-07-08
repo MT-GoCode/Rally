@@ -1,5 +1,6 @@
 import AppKit
 import PDFKit
+import SwiftUI
 
 // Rasterize a PDF into the content-block stream: "Page 1" text + page image, "Page 2" + image, …
 // (same interleaved shape as CONTEXT/the Sipser seed, so the model can see + reference each page).
@@ -20,9 +21,48 @@ func pdfToBlocks(_ url: URL) -> [Block] {
 
 extension Block {
     // decode an image block's base64 to an NSImage for inline display (nil for text blocks).
+    // NOTE: synchronous — DO NOT call in a view body (it beachballs on multi-image contexts). Use
+    // AsyncBlockImage, which decodes off the main thread and caches. Kept for non-render callers.
     var nsImage: NSImage? {
         guard type == "image", let d = Data(base64Encoded: data ?? "") else { return nil }
         return NSImage(data: d)
+    }
+}
+
+// Cross-boundary box: NSImage isn't Sendable, but we only ever read it, so shipping a decoded one back
+// from a detached task is safe.
+struct SendableImage: @unchecked Sendable { let image: NSImage }
+
+// Decoded-image cache so a given block's base64 is turned into an NSImage AT MOST ONCE.
+enum ImageCache {
+    // NSCache is internally thread-safe; the compiler can't prove it, so opt out explicitly.
+    nonisolated(unsafe) private static let cache: NSCache<NSString, NSImage> = { let c = NSCache<NSString, NSImage>(); c.countLimit = 512; return c }()
+    static func get(_ key: String) -> NSImage? { cache.object(forKey: key as NSString) }
+    static func set(_ key: String, _ img: NSImage) { cache.setObject(img, forKey: key as NSString) }
+}
+
+// Renders an image block WITHOUT ever decoding base64→NSImage on the main thread. Shows a light
+// placeholder until the off-main decode finishes; caches the result so re-renders are instant.
+// This is THE fix for the multi-image-context beachball. Caller styles the Image via `content`.
+struct AsyncBlockImage<Content: View>: View {
+    let block: Block
+    @ViewBuilder let content: (Image) -> Content
+    @State private var img: NSImage?
+    var body: some View {
+        Group {
+            if let img { content(Image(nsImage: img)) }
+            else { RoundedRectangle(cornerRadius: 6).fill(.secondary.opacity(0.08)).overlay(ProgressView().controlSize(.small)) }
+        }
+        .task(id: block.id) {
+            let key = block.id.uuidString
+            if let c = ImageCache.get(key) { img = c; return }
+            let b64 = block.data ?? ""
+            let decoded = await Task.detached(priority: .userInitiated) { () -> SendableImage? in
+                guard let d = Data(base64Encoded: b64), let ns = NSImage(data: d) else { return nil }
+                return SendableImage(image: ns)
+            }.value
+            if let decoded { ImageCache.set(key, decoded.image); img = decoded.image }
+        }
     }
 }
 

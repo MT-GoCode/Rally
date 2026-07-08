@@ -84,7 +84,11 @@ PRECACHE = {"state": "idle"}               # post-response KV warm-up for the NE
 # chord state. Transcribe-after submode = Parakeet BATCH here. No Python streaming/prefill anymore.
 VLOCK = threading.Lock()
 VOICE = {"enabled": False, "submode": "toggle", "streaming": False, "key": "ctrl+alt",
-         "state": "idle", "partial": "", "final": None, "seq": 0, "perm": True}
+         "state": "idle", "partial": "", "final": None, "seq": 0, "perm": True,
+         # hotkeyMode: how the dictation/capture triggers arrive. "tap" = legacy global CGEventTap (intrusive,
+         # steals keys system-wide — avoid). "self"/"karabiner" = NO tap; triggers come via the /trigger HTTP
+         # endpoint (the Swift app's RegisterEventHotKey, or a Karabiner-invoked CLI). Default: no tap.
+         "hotkeyMode": "self"}
 # Intended listening state, driven by chord events and decoupled from VOICE["state"] (which lags because
 # start/stop are QUEUED and applied by the voice thread). Gating stop on the lagging state dropped the
 # stop on a fast press+release → stuck "listening". Touched only on the single tap-drain thread.
@@ -117,6 +121,22 @@ def _free_mem():
     footprint sits at the peak. clear_cache() returns them so Activity Monitor drops back to ~weights+KV."""
     try: (getattr(mx, "clear_cache", None) or getattr(getattr(mx, "metal", None), "clear_cache", lambda: None))()
     except Exception: pass
+
+
+def _mx_get(name):
+    return getattr(mx, name, None) or getattr(getattr(mx, "metal", None), name, None)
+
+def _mem_reset_peak():
+    f = _mx_get("reset_peak_memory")
+    if f:
+        try: f()
+        except Exception: pass
+
+def _mem():
+    """(active_gb, peak_gb) of MLX Metal allocations — captures GPU/KV memory that process RSS misses."""
+    a, p = _mx_get("get_active_memory"), _mx_get("get_peak_memory")
+    try: return (round((a() if a else 0) / 1e9, 2), round((p() if p else 0) / 1e9, 2))
+    except Exception: return (0.0, 0.0)
 
 
 def load_model():
@@ -189,6 +209,44 @@ def trim_kv(kv, n):
             c.values = c.values[:, :, :n, :]
             if hasattr(c, "offset"):
                 c.offset = n
+
+
+def _rerope_const(rope, x, delta):
+    """Apply a CONSTANT positional rotation `delta` to EVERY key in x [B,H,T,D]. mx.fast.rope needs a 4D
+    tensor and rotates axis -2, so reshape to seq=1 per key (validated exact vs a fresh rope, err ~1e-5)."""
+    B, H, T, D = x.shape
+    return rope(x.reshape(B, H * T, 1, D), offset=int(delta)).reshape(B, H, T, D)
+
+
+def rerope_drop(kv, pin_len, drop):
+    """STREAMING eviction: drop the oldest `drop` conversation tokens from the FULL-ATTENTION layers
+    while KEEPING the retained tail's smear — slice out [pin_len : pin_len+drop] and delta-re-rope the
+    tail DOWN by `drop` so its RoPE positions stay contiguous right after the pin. Values aren't roped.
+    The sliding (RotatingKVCache) layers self-bound at 1024 and are left untouched. Near-instant: a
+    slice + one constant rotation per full layer, no forward pass. RoPE composes, so this is EXACT
+    (unlike a bare slice, which would leave the tail at wrong absolute positions)."""
+    if drop <= 0:
+        return
+    lm = model.language_model.model
+    touched = []
+    for i, c in enumerate(kv):
+        layer = lm.layers[i]
+        if getattr(layer, "layer_type", None) != "full_attention":
+            continue                                   # sliding layers self-manage; skip
+        if getattr(c, "keys", None) is None:
+            continue
+        off = c.offset
+        if off <= pin_len + drop:                      # not enough conversation past the pin to drop
+            continue
+        rope = layer.self_attn.rope
+        k = c.keys[:, :, :off, :]; v = c.values[:, :, :off, :]
+        tail_k = _rerope_const(rope, k[:, :, pin_len + drop:, :], -drop)
+        c.keys = mx.concatenate([k[:, :, :pin_len, :], tail_k], axis=2)
+        c.values = mx.concatenate([v[:, :, :pin_len, :], v[:, :, pin_len + drop:, :]], axis=2)
+        c.offset = off - drop
+        touched.append(c)
+    if touched:
+        mx.eval([c.keys for c in touched] + [c.values for c in touched])
 
 
 # ---- batched image encoding: cap the pin-time memory peak ----
@@ -326,6 +384,8 @@ def gemma_worker():
                 _do_prefill(job)
             elif job.kind == "precache":
                 _do_precache(job)
+            elif job.kind == "reconcile":
+                _do_reconcile(job)
         except Exception as e:
             import traceback
             log("worker ERR", traceback.format_exc())
@@ -375,7 +435,7 @@ def _do_pin(job):
         kv, pin_len = make_prompt_cache(model), 0
     _drop_pin()
     st.update(kv=kv, pin_len=pin_len, ctx_content=ctx_content, ctx_paths=paths,
-              tmpdir=tmpdir, system=d.get("system"))
+              tmpdir=tmpdir, system=d.get("system"), conv_start=0, stream_start=0)   # fresh pin → window restarts at turn 0
     PF["ids"] = None
     _free_mem()                # release the pin's transient buffers so the process drops to ~weights+KV
     job.result = {"ok": True, "overLimit": False, "tokens": pin_len}
@@ -442,6 +502,82 @@ def _lcp(a, b):
     while i < n and a[i] == b[i]:
         i += 1
     return i
+
+
+# ---- bounded conversation window (sliding, with hysteresis) ------------------------------------
+def _reminder_tok_len(reminder):
+    """Token length of the reminder text — it counts toward the conversation budget."""
+    tok = getattr(processor, "tokenizer", processor)
+    if reminder is None:      txt = REMINDER
+    elif isinstance(reminder, str): txt = reminder
+    else: txt = "".join(b.get("text", "") for b in (reminder or []) if isinstance(b, dict) and b.get("type") == "text")
+    try: return len(tok.encode(txt)) if txt else 0
+    except Exception: return 0
+
+
+def _turn_lens(messages):
+    """Approx per-message conversation token length (text only) for windowing — cheap, no forward pass.
+    +5 per message is a rough <start_of_turn>role … <end_of_turn> marker overhead."""
+    tok = getattr(processor, "tokenizer", processor)
+    out = []
+    for m in messages:
+        txt = "".join(b.get("text", "") for b in (m.get("content") or []) if b.get("type") == "text")
+        try: n = len(tok.encode(txt)) if txt else 0
+        except Exception: n = 0
+        out.append(n + 5)
+    return out
+
+
+def _window_start(messages, reminder, mode, cur, trigger, target):
+    """Hysteresis sliding window over conversation TURNS. Keep `cur` unless the windowed conversation
+    exceeds `trigger` (X) tokens; then advance `cur` to the earliest user-turn start whose remaining
+    conversation ≤ `target` (Y). Monotonic within a session (never rewinds). trigger<=0 disables it
+    (returns 0 → whole conversation, today's behaviour)."""
+    n = len(messages)
+    cur = max(0, min(cur or 0, n))
+    if trigger <= 0 or n == 0:
+        return 0
+    lens = _turn_lens(messages)
+    rem_n = _reminder_tok_len(reminder)
+    def clen(s): return sum(lens[s:]) + rem_n
+    if clen(cur) <= trigger:
+        return cur                                  # still inside the deadband → don't trim
+    for s in range(cur, n):                         # over X → drop oldest whole turns down to ≤ Y
+        if messages[s].get("role") == "user" and clen(s) <= target:
+            return s
+    # couldn't get under Y (one giant turn) → keep just the last user turn
+    starts = [i for i in range(cur, n) if messages[i].get("role") == "user"]
+    return starts[-1] if starts else cur
+
+
+def _live_drop(messages, conv_start):
+    """LIVE drop (BOTH resume modes — this is what an ONGOING chat always does): when the window slides,
+    physically evict the dropped turns from the cache via delta-re-rope. Near-instant (a constant rotation
+    on the full-attention keys), NO forward pass, and it keeps the smear — so ongoing chats never recompute
+    the cache. SAFE FALLBACK: if the dropped-turn tokens aren't an exact prefix of PF (e.g. reminder placed
+    'start', or drift), do nothing → the windowed feed re-prefills instead (correct, just no smear).
+    The RECENT-vs-STREAMING choice is a RESUME concern (/reconcile), not a live one. Fires once per drop."""
+    if not st.get("kv") or conv_start <= 0:
+        return
+    old = st.get("stream_start", 0)
+    if conv_start <= old:
+        st["stream_start"] = conv_start
+        return
+    pf = PF["ids"] or []
+    tmpdir = tempfile.mkdtemp(prefix="civm-sd-")
+    try:
+        dropped = _render_ids(_mlx_messages(messages[old:conv_start], tmpdir, []), [], add_gen=False)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    D = len(dropped)
+    if 0 < D < len(pf) and pf[:D] == dropped:          # exact prefix → safe to re-rope-drop
+        with MLX_LOCK:
+            rerope_drop(st["kv"], st["pin_len"], D)
+        PF["ids"] = pf[D:]
+        log(f"stream rerope-drop: {D} tok (turns {old}→{conv_start}), conv now {len(pf) - D} tok")
+    else:
+        log(f"stream drop fallback→reprefill (no prefix align; D={D}, pf={len(pf)})")
+    st["stream_start"] = conv_start
 
 
 _EOT = {"id": "unset"}
@@ -536,21 +672,104 @@ def _do_precache(job):
         PRECACHE["state"] = "idle"; return
     PRECACHE["state"] = "working"
     try:
-        target, pv = _precache_target(job.params["messages"], job.params["reminder"], job.params["mode"])
+        messages = job.params["messages"]; reminder = job.params["reminder"]; mode = job.params["mode"]
+        trigger = int(job.params.get("trigger") or 0); target = int(job.params.get("target") or 0)
+        recache = job.params.get("recache") or "recent"
+        conv_start = _window_start(messages, reminder, mode, st.get("conv_start", 0), trigger, target)
+        st["conv_start"] = conv_start
+        _live_drop(messages, conv_start)                 # ongoing chat: always re-rope-drop the front (no recompute)
+        tgt_ids, pv = _precache_target(messages[conv_start:], reminder, mode)
         pin_len = st["pin_len"]
-        lcp = _lcp(PF["ids"] or [], target)
+        lcp = _lcp(PF["ids"] or [], tgt_ids)
         if pv is not None:
             # pv must match the image placeholders in the fed tokens: with per-turn images their
             # placeholders sit in the reused prefix, so re-feed the whole target past the pin.
             lcp = 0
-        if lcp < len(target):
+        if lcp < len(tgt_ids):
             trim_kv(st["kv"], pin_len + lcp)
-            feed = mx.array([target[lcp:]])
+            feed = mx.array([tgt_ids[lcp:]])
             with MLX_LOCK:
                 for _ in stream_generate(model, processor, "", input_ids=feed, pixel_values=pv,
                                          prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
                     pass
-        PF["ids"] = target                     # next /chat's LCP reuses everything up to the question
+        PF["ids"] = tgt_ids                     # next /chat's LCP reuses everything up to the question
+    finally:
+        PRECACHE["state"] = "done"
+        _free_mem()
+
+
+def _stream_replay(messages, reminder, mode, trigger, target):
+    """STREAMING cold-resume: replay the whole conversation onto the pin (clean history, turn by turn),
+    re-rope-dropping the oldest turns to `target` whenever the physical conversation exceeds `trigger`.
+    The final window carries the SMEAR of dropped turns, AND the KV never exceeds ~trigger+one-turn (each
+    turn is fed then possibly dropped — bounded, chunked, no spike). Sets PF['ids'] to the retained tail;
+    returns the retained window's first message index (conv_start)."""
+    pin_len = st["pin_len"]
+    with MLX_LOCK:
+        trim_kv(st["kv"], pin_len)
+    PF["ids"] = []; st["stream_start"] = 0
+    starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    if not starts:
+        return 0
+    starts.append(len(messages))
+    seg_lens, fed, win = [], [], 0                 # per-turn fed length, live tokens past pin, oldest-retained turn
+    tmproot = tempfile.mkdtemp(prefix="civm-rp-")
+    try:
+        for b in range(len(starts) - 1):
+            paths = []
+            seg_ids = _render_ids(_mlx_messages(messages[starts[b]:starts[b + 1]], tmproot, paths), paths, add_gen=False)
+            pv = _per_turn_pixels(paths)
+            with MLX_LOCK:
+                for _ in stream_generate(model, processor, "", input_ids=mx.array([seg_ids]),
+                                         pixel_values=pv, prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
+                    pass
+            fed += seg_ids; seg_lens.append(len(seg_ids))
+            if len(fed) > trigger:                 # hysteresis: over X → drop oldest whole turns to ≤ Y
+                while len(fed) > target and win < b:
+                    D = seg_lens[win]
+                    with MLX_LOCK:
+                        rerope_drop(st["kv"], pin_len, D)
+                    fed = fed[D:]; win += 1
+        PF["ids"] = fed
+        return starts[win]
+    finally:
+        shutil.rmtree(tmproot, ignore_errors=True)
+        _free_mem()
+
+
+def _do_reconcile(job):
+    """Rebuild the conversation cache so it is CORRECT for the current settings — called on chat OPEN and
+    after a content/setting change, so the next message lands on a correct cache. recent → prefill the
+    window; streaming → replay with smear. The pin ([system+ctx]) is assumed current (/pin runs first)."""
+    if not st.get("kv"):
+        PRECACHE["state"] = "idle"; job.result = {}; return
+    PRECACHE["state"] = "working"
+    _mem_reset_peak()
+    try:
+        messages = job.params["messages"]; reminder = job.params["reminder"]; mode = job.params["mode"]
+        trigger = int(job.params.get("trigger") or 0); target = int(job.params.get("target") or 0)
+        recache = job.params.get("recache") or "recent"
+        pin_len = st["pin_len"]
+        if recache == "streaming" and trigger > 0 and messages:
+            conv_start = _stream_replay(messages, reminder, mode, trigger, target)   # rebuild the smear
+        else:
+            with MLX_LOCK:
+                trim_kv(st["kv"], pin_len)
+            PF["ids"] = []; st["stream_start"] = 0
+            conv_start = _window_start(messages, reminder, mode, 0, trigger, target)
+        st["conv_start"] = conv_start; st["stream_start"] = conv_start
+        # warm the precache target for the NEXT message on top of the rebuilt window (reminder-aware)
+        tgt_ids, pv = _precache_target(messages[conv_start:], reminder, mode) if messages else ([], None)
+        lcp = _lcp(PF["ids"] or [], tgt_ids)
+        if pv is not None: lcp = 0
+        if lcp < len(tgt_ids):
+            with MLX_LOCK:
+                trim_kv(st["kv"], pin_len + lcp)
+                for _ in stream_generate(model, processor, "", input_ids=mx.array([tgt_ids[lcp:]]),
+                                         pixel_values=pv, prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
+                    pass
+        PF["ids"] = tgt_ids
+        job.result = {"conv_start": conv_start, "conv_tokens": len(tgt_ids), "mem_peak_gb": _mem()[1]}
     finally:
         PRECACHE["state"] = "done"
         _free_mem()
@@ -563,7 +782,16 @@ def _do_generate(job):
     messages = job.params["messages"]
     reminder = job.params["reminder"]
     mode = job.params.get("mode") or "last"
-    conv_ids, per_pv, per_turn_paths, tmpdir = _conv_ids(messages, reminder, mode)
+    trigger = int(job.params.get("trigger") or 0)   # X: trim when conv+reminder cache exceeds this
+    target = int(job.params.get("target") or 0)     # Y: …down to this (hysteresis). 0 disables both.
+    # Bounded sliding window: drop oldest whole turns so only messages[conv_start:] sit past the pin.
+    recache = job.params.get("recache") or "recent"
+    _mem_reset_peak()                                # so mem_peak in the meta is THIS turn's peak (spike check)
+    conv_start = _window_start(messages, reminder, mode, st.get("conv_start", 0), trigger, target)
+    st["conv_start"] = conv_start
+    _live_drop(messages, conv_start)                 # ongoing chat: always re-rope-drop the front (no recompute)
+    win = messages[conv_start:]
+    conv_ids, per_pv, per_turn_paths, tmpdir = _conv_ids(win, reminder, mode)
     try:
         pin_len = st["pin_len"]              # frozen physical length of the pinned [system+ctx+ACK] KV
         # Cross-turn reuse on the CONVERSATION tokens only (pure text past the pin → deterministic).
@@ -647,7 +875,9 @@ def _do_generate(job):
             meta = {"done": True, "ttft": round(ttft or 0, 3), "gen_s": round(time.time() - start, 2),
                     "new_tokens": new_tokens, "chat_tokens": int(chat_tokens), "pinned": pin_len,
                     "reused": int(reused), "gen_tps": round(getattr(last, "generation_tps", 0) or 0, 1),
-                    "anew_parts": anew_parts, "mode": mode}
+                    "anew_parts": anew_parts, "mode": mode,
+                    "conv_start": conv_start, "conv_tokens": len(conv_ids),   # sliding-window boundary + size
+                    "mem_active_gb": _mem()[0], "mem_peak_gb": _mem()[1]}      # MLX Metal mem (spike check)
             job.q.put(("done", meta))
             # PRECACHE: warm the KV for the next message NOW (idle time). Reconstruct the clean answer
             # exactly as the app stores it (text before @@APPENDIX@@, trimmed) so next turn's history matches.
@@ -655,7 +885,8 @@ def _do_generate(job):
             if ans:
                 msgs2 = messages + [{"role": "assistant", "content": [{"type": "text", "text": ans}]}]
                 PRECACHE["state"] = "working"    # flip immediately (the job may sit behind others briefly)
-                GEMMA_Q.put(Job("precache", messages=msgs2, reminder=reminder, mode=mode))
+                GEMMA_Q.put(Job("precache", messages=msgs2, reminder=reminder, mode=mode,
+                                trigger=trigger, target=target, recache=recache))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
         _free_mem()
@@ -875,7 +1106,9 @@ class H(BaseHTTPRequestHandler):
                 self.end_headers()
                 PRECACHE["state"] = "idle"     # a new turn begins; clear the previous "done" flag
                 job = Job("generate", messages=messages, reminder=body.get("reminder"),
-                          mode=body.get("reminderMode") or "last")
+                          mode=body.get("reminderMode") or "last",
+                          trigger=body.get("trimTrigger"), target=body.get("trimTarget"),
+                          recache=body.get("recacheMode"))
                 GEMMA_Q.put(job)
                 while True:
                     kind, payload = job.q.get()
@@ -910,6 +1143,7 @@ class H(BaseHTTPRequestHandler):
                     VOICE["submode"] = d.get("submode", VOICE["submode"])
                     VOICE["streaming"] = bool(d.get("streaming", VOICE["streaming"]))
                     VOICE["key"] = d.get("key", VOICE["key"])
+                    VOICE["hotkeyMode"] = d.get("hotkeyMode", VOICE["hotkeyMode"])   # tap|self|karabiner
                     if not VOICE["enabled"]:
                         VOICE_WANT["on"] = False    # voice turned off → clear intent so re-enable starts clean
                         VOICE["state"] = "idle"; VOICE["partial"] = ""; VOICE["final"] = None
@@ -922,6 +1156,20 @@ class H(BaseHTTPRequestHandler):
                     CAPTURE["shot_parsed"] = V.parse_binding(CAPTURE["shot_binding"])
                     CAPTURE["copy_parsed"] = V.parse_binding(CAPTURE["copy_binding"])
                 return self._json(200, {"ok": True, "perm": VOICE["perm"]})
+
+            if self.path == "/trigger":
+                # External hotkey trigger — the Swift app's RegisterEventHotKey OR a Karabiner-invoked CLI
+                # (no CGEventTap). Pushes the SAME events the tap used onto TAP_Q, so the voice/capture
+                # state machines are unchanged. kind: chord_down|chord_up|cancel|shot|copy.
+                d = self._body()
+                kind = d.get("kind", "")
+                if kind == "chord_down": TAP_Q.put("chord_down")
+                elif kind == "chord_up": TAP_Q.put("chord_up")
+                elif kind == "cancel":   TAP_Q.put("esc")
+                elif kind == "shot":     TAP_Q.put(("shot_down", float(d.get("x", 0)), float(d.get("y", 0))))
+                elif kind == "shot_up":  TAP_Q.put(("shot_up", float(d.get("x", 0)), float(d.get("y", 0))))
+                elif kind == "copy":     TAP_Q.put(("copy",))
+                return self._json(200, {"ok": True})
 
             if self.path == "/voice/prefill":
                 # Apple partial → prefill Gemma's KV while the user talks. {messages, partial} →
@@ -942,9 +1190,25 @@ class H(BaseHTTPRequestHandler):
                     return self._json(200, {"ok": True})
                 PRECACHE["state"] = "working"
                 job = Job("precache", messages=d.get("messages") or [], reminder=d.get("reminder"),
-                          mode=d.get("reminderMode") or "last")
+                          mode=d.get("reminderMode") or "last",
+                          trigger=d.get("trimTrigger"), target=d.get("trimTarget"),
+                          recache=d.get("recacheMode"))
                 GEMMA_Q.put(job); job.done.wait()
                 return self._json(200, {"ok": True})
+
+            if self.path == "/reconcile":
+                # Rebuild the conversation cache so it's CORRECT for the current settings (chat open, or
+                # a content/setting change). recent → prefill the window; streaming → replay with smear.
+                d = self._body()
+                if not st.get("kv"):
+                    return self._json(200, {"ok": True, "conv_start": 0, "conv_tokens": 0})
+                PRECACHE["state"] = "working"
+                job = Job("reconcile", messages=d.get("messages") or [], reminder=d.get("reminder"),
+                          mode=d.get("reminderMode") or "last",
+                          trigger=d.get("trimTrigger"), target=d.get("trimTarget"),
+                          recache=d.get("recacheMode"))
+                GEMMA_Q.put(job); job.done.wait()
+                return self._json(200, {"ok": True, **(job.result or {})})
 
             if self.path == "/voice/ack":
                 d = self._body()
@@ -1069,8 +1333,9 @@ def _drain_tap_and_overlay(overlay, sel, tap, flash):
             except Exception: pass
             SHOT["shown"] = False
 
-    # lazy tap lifecycle: create when EITHER voice or capture is enabled (perms belong to the app)
-    want_tap = VOICE["enabled"] or CAPTURE["enabled"]
+    # lazy tap lifecycle: the global CGEventTap is created ONLY in legacy "tap" mode. In "self" /
+    # "karabiner" mode we install NO tap (zero interference) — triggers arrive via /trigger instead.
+    want_tap = (VOICE.get("hotkeyMode", "self") == "tap") and (VOICE["enabled"] or CAPTURE["enabled"])
     if want_tap and not tap["obj"]:
         t = V.Tap(TAP_Q, _should_consume_esc, cfg=_tap_cfg, log=log, prompt_perms=False)
         ok = t.create()

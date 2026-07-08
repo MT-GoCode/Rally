@@ -1,0 +1,62 @@
+{
+  "title": "Rally — dictation & capture",
+  "rules": [
+    {
+      "description": "Rally: hold Control+Shift to dictate (hold-to-talk)",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "simultaneous": [
+              { "key_code": "left_control" },
+              { "key_code": "left_shift" }
+            ],
+            "simultaneous_options": {
+              "key_down_order": "insensitive",
+              "key_up_order": "insensitive",
+              "detect_key_down_uninterruptedly": true
+            }
+          },
+          "to": [{ "shell_command": "/Users/minh/code/contextualized_instant_voice_models/rally down" }],
+          "to_after_key_up": [{ "shell_command": "/Users/minh/code/contextualized_instant_voice_models/rally up" }]
+        }
+      ]
+    },
+    {
+      "description": "Rally: Control+Shift TOGGLE dictation (alternative to hold — enable ONE of the two)",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "simultaneous": [
+              { "key_code": "left_control" },
+              { "key_code": "left_shift" }
+            ],
+            "simultaneous_options": { "key_down_order": "insensitive" }
+          },
+          "to": [{ "shell_command": "/Users/minh/code/contextualized_instant_voice_models/rally toggle" }]
+        }
+      ]
+    },
+    {
+      "description": "Rally: Option+Shift+S screenshot to chat",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": { "key_code": "s", "modifiers": { "mandatory": ["option", "shift"] } },
+          "to": [{ "shell_command": "/Users/minh/code/contextualized_instant_voice_models/rally shot" }]
+        }
+      ]
+    },
+    {
+      "description": "Rally: Option+Shift+C copy selection to chat",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": { "key_code": "c", "modifiers": { "mandatory": ["option", "shift"] } },
+          "to": [{ "shell_command": "/Users/minh/code/contextualized_instant_voice_models/rally copy" }]
+        }
+      ]
+    }
+  ]
+}

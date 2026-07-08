@@ -107,6 +107,16 @@ enum VoiceState: Equatable {
     // composition of the anew tokens, IN forward-pass order, summing to lastNew (engine-computed).
     @Published private(set) var anewParts: [(label: String, n: Int)] = []
     @Published private(set) var precache = ""     // "" hidden · "working" caching next msg · "done"
+    @Published var convStart: Int? = nil          // oldest in-window message index (out-of-context boundary); nil = unknown
+    @Published var convTokens: Int? = nil         // current conversation+reminder tokens in the cache (live usage vs budget)
+    @Published var visibleCount = 30              // how many trailing messages the view renders (perf window; NOT the KV window)
+    func loadEarlier() { visibleCount += 30 }
+    // Cache budget + resume mode are GLOBAL (read live from settings), NOT a per-chat snapshot — so
+    // changing them in Settings or the ⋯ menu applies to EVERY open chat immediately (recompute on
+    // change and on chat visit). This is why an old chat now trims to the current budget on open.
+    var trimTrigger: Int { SK.cacheTriggerValue }
+    var trimTarget: Int  { SK.cacheTargetValue }
+    var recacheMode: String { RecacheMode.current.rawValue }
     private var prevHadOutput = false             // did the turn we just cancelled produce any text?
     // AskPipeline (mode-agnostic): one in-flight turn; interrupts cancel it and stack a new one.
     private var askTask: Task<Void, Never>? = nil
@@ -342,14 +352,18 @@ enum VoiceState: Equatable {
         await modeSwitchTask?.value       // if a reminder-mode switch is still re-warming the cache, wait
         modeSwitchTask = nil
         precache = ""                     // hide the chip now that the switch re-cache (if any) is done
-        if !pinned { await pinNow() }           // pin on demand (caching first isn't required)
+        if !cachedCurrent { await pinNow() }    // re-pin if unpinned OR the system/context changed (wait-until-correct)
         do {
+            let s = store.chat.settings
             let meta = try await engine.chat(messages: buildEngineMessages(), reminder: store.chat.reminder,
-                                              reminderMode: store.chat.settings.reminderMode) { self.streaming += $0 }
+                                              reminderMode: s.reminderMode, trimTrigger: trimTrigger,
+                                              trimTarget: trimTarget, recacheMode: recacheMode) { self.streaming += $0 }
             if Task.isCancelled {               // interrupted right as the stream ended
                 stashInterrupted(); return
             }
             store.chat.messages.append(Msg(role: "assistant", text: streaming))
+            if let cs = meta["conv_start"] as? Int { convStart = cs }   // sliding-window boundary (out-of-context line)
+            if let cvt = meta["conv_tokens"] as? Int { convTokens = cvt } // live conversation-cache usage vs budget
             if let ct = meta["chat_tokens"] as? Int { store.chat.chatTokens = ct }
             if let pt = meta["pinned"] as? Int, pt > 0 { store.chat.pinnedTokens = pt }
             lastReused = meta["reused"] as? Int ?? 0
@@ -457,6 +471,8 @@ enum VoiceState: Equatable {
         voiceSeq = -1; livePartial = ""
         if dictating { endDictation() }                   // don't carry a locked field / muted audio across chats
         selectedMessageID = nil; sourceShownIDs = []      // nav highlight + source toggles are per-chat
+        convStart = nil; convTokens = nil                 // boundary + usage unknown until this chat's cache reports
+        visibleCount = 30                                  // reset the view render-window (perf) for the new chat
     }
 
     // Single chat-activation path (fix A). Fires once per open / new / seed, AFTER store.chat settled.
@@ -467,8 +483,38 @@ enum VoiceState: Equatable {
             resetForChatSwitch()
             pinOutcome = .none                       // chat B must not show chat A's "cache failed: …" (fix 5)
         }
-        if kind == .opened { cache() }              // opening evicts the old KV, re-pins this chat
-        postVoiceConfig()                           // the new chat may have different voice settings → re-arm the tap
+        if kind == .opened {                        // opening evicts the old KV → re-pin, THEN rebuild the
+            Task { [weak self] in                   // conversation cache (recent window / streaming replay)
+                await self?.pinNow()                // so the boundary + smear are correct before the 1st message
+                self?.reconcileCache()
+            }
+        }
+        postVoiceConfig()                           // the new chat may have different voice settings → re-arm hotkeys
+    }
+
+    // Rebuild the conversation cache so it's correct for THIS chat's settings (called on open; the engine
+    // does recent-window prefill or streaming replay). Tracked in modeSwitchTask so the next send() waits
+    // on it. Drives the "conversation cache" spinner and the out-of-context boundary (convStart).
+    func reconcileCache() {
+        guard engine.ready, store.screen == .chat, !store.chat.messages.isEmpty else { convStart = nil; return }
+        precache = "working"
+        let msgs = buildEngineMessages(), rem = store.chat.reminder, s = store.chat.settings
+        let trig = trimTrigger, tgt = trimTarget, mode = recacheMode
+        let t = Task { [weak self] in
+            let r = await self?.engine.reconcile(messages: msgs, reminder: rem, reminderMode: s.reminderMode,
+                                                 trimTrigger: trig, trimTarget: tgt,
+                                                 recacheMode: mode)
+            if let self, let r { self.convStart = r.convStart; self.convTokens = r.convTokens }  // divider + gauge on open
+            return ()
+        }
+        modeSwitchTask = t
+        Task { [weak self] in
+            await t.value
+            guard let self else { return }
+            if self.precache == "working" { self.precache = "done" }
+            try? await Task.sleep(for: .seconds(1.4))
+            if self.precache == "done" { self.precache = "" }
+        }
     }
 
     // ---- per-chat setting writes: mutate store.chat.settings, save, and fire the right side effect ----
@@ -480,6 +526,11 @@ enum VoiceState: Equatable {
     func setMuteDictation(_ on: Bool)   { store.chat.settings.muteDictation = on;   saveSettings() }
     func setAgentOutput(_ o: AgentOutput) { store.chat.settings.agentOutput = o.rawValue; saveSettings() }
     func setSpeechLocale(_ id: String)  { store.chat.settings.speechLocale = id;    saveSettings() }
+    // Cache budget / resume strategy — per-chat, applied to the LIVE cache immediately (reconcile rebuilds).
+    // GLOBAL budget/mode (UserDefaults) — applies to every chat; reconcile the open chat so it applies now.
+    func setCacheTrigger(_ v: Int)      { UserDefaults.standard.set(v, forKey: SK.cacheTrigger); reconcileCache() }
+    func setCacheTarget(_ v: Int)       { UserDefaults.standard.set(v, forKey: SK.cacheTarget);  reconcileCache() }
+    func setRecacheMode(_ m: RecacheMode) { UserDefaults.standard.set(m.rawValue, forKey: SK.recacheMode) }  // resume-only → no live rebuild
 
     private func postVoiceConfig() {
         // voice chord arms when THIS chat's voice input is on; capture bindings are active whenever a
@@ -493,7 +544,29 @@ enum VoiceState: Equatable {
             submode: s.submode,
             streaming: s.transcriptionV == .stream,
             key: hotkey,
-            shotBinding: shotBinding, shotStyle: shotStyleRaw, copyBinding: copyBinding) }
+            shotBinding: shotBinding, shotStyle: shotStyleRaw, copyBinding: copyBinding,
+            hotkeyMode: HotkeyMode.current.rawValue) }
+        refreshHotkeys()                            // (re)register the OS hotkeys for self-contained mode
+    }
+
+    // Self-contained mode: register OS-level hotkeys (RegisterEventHotKey) that poke the engine's
+    // /trigger — no event tap, zero interference. Karabiner mode registers nothing (the CLI drives it).
+    private let hotkeys = HotkeyManager()
+    func refreshHotkeys() {
+        hotkeys.clear()
+        guard HotkeyMode.current == .selfContained, store.screen == .chat else { return }
+        let s = store.chat.settings
+        if s.voiceInput, let c = HotkeyManager.parse(hotkey) ?? HotkeyManager.parse(SK.defaultHotkey) {
+            hotkeys.register(c,
+                onPress:   { [weak self] in Task { await self?.engine.trigger("chord_down") } },
+                onRelease: { [weak self] in Task { await self?.engine.trigger("chord_up") } })
+        }
+        if let c = HotkeyManager.parse(shotBinding) {
+            hotkeys.register(c, onPress: { [weak self] in Task { await self?.engine.trigger("shot") } })
+        }
+        if let c = HotkeyManager.parse(copyBinding) {
+            hotkeys.register(c, onPress: { [weak self] in Task { await self?.engine.trigger("copy") } })
+        }
     }
 
     // Refresh the GLOBAL stored copies (hotkey + capture bindings) on a defaults change; re-post config
@@ -501,10 +574,12 @@ enum VoiceState: Equatable {
     // (they're written directly via the setters above) — and changing a DEFAULT never touches the open chat.
     private func settingsChanged() {
         let hk = SK.hotkeyValue, sb = SK.shotBindingValue, ss = SK.shotStyleValue, cb = SK.copyBindingValue
-        let configDirty = hk != hotkey || sb != shotBinding || ss != shotStyleRaw || cb != copyBinding
-        hotkey = hk; shotBinding = sb; shotStyleRaw = ss; copyBinding = cb
-        if configDirty { postVoiceConfig() }
+        let hm = HotkeyMode.current.rawValue
+        let configDirty = hk != hotkey || sb != shotBinding || ss != shotStyleRaw || cb != copyBinding || hm != hotkeyModeCopy
+        hotkey = hk; shotBinding = sb; shotStyleRaw = ss; copyBinding = cb; hotkeyModeCopy = hm
+        if configDirty { postVoiceConfig() }   // re-posts hotkeyMode + re-registers the OS hotkeys
     }
+    private var hotkeyModeCopy = HotkeyMode.current.rawValue
 
     // While Apple streams, prefill Gemma's KV from the growing partial (debounced) so the final ask
     // is near-instant. Reports the live token count fed past the pin. Runs until appleRunning clears.
@@ -539,9 +614,11 @@ enum VoiceState: Equatable {
     func rewarmCache() {
         guard engine.ready, !store.chat.messages.isEmpty else { precache = ""; return }
         precache = "working"
-        let msgs = buildEngineMessages(), rem = store.chat.reminder, mode = store.chat.settings.reminderMode
+        let msgs = buildEngineMessages(), rem = store.chat.reminder, s = store.chat.settings
+        let trig = trimTrigger, tgt = trimTarget, mode = recacheMode
         let t = Task { [weak self] in
-            await self?.engine.precache(messages: msgs, reminder: rem, reminderMode: mode)
+            await self?.engine.precache(messages: msgs, reminder: rem, reminderMode: s.reminderMode,
+                                        trimTrigger: trig, trimTarget: tgt, recacheMode: mode)
             return ()
         }
         modeSwitchTask = t
