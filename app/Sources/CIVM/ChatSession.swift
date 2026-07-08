@@ -531,10 +531,18 @@ enum VoiceState: Equatable {
             resetForChatSwitch()
             pinOutcome = .none                       // chat B must not show chat A's "cache failed: …" (fix 5)
         }
-        if kind == .opened {                        // opening evicts the old KV → re-pin, THEN rebuild the
-            Task { [weak self] in                   // conversation cache (recent window / streaming replay)
-                await self?.pinNow()                // so the boundary + smear are correct before the 1st message
-                self?.reconcileCache()
+        if kind == .opened {
+            // Only rebuild if the engine does NOT already hold this chat intact. cachedCurrent means the
+            // engine is still pinned to THIS chat.id with the same content hash — i.e. no OTHER chat was
+            // opened to evict its KV since we left. In that case the pin AND the conversation cache are
+            // still correct (exiting to home clears nothing, and settings/reminder edits reconcile at
+            // edit-time), so re-pinning (re-encoding the context images) + replaying is pure waste. Only a
+            // genuine eviction (a different chat was opened) or a stale pin needs the rebuild.
+            if !cachedCurrent {
+                Task { [weak self] in
+                    await self?.pinNow()            // re-pin system+context (evicted by another chat, or changed)
+                    self?.reconcileCache()          // rebuild the conversation window (boundary + smear)
+                }
             }
         }
         resetRenderWindow()                         // open shows a small window; "Load earlier" widens on demand
