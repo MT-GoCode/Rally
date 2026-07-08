@@ -709,7 +709,7 @@ def _do_prefill(job):
         per_pv = _per_turn_pixels(per_turn_paths)
         with MLX_LOCK:
             for _ in stream_generate(model, processor, "", input_ids=feed, pixel_values=per_pv,
-                                     prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
+                                     prompt_cache=st["kv"], max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP):
                 pass
         PF["ids"] = open_list
         job.result = {"fed": len(open_list)}
@@ -766,7 +766,7 @@ def _do_precache(job):
             feed = mx.array([tgt_ids[lcp:]])
             with MLX_LOCK:
                 for _ in stream_generate(model, processor, "", input_ids=feed, pixel_values=pv,
-                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
+                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP):
                     pass
         PF["ids"] = tgt_ids                     # next /chat's LCP reuses everything up to the question
     finally:
@@ -798,7 +798,7 @@ def _stream_replay(messages, reminder, mode, trigger, target):
             pv = _per_turn_pixels(paths)
             with MLX_LOCK:
                 for _ in stream_generate(model, processor, "", input_ids=mx.array([seg_ids]),
-                                         pixel_values=pv, prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
+                                         pixel_values=pv, prompt_cache=st["kv"], max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP):
                     pass
             fed += seg_ids; seg_lens.append(len(seg_ids))
             if len(fed) > trigger:                 # hysteresis: over X → drop oldest whole turns to ≤ Y
@@ -844,7 +844,7 @@ def _do_reconcile(job):
             with MLX_LOCK:
                 trim_kv(st["kv"], pin_len + lcp)
                 for _ in stream_generate(model, processor, "", input_ids=mx.array([tgt_ids[lcp:]]),
-                                         pixel_values=pv, prompt_cache=st["kv"], max_tokens=0, temperature=0.0):
+                                         pixel_values=pv, prompt_cache=st["kv"], max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP):
                     pass
         PF["ids"] = tgt_ids
         job.result = {"conv_start": conv_start, "conv_tokens": len(tgt_ids), "mem_peak_gb": _mem()[1]}
@@ -920,7 +920,8 @@ def _do_generate(job):
         _prog(op="generate", stage="prefill", done=0, total=new_tokens, label="prefilling", bump=True)
         gen = stream_generate(model, processor, "", input_ids=feed_ids,
                               pixel_values=per_pv, prompt_cache=st["kv"],
-                              max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
+                              max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
+                              prefill_step_size=PREFILL_STEP)   # chunk the generation prefill like the pin (was 2048)
         ttft, last, start = None, None, time.time()
         gen_count = 0
         gen_ids = []                             # sampled token ids (to record the KV's physical tail)
