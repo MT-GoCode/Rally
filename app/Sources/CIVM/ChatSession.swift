@@ -110,7 +110,7 @@ enum VoiceState: Equatable {
     }
 
     // ---- in-flight turn (ask pipeline) ----
-    private(set) var busy = false
+    private(set) var busy = false { didSet { if busy != oldValue { web?.setBusy(busy) } } }   // toggle composer Send↔Stop
     private(set) var streaming = ""
     // per-message accounting from the last /chat done meta — explicit cache-vs-new breakdown.
     private(set) var lastReused = 0    // history tokens reused from the cross-turn KV cache
@@ -499,6 +499,7 @@ enum VoiceState: Equatable {
     // ---- capture staging intents (fix E) — clipboard/timeline UI hands finished Blocks in ----
     func attachPastedImages(_ blocks: [Block]) { pastedImages.append(contentsOf: blocks); syncThumbs() }
     func removePastedImage(id: UUID) { pastedImages.removeAll { $0.id == id }; syncThumbs() }
+    func removePastedImageAt(_ i: Int) { guard pastedImages.indices.contains(i) else { return }; pastedImages.remove(at: i); syncThumbs() }
 
     // ---- Voice·Text + capture control channel ----
     // Poll GET /voice/poll ~10Hz while a chat is open in ANY mode: capture events are delivered in
@@ -821,12 +822,15 @@ enum VoiceState: Equatable {
     // Deliver captures to the chat as if the user had pasted them: images → thumbnail bar, text → input.
     // One path now (the input box is always present), so screenshots/copies ride the next send either way.
     private func deliverCaptures(_ caps: [Capture]) {
+        var gotImage = false, gotText = false
         for c in caps {
             if c.kind == "image", let d = c.data, !d.isEmpty {
-                pastedImages.append(Block(mediaType: "image/png", data: d))
+                pastedImages.append(Block(mediaType: "image/png", data: d)); gotImage = true
             } else if c.kind == "text", let t = c.text, !t.isEmpty {
-                input += input.isEmpty ? t : " " + t
+                input += input.isEmpty ? t : " " + t; gotText = true
             }
         }
+        if gotImage { syncThumbs() }            // screenshot shortcut → refresh the send-queue bar NOW (was stale until next paste)
+        if gotText { web?.setComposer(input) }  // captured text → into the WebView composer
     }
 }

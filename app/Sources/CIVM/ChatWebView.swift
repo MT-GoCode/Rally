@@ -16,6 +16,7 @@ import WebKit
     func setComposer(_ t: String)
     func submitComposer()
     func setThumbs(_ dataURIs: [String])
+    func setBusy(_ busy: Bool)       // toggle Send ↔ Stop / Interrupt&Send + placeholder
     func streamSet(_ text: String)   // live reply text (pushed per-token, direct → smooth streaming)
     func streamEnd()                 // reply committed → remove the live bubble
 }
@@ -94,6 +95,7 @@ struct ChatWebView: NSViewRepresentable {
             let arr = (try? String(data: JSONSerialization.data(withJSONObject: u), encoding: .utf8)) ?? "[]"
             runJS("window.rally.setThumbs(\(arr))")
         }
+        func setBusy(_ busy: Bool) { runJS("window.rally.setBusy(\(busy))") }
         private func runJS(_ js: String) {
             guard loaded, let wv = webView else { if pending == nil { pending = ("", 0) }; return }
             wv.evaluateJavaScript(js, completionHandler: nil)
@@ -107,8 +109,10 @@ struct ChatWebView: NSViewRepresentable {
             case "input":      session?.input = d["text"] as? String ?? ""
             case "focus":      session?.inputIsFocused = (d["focused"] as? Bool ?? false)
             case "copy":       let s = d["text"] as? String ?? ""; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string)
-            case "reset":      if let id = (d["id"] as? String).flatMap(UUID.init) { session?.resetToHere(id) }
-            case "pasteImage": if let uri = d["data"] as? String { session?.attachDataURIImage(uri) }
+            case "reset":       if let id = (d["id"] as? String).flatMap(UUID.init) { session?.resetToHere(id) }
+            case "pasteImage":  if let uri = d["data"] as? String { session?.attachDataURIImage(uri) }
+            case "removeImage": if let i = d["index"] as? Int { session?.removePastedImageAt(i) }
+            case "stop":        session?.stop()
             default: break
             }
         }
@@ -118,6 +122,7 @@ struct ChatWebView: NSViewRepresentable {
             if let l = last { wv.evaluateJavaScript("window.rally.render(\(l.0), \(l.1))", completionHandler: nil) }
             if let t = lastStream { wv.evaluateJavaScript("window.rally.setStream(\(jsonStr(t)))", completionHandler: nil) }
             pending = nil
+            if let s = session { setBusy(s.busy); s.syncThumbs() }   // push current state to the freshly-loaded page
         }
     }
 }
