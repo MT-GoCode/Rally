@@ -605,7 +605,11 @@ def _window_start(messages, reminder, mode, cur, trigger, target):
     """Hysteresis sliding window over conversation TURNS. Keep `cur` unless the windowed conversation
     exceeds `trigger` (X) tokens; then advance `cur` to the earliest user-turn start whose remaining
     conversation ≤ `target` (Y). Monotonic within a session (never rewinds). trigger<=0 disables it
-    (returns 0 → whole conversation, today's behaviour)."""
+    (returns 0 → whole conversation, today's behaviour).
+
+    FLOOR: never trim past the last COMPLETE turn — always keep ≥1 full Q&A in cache so follow-ups have
+    context, even when `target` is smaller than a single turn. Without this the window would walk all the
+    way to the bare current question (dropping the previous answer) whenever target < one turn's tokens."""
     n = len(messages)
     cur = max(0, min(cur or 0, n))
     if trigger <= 0 or n == 0:
@@ -613,14 +617,20 @@ def _window_start(messages, reminder, mode, cur, trigger, target):
     lens = _turn_lens(messages)
     rem_n = _reminder_tok_len(reminder)
     def clen(s): return sum(lens[s:]) + rem_n
+    # The floor is the start of the last complete turn: if the newest message is the in-flight user
+    # question, that's the PREVIOUS user turn (keep prev Q&A + the question); otherwise it's the last
+    # user turn (keep the last Q&A). conv_start is never allowed past this index.
+    user_starts = [i for i in range(n) if messages[i].get("role") == "user"]
+    if messages[-1].get("role") == "user":
+        floor = user_starts[-2] if len(user_starts) >= 2 else 0
+    else:
+        floor = user_starts[-1] if user_starts else 0
     if clen(cur) <= trigger:
-        return cur                                  # still inside the deadband → don't trim
+        return min(cur, floor)                      # inside the deadband, but never below the floor
     for s in range(cur, n):                         # over X → drop oldest whole turns down to ≤ Y
         if messages[s].get("role") == "user" and clen(s) <= target:
-            return s
-    # couldn't get under Y (one giant turn) → keep just the last user turn
-    starts = [i for i in range(cur, n) if messages[i].get("role") == "user"]
-    return starts[-1] if starts else cur
+            return min(s, floor)
+    return floor                                    # couldn't reach Y (giant turn) → keep the last full turn
 
 
 def _live_drop(messages, conv_start):
