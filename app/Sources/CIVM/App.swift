@@ -760,25 +760,17 @@ struct RootView: View {
             // thread). `.id(store.chat.id)` recreates it (fresh web process) per chat and tears down the old
             // one → bounded memory, no beachball. Reads session.streaming/busy so the live reply updates —
             // cheap now, since the heavy render happens in the web process, not here.
-            ChatWebView(messagesJSON: conversationJSON(store.chat.messages),
+            // Messages + composer both live in this one WebView (so ↑/↓ moves seamlessly between them);
+            // it owns all conversation keyboard handling in JS. No SwiftUI keyMonitor → no double-handling.
+            ChatWebView(session: session,
+                        messagesJSON: conversationJSON(store.chat.messages),
                         convStart: session.convStart ?? -1,
                         streamingText: session.streaming, isBusy: session.busy)
                 .id(store.chat.id)
                 .overlay(alignment: .bottomTrailing) { precacheChip.padding(10) }
             Divider()
-            inputRegion
+            chatMetaBar.padding(.horizontal, 12).padding(.vertical, 6)   // token counts + reminder — OUTSIDE the WebView
         }
-        // Keyboard nav + focus mirroring live at the chat-pane level so ↑/↓/space/s/c/r work regardless
-        // of whether the user is typing or dictating (there is now ONE input region for both).
-        // Monitor lifetime is the whole chat screen.
-        .onChange(of: inputFocused) { _, f in session.inputIsFocused = f; if f { session.clearSelection() } }
-        .onChange(of: session.inputFocusToken) { _, _ in inputFocused = true }
-        .onChange(of: session.selectedMessageID) { _, id in if id != nil { inputFocused = false } }
-        .onAppear {
-            guard pasteMonitor == nil else { return }
-            pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in keyMonitor(e) }
-        }
-        .onDisappear { if let m = pasteMonitor { NSEvent.removeMonitor(m); pasteMonitor = nil } }
         .overlay(alignment: .top) { copiedToast }
     }
 

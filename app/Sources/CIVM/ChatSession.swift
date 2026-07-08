@@ -175,8 +175,27 @@ enum VoiceState: Equatable {
     private var pinOutcome: PinOutcome = .none
 
     // ---- compose buffer + capture staging (fix E — intent methods mutate; views only read) ----
-    var input = ""                             // typed chat input (bound two-way to the TextField)
+    var input = ""                             // mirror of the WebView composer (kept in sync via the "input" bridge)
     private(set) var pastedImages: [Block] = []   // chat-input pasted images (thumbnail bar → ride with the question)
+    @ObservationIgnored weak var web: ChatWebBridge?   // drives the in-WebView composer (voice insert / focus / thumbs / submit)
+
+    // Send with text from the WebView composer (Enter, or voice auto-send). Mirrors send() but the text
+    // comes from JS rather than `input`.
+    func sendText(_ text: String) {
+        let imgs = pastedImages
+        pastedImages = []; input = ""; web?.setThumbs([])
+        ask(text: text, images: imgs)
+    }
+    // A "data:<mediaType>;base64,<data>" URI pasted into the composer → a pasted image (+ refresh thumbs).
+    func attachDataURIImage(_ uri: String) {
+        guard let comma = uri.firstIndex(of: ","), uri.hasPrefix("data:") else { return }
+        let meta = uri[uri.index(uri.startIndex, offsetBy: 5)..<comma]
+        let mediaType = meta.split(separator: ";").first.map(String.init) ?? "image/png"
+        let data = String(uri[uri.index(after: comma)...])
+        pastedImages.append(Block(mediaType: mediaType, data: data))
+        syncThumbs()
+    }
+    func syncThumbs() { web?.setThumbs(pastedImages.map { "data:\($0.mediaType ?? "image/png");base64,\($0.data ?? "")" }) }
 
     // ---- hybrid dictation: the field locks while talking; the transcript lands at the caret ----
     private(set) var dictating = false         // a dictation is live → the input field is uneditable
@@ -207,7 +226,7 @@ enum VoiceState: Equatable {
     // AGENT message ids oldest→newest — the navigation order (user turns are skipped).
     var agentMessageIDs: [UUID] { store.chat.messages.filter { $0.role == "assistant" }.map { $0.id } }
 
-    func focusInput() { selectedMessageID = nil; inputFocusToken &+= 1 }
+    func focusInput() { selectedMessageID = nil; inputFocusToken &+= 1; web?.focusComposer() }
     func clearSelection() { selectedMessageID = nil }
     func navUp() {                                       // older; from input/none → most-recent agent msg
         let ids = agentMessageIDs; guard !ids.isEmpty else { return }
@@ -475,8 +494,8 @@ enum VoiceState: Equatable {
     }
 
     // ---- capture staging intents (fix E) — clipboard/timeline UI hands finished Blocks in ----
-    func attachPastedImages(_ blocks: [Block]) { pastedImages.append(contentsOf: blocks) }
-    func removePastedImage(id: UUID) { pastedImages.removeAll { $0.id == id } }
+    func attachPastedImages(_ blocks: [Block]) { pastedImages.append(contentsOf: blocks); syncThumbs() }
+    func removePastedImage(id: UUID) { pastedImages.removeAll { $0.id == id }; syncThumbs() }
 
     // ---- Voice·Text + capture control channel ----
     // Poll GET /voice/poll ~10Hz while a chat is open in ANY mode: capture events are delivered in
@@ -773,11 +792,11 @@ enum VoiceState: Equatable {
         let wasAlone = dictWasAlone
         endDictation()                                      // unlock first (so send()/edits see an enabled field)
         guard !t.isEmpty else { return }                    // empty → nothing to insert; field already unlocked
-        insertAtCaret(t, offset: dictCaret)
+        web?.insertText(t)                                  // insert at the composer caret (in the WebView)
         switch store.chat.settings.autoSendV {
-        case .always:  send()
-        case .ifAlone: if wasAlone { send() }               // box was empty at start → the transcript is the message
-        case .never:   break                                // leave it inserted; the user presses Enter
+        case .always:  web?.submitComposer()
+        case .ifAlone: if wasAlone { web?.submitComposer() } else { web?.focusComposer() }  // box had text → leave it
+        case .never:   web?.focusComposer()                 // leave it inserted; the user presses Enter
         }
     }
 

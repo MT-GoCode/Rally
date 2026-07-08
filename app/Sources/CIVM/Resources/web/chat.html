@@ -8,18 +8,15 @@
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body {
-    background: #1e1e1e; color: #e6e6e6;
-    font: 14px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif;
-    -webkit-user-select: text; -webkit-font-smoothing: antialiased;
-    overflow-y: scroll; overflow-x: hidden;
-  }
-  #messages { padding: 14px; max-width: 100%; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body { background: #1e1e1e; color: #e6e6e6;
+    font: 14px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  #messages { flex: 1 1 auto; overflow-y: scroll; overflow-x: hidden; padding: 14px; -webkit-user-select: text; }
   .row { display: flex; margin: 0 0 14px; }
   .row.user { justify-content: flex-end; }
   .row.assistant { justify-content: flex-start; }
-  .bubble { padding: 8px 12px; border-radius: 12px; max-width: 82%; overflow-wrap: anywhere; }
+  .bubble { position: relative; padding: 8px 12px; border-radius: 12px; max-width: 82%; overflow-wrap: anywhere; }
   .user .bubble { background: rgba(10,132,255,0.22); }
   .assistant .bubble { background: rgba(160,160,160,0.15); max-width: 92%; }
   .interruption .bubble { background: rgba(255,159,10,0.20); }
@@ -34,102 +31,144 @@
   .bubble blockquote { border-left: 3px solid rgba(160,160,160,0.4); margin: 6px 0; padding-left: 10px; color: #bdbdbd; }
   .bubble img.inline { max-height: 120px; border-radius: 6px; margin: 4px 6px 0 0; vertical-align: top; }
   .bubble a { color: #4aa3ff; }
-  .row.selected .bubble { outline: 2px solid #0a84ff; outline-offset: 1px; }
+  .row.sel .bubble { outline: 2px solid #0a84ff; outline-offset: 1px; }
   .divider { display: flex; align-items: center; gap: 8px; color: #8a8a8a; font-size: 9px; margin: 6px 2px 14px; }
   .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: rgba(160,160,160,0.3); }
   .appendix { margin-top: 8px; font-size: 12px; color: #9a9a9a; }
   .appendix summary { cursor: pointer; color: #7a7a7a; }
   .src { white-space: pre-wrap; font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12px; }
+  .dots { position: absolute; top: 4px; right: 6px; color: #8a8a8a; cursor: pointer; font-size: 13px; opacity: 0; padding: 0 4px; }
+  .assistant .bubble:hover .dots, .row.sel .dots { opacity: 1; }
+  .menu { position: absolute; top: 22px; right: 6px; background: #2b2b2b; border: 1px solid rgba(160,160,160,0.3);
+    border-radius: 8px; padding: 4px; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,0.4); display: none; }
+  .menu.open { display: block; }
+  .menu button { display: block; width: 100%; text-align: left; background: none; border: 0; color: #e6e6e6;
+    font: inherit; padding: 5px 10px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+  .menu button:hover { background: rgba(10,132,255,0.3); }
+  #composer-wrap { flex: 0 0 auto; border-top: 1px solid rgba(160,160,160,0.2); padding: 8px 12px; background: #1a1a1a; }
+  #composer { width: 100%; min-height: 22px; max-height: 40vh; overflow-y: auto; background: transparent;
+    border: 0; outline: none; color: #e6e6e6; font: inherit; resize: none; }
+  #composer::placeholder { color: #6a6a6a; }
+  #thumbs { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+  #thumbs img { height: 40px; border-radius: 5px; }
 </style>
 </head>
 <body>
-<div id="messages"></div>
+<div id="app">
+  <div id="messages"></div>
+  <div id="composer-wrap">
+    <div id="thumbs"></div>
+    <textarea id="composer" rows="1" placeholder="Space to type · hold ⌃⇧ to talk · ↑ to review replies"></textarea>
+  </div>
+</div>
 <script src="markdown-it.min.js"></script>
 <script src="highlight.min.js"></script>
 <script src="katex.min.js"></script>
 <script src="katex-auto-render.min.js"></script>
 <script>
-const md = window.markdownit({
-  html: false, linkify: true, breaks: false,
-  highlight: (str, lang) => {
-    try { if (lang && hljs.getLanguage(lang)) return hljs.highlight(str, {language: lang}).value; } catch (e) {}
-    return md.utils.escapeHtml(str);
-  }
-});
-const KATEX = { delimiters: [
-  {left:"$$", right:"$$", display:true}, {left:"\\[", right:"\\]", display:true},
-  {left:"$", right:"$", display:false}, {left:"\\(", right:"\\)", display:false}
-], throwOnError:false };
+"use strict";
+const bridge = (a) => { try { window.webkit.messageHandlers.rally.postMessage(a); } catch(e) {} };
+const md = window.markdownit({ html:false, linkify:true, breaks:false,
+  highlight:(s,l)=>{ try{ if(l&&hljs.getLanguage(l)) return hljs.highlight(s,{language:l}).value; }catch(e){} return md.utils.escapeHtml(s); } });
+const KATEX = { delimiters:[{left:"$$",right:"$$",display:true},{left:"\\[",right:"\\]",display:true},
+  {left:"$",right:"$",display:false},{left:"\\(",right:"\\)",display:false}], throwOnError:false };
+const esc = s => s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
-const container = document.getElementById("messages");
-let MSGS = [], CONV_START = -1, SHOW_SRC = {};   // SHOW_SRC[index] = raw source toggle
+const messagesEl = document.getElementById("messages");
+const composer = document.getElementById("composer");
+const thumbsEl = document.getElementById("thumbs");
+let MSGS = [], CONV_START = -1, SEL = -1, SRC = {}, streamEl = null;
 
-function esc(s){ return s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function agentIndices(){ return MSGS.map((m,i)=>m.role==="assistant"&&!m.streaming?i:-1).filter(i=>i>=0); }
+function atBottom(){ return messagesEl.scrollTop + messagesEl.clientHeight >= messagesEl.scrollHeight - 60; }
+function toBottom(){ messagesEl.scrollTop = messagesEl.scrollHeight; }
 
-function renderBubbleBody(el, text) {
+function renderBody(el, text){
   const parts = text.split("@@APPENDIX@@");
-  const body = (parts[0] || "").trim();
-  el.innerHTML = md.render(body);
-  try { renderMathInElement(el, KATEX); } catch(e) {}
-  if (parts.length > 1) {
-    try {
-      const j = JSON.parse(parts[1].slice(parts[1].indexOf("{")));
-      const items = (j.deferred||[]).map(d=>d.item).filter(Boolean).concat(j.training||[]);
-      if (items.length) {
-        const d = document.createElement("details"); d.className = "appendix";
-        d.innerHTML = "<summary>notes</summary>" + items.map(i=>"<div>• "+esc(i)+"</div>").join("");
-        el.appendChild(d);
-      }
-    } catch(e) {}
-  }
+  el.innerHTML = md.render((parts[0]||"").trim());
+  try { renderMathInElement(el, KATEX); } catch(e){}
+  if (parts.length>1){ try {
+    const j = JSON.parse(parts[1].slice(parts[1].indexOf("{")));
+    const items = (j.deferred||[]).map(d=>d.item).filter(Boolean).concat(j.training||[]);
+    if (items.length){ const d=document.createElement("details"); d.className="appendix";
+      d.innerHTML="<summary>notes</summary>"+items.map(i=>"<div>• "+esc(i)+"</div>").join(""); el.appendChild(d); }
+  } catch(e){} }
 }
 
-function render(msgs, convStart) {
-  MSGS = msgs || MSGS; CONV_START = (convStart===undefined? CONV_START : convStart);
-  container.innerHTML = "";
-  MSGS.forEach((m, i) => {
-    if (CONV_START > 0 && i === CONV_START) {
-      const dv = document.createElement("div"); dv.className = "divider";
-      dv.textContent = "earlier turns are out of context"; container.appendChild(dv);
-    }
-    const row = document.createElement("div");
-    row.className = "row " + (m.role === "user" ? "user" : "assistant") + (m.isInterruption ? " interruption" : "");
-    if (m.selected) row.className += " selected";
-    const bub = document.createElement("div"); bub.className = "bubble";
-    if (m.isInterruption) { const l=document.createElement("div"); l.className="intlabel"; l.textContent="INTERRUPTED TO ADD"; bub.appendChild(l); }
-    if (m.images && m.images.length) {
-      const strip=document.createElement("div");
-      m.images.forEach(src=>{ const im=document.createElement("img"); im.className="inline"; im.src=src; strip.appendChild(im); });
-      bub.appendChild(strip);
-    }
-    const bodyEl = document.createElement("div");
-    if (m.role === "user" || SHOW_SRC[i]) { bodyEl.className="src"; bodyEl.textContent = m.text.split("@@APPENDIX@@")[0].trim(); }
-    else { renderBubbleBody(bodyEl, m.text); }
+function render(msgs, convStart){
+  const stick = atBottom();
+  if (msgs!==undefined) MSGS = msgs;
+  if (convStart!==undefined) CONV_START = convStart;
+  messagesEl.innerHTML = "";
+  MSGS.forEach((m,i)=>{
+    if (CONV_START>0 && i===CONV_START){ const dv=document.createElement("div"); dv.className="divider"; dv.textContent="earlier turns are out of context"; messagesEl.appendChild(dv); }
+    const row=document.createElement("div");
+    row.className="row "+(m.role==="user"?"user":"assistant")+(m.isInterruption?" interruption":"")+(i===SEL?" sel":"");
+    const bub=document.createElement("div"); bub.className="bubble";
+    if (m.isInterruption){ const l=document.createElement("div"); l.className="intlabel"; l.textContent="INTERRUPTED TO ADD"; bub.appendChild(l); }
+    if (m.images&&m.images.length){ const s=document.createElement("div"); m.images.forEach(src=>{const im=document.createElement("img"); im.className="inline"; im.src=src; s.appendChild(im);}); bub.appendChild(s); }
+    const bodyEl=document.createElement("div");
+    if (m.role==="user"||SRC[i]){ bodyEl.className="src"; bodyEl.textContent=m.text.split("@@APPENDIX@@")[0].trim(); } else { renderBody(bodyEl, m.text); }
     bub.appendChild(bodyEl);
-    if (m.interrupted) { const c=document.createElement("div"); c.style.cssText="font-size:11px;color:#8a8a8a"; c.textContent="⎯ interrupted"; bub.appendChild(c); }
-    row.appendChild(bub); container.appendChild(row);
+    if (m.interrupted){ const c=document.createElement("div"); c.style.cssText="font-size:11px;color:#8a8a8a"; c.textContent="⎯ interrupted"; bub.appendChild(c); }
+    if (m.role==="assistant" && m.id){                    // ⋯ menu on committed agent replies
+      const dots=document.createElement("div"); dots.className="dots"; dots.textContent="⋯";
+      const menu=document.createElement("div"); menu.className="menu";
+      const mk=(label,fn)=>{const b=document.createElement("button"); b.textContent=label; b.onclick=(e)=>{e.stopPropagation(); menu.classList.remove("open"); fn();}; return b;};
+      menu.appendChild(mk("Copy · C", ()=>bridge({action:"copy", text:(m.text.split("@@APPENDIX@@")[0]).trim()})));
+      menu.appendChild(mk("View source · S", ()=>{ SRC[i]=!SRC[i]; render(); }));
+      menu.appendChild(mk("Reset to here · R", ()=>bridge({action:"reset", id:m.id})));
+      dots.onclick=(e)=>{ e.stopPropagation(); document.querySelectorAll(".menu.open").forEach(x=>x.classList.remove("open")); menu.classList.toggle("open"); };
+      bub.appendChild(dots); bub.appendChild(menu);
+    }
+    row.appendChild(bub); messagesEl.appendChild(row);
   });
-  scrollToBottom();
+  if (stick) toBottom();
 }
+document.addEventListener("click", ()=>document.querySelectorAll(".menu.open").forEach(x=>x.classList.remove("open")));
 
-// Streaming: keep the last assistant bubble live without re-rendering the whole list.
-let streamEl = null;
-function beginStream() {
-  const row=document.createElement("div"); row.className="row assistant";
-  const bub=document.createElement("div"); bub.className="bubble";
-  streamEl=document.createElement("div"); bub.appendChild(streamEl); row.appendChild(bub); container.appendChild(row);
-  scrollToBottom();
-}
-function setStream(text){ if(!streamEl) beginStream(); renderBubbleBody(streamEl, text || "…"); scrollToBottom(); }
-function endStream(){ streamEl=null; }
+// ---- streaming (live reply, not re-rendering the whole list) ----
+function setStream(text){ const stick=atBottom();
+  if(!streamEl){ const row=document.createElement("div"); row.className="row assistant"; const bub=document.createElement("div"); bub.className="bubble"; streamEl=document.createElement("div"); bub.appendChild(streamEl); row.appendChild(bub); messagesEl.appendChild(row); }
+  renderBody(streamEl, text||"…"); if(stick) toBottom(); }
+function endStream(){ if(streamEl){ streamEl.closest(".row")?.remove(); streamEl=null; } }
 
-function setSelected(idx){ MSGS.forEach((m,i)=>m.selected=(i===idx)); render(); if(idx>=0){ const r=container.querySelectorAll(".row")[idx]; if(r) r.scrollIntoView({block:"center"}); } }
-function toggleSource(idx){ SHOW_SRC[idx]=!SHOW_SRC[idx]; render(); }
-function atBottom(){ return window.innerHeight + window.scrollY >= document.body.scrollHeight - 60; }
-function scrollToBottom(){ window.scrollTo(0, document.body.scrollHeight); }
+// ---- selection / keyboard nav (seamless composer <-> messages) ----
+function setSel(i){ SEL=i; render(); const rows=messagesEl.querySelectorAll(".row"); if(i>=0&&rows[i]) rows[i].scrollIntoView({block:"center"}); }
+function selectLast(){ const a=agentIndices(); if(a.length){ composer.blur(); setSel(a[a.length-1]); } }
+function focusComposer(){ setSel(-1); composer.focus(); }
+function caretAtStart(){ return composer.selectionStart===0 && composer.selectionEnd===0; }
 
-// Swift bridge entry point (single JSON message → dispatch)
-window.rally = { render, setStream, endStream, setSelected, toggleSource, scrollToBottom };
+composer.addEventListener("input", ()=>{ composer.style.height="auto"; composer.style.height=Math.min(composer.scrollHeight, window.innerHeight*0.4)+"px"; bridge({action:"input", text:composer.value}); });
+composer.addEventListener("focus", ()=>bridge({action:"focus", focused:true}));
+composer.addEventListener("blur", ()=>bridge({action:"focus", focused:false}));
+composer.addEventListener("paste", (e)=>{ const items=e.clipboardData?.items||[]; for(const it of items){ if(it.type.startsWith("image/")){ const f=it.getAsFile(); const r=new FileReader(); r.onload=()=>bridge({action:"pasteImage", data:String(r.result)}); r.readAsDataURL(f); e.preventDefault(); } } });
+
+document.addEventListener("keydown", (e)=>{
+  const inComposer = document.activeElement===composer;
+  if (inComposer){
+    if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); const t=composer.value; composer.value=""; composer.style.height="auto"; bridge({action:"send", text:t}); return; }
+    if (e.key==="ArrowUp" && caretAtStart()){ e.preventDefault(); selectLast(); return; }
+    return;                                   // Shift+Enter, normal typing, etc. → default
+  }
+  const a = agentIndices(); const pos = a.indexOf(SEL);
+  if (e.key==="ArrowUp"){ e.preventDefault(); if(pos>0) setSel(a[pos-1]); else if(pos<0&&a.length) setSel(a[a.length-1]); }
+  else if (e.key==="ArrowDown"){ e.preventDefault(); if(pos>=0&&pos<a.length-1) setSel(a[pos+1]); else focusComposer(); }
+  else if (e.key===" "){ e.preventDefault(); focusComposer(); }
+  else if (e.key==="Escape"){ setSel(-1); }
+  else if (SEL>=0){ const m=MSGS[SEL];
+    if (e.key==="s"){ SRC[SEL]=!SRC[SEL]; render(); }
+    else if (e.key==="c"){ bridge({action:"copy", text:(m.text.split("@@APPENDIX@@")[0]).trim()}); }
+    else if (e.key==="r" && m.id){ bridge({action:"reset", id:m.id}); } }
+});
+
+// ---- Swift → JS ----
+function setThumbs(list){ thumbsEl.innerHTML=""; (list||[]).forEach(src=>{const im=document.createElement("img"); im.src=src; thumbsEl.appendChild(im);}); }
+function setComposer(t){ composer.value=t||""; composer.style.height="auto"; composer.style.height=Math.min(composer.scrollHeight, window.innerHeight*0.4)+"px"; }
+function insertText(t){ const s=composer.selectionStart||composer.value.length; composer.value = composer.value.slice(0,s)+t+composer.value.slice(composer.selectionEnd||s); composer.style.height="auto"; composer.style.height=Math.min(composer.scrollHeight, window.innerHeight*0.4)+"px"; composer.focus(); bridge({action:"input", text:composer.value}); }
+function submitComposer(){ const t=composer.value; composer.value=""; composer.style.height="auto"; bridge({action:"send", text:t}); }
+window.rally = { render, setStream, endStream, setSel, focusComposer, setComposer, insertText, submitComposer, setThumbs };
+composer.focus();   // WebView takes keyboard on open (type immediately; ↑ to review replies)
 </script>
 </body>
 </html>

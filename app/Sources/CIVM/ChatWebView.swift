@@ -2,18 +2,26 @@ import SwiftUI
 import WebKit
 
 // ---------------------------------------------------------------------------
-// The conversation transcript, rendered by a SINGLE WKWebView (markdown-it + KaTeX + highlight.js,
-// all bundled offline). One web process per open chat — SwiftUI recreates this view (fresh WKWebView →
-// fresh WebContent process) whenever store.chat.id changes via `.id(chat.id)` at the call site, and tears
-// the old one down (terminating its process) → bounded memory, no accumulation, and markdown/math/table
-// layout runs in the web process, never on the SwiftUI main thread (that was the beachball).
-// Stage 1: render committed messages. (Input box + token line + streaming/keyboard bridge come next.)
+// The conversation transcript AND the input composer, in one WKWebView (markdown-it + KaTeX +
+// highlight.js, bundled offline). One web process per open chat (`.id(chat.id)` at the call site
+// recreates it and tears down the old → bounded memory; all markdown/math layout runs in the web
+// process, never the SwiftUI main thread). The composer lives inside so ↑/↓ moves seamlessly between
+// it and the messages. Token line, reminder, and cache HUD stay in SwiftUI outside this view.
 // ---------------------------------------------------------------------------
 
-// Build the JSON the web page renders: [{role,text,images:[dataURI],interrupted,isInterruption}].
+// Lets ChatSession drive the live web page (voice insert, focus, compose buffer) without importing WebKit.
+@MainActor protocol ChatWebBridge: AnyObject {
+    func insertText(_ t: String)
+    func focusComposer()
+    func setComposer(_ t: String)
+    func submitComposer()
+    func setThumbs(_ dataURIs: [String])
+}
+
+// [{id,role,text,images:[dataURI],interrupted,isInterruption}] for the web page to render.
 func conversationJSON(_ messages: [Msg]) -> String {
     let arr: [[String: Any]] = messages.map { m in
-        var d: [String: Any] = ["role": m.role, "text": m.text,
+        var d: [String: Any] = ["id": m.id.uuidString, "role": m.role, "text": m.text,
                                 "interrupted": m.interrupted, "isInterruption": m.isInterruption]
         let imgs = m.content.filter { $0.type == "image" }
             .map { "data:\($0.mediaType ?? "image/png");base64,\($0.data ?? "")" }
@@ -25,18 +33,27 @@ func conversationJSON(_ messages: [Msg]) -> String {
     return s
 }
 
+private func jsonStr(_ s: String) -> String {
+    guard let d = try? JSONSerialization.data(withJSONObject: [s]), let j = String(data: d, encoding: .utf8) else { return "\"\"" }
+    return "\(j)[0]"
+}
+
 struct ChatWebView: NSViewRepresentable {
+    let session: ChatSession
     let messagesJSON: String
     let convStart: Int
-    var streamingText: String = ""    // live in-progress reply (empty when not generating)
+    var streamingText: String = ""
     var isBusy: Bool = false
 
     func makeNSView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
+        cfg.userContentController.add(context.coordinator, name: "rally")
         let wv = WKWebView(frame: .zero, configuration: cfg)
         wv.navigationDelegate = context.coordinator
         if #available(macOS 12.0, *) { wv.underPageBackgroundColor = NSColor(red: 0.118, green: 0.118, blue: 0.118, alpha: 1) }
         context.coordinator.webView = wv
+        context.coordinator.session = session
+        session.web = context.coordinator            // register for Swift→JS (voice insert / focus / thumbs)
         if let url = Bundle.module.url(forResource: "chat", withExtension: "html", subdirectory: "web") {
             wv.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         }
@@ -48,44 +65,63 @@ struct ChatWebView: NSViewRepresentable {
         context.coordinator.stream(isBusy ? streamingText : nil)
     }
 
+    static func dismantleNSView(_ wv: WKWebView, coordinator: Coordinator) {
+        wv.configuration.userContentController.removeScriptMessageHandler(forName: "rally")
+    }
+
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    @MainActor final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler, ChatWebBridge {
         weak var webView: WKWebView?
+        weak var session: ChatSession?
         private var loaded = false
         private var pending: (String, Int)?
         private var last: (String, Int)?
-
         private var lastStream: String? = ""
 
+        // ---- Swift → JS ----
         func render(_ json: String, _ convStart: Int) {
-            if let l = last, l.0 == json, l.1 == convStart { return }   // dedup — don't re-render unchanged
+            if let l = last, l.0 == json, l.1 == convStart { return }
             last = (json, convStart)
-            guard loaded, let wv = webView else { pending = (json, convStart); return }
-            wv.evaluateJavaScript("window.rally.render(\(json), \(convStart))", completionHandler: nil)
+            runJS("window.rally.render(\(json), \(convStart))")
         }
-
-        // nil = not generating (end any live stream); non-nil = the growing reply text.
         func stream(_ text: String?) {
             if text == lastStream { return }
             lastStream = text
-            guard loaded, let wv = webView else { return }
-            if let t = text, let j = try? String(data: JSONSerialization.data(withJSONObject: [t]), encoding: .utf8) {
-                wv.evaluateJavaScript("window.rally.setStream(\(j)[0])", completionHandler: nil)   // JSON-escape the text
-            } else {
-                wv.evaluateJavaScript("window.rally.endStream()", completionHandler: nil)
+            if let t = text { runJS("window.rally.setStream(\(jsonStr(t)))") } else { runJS("window.rally.endStream()") }
+        }
+        func insertText(_ t: String)  { runJS("window.rally.insertText(\(jsonStr(t)))") }
+        func focusComposer()          { runJS("window.rally.focusComposer()") }
+        func setComposer(_ t: String) { runJS("window.rally.setComposer(\(jsonStr(t)))") }
+        func submitComposer()         { runJS("window.rally.submitComposer && window.rally.submitComposer()") }
+        func setThumbs(_ u: [String]) {
+            let arr = (try? String(data: JSONSerialization.data(withJSONObject: u), encoding: .utf8)) ?? "[]"
+            runJS("window.rally.setThumbs(\(arr))")
+        }
+        private func runJS(_ js: String) {
+            guard loaded, let wv = webView else { if pending == nil { pending = ("", 0) }; return }
+            wv.evaluateJavaScript(js, completionHandler: nil)
+        }
+
+        // ---- JS → Swift ----
+        func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+            guard let d = m.body as? [String: Any], let action = d["action"] as? String else { return }
+            switch action {
+            case "send":       session?.sendText(d["text"] as? String ?? "")
+            case "input":      session?.input = d["text"] as? String ?? ""
+            case "focus":      session?.inputIsFocused = (d["focused"] as? Bool ?? false)
+            case "copy":       let s = d["text"] as? String ?? ""; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string)
+            case "reset":      if let id = (d["id"] as? String).flatMap(UUID.init) { session?.resetToHere(id) }
+            case "pasteImage": if let uri = d["data"] as? String { session?.attachDataURIImage(uri) }
+            default: break
             }
         }
 
-        func webView(_ wv: WKWebView, didFinish navigation: WKNavigation!) {
+        func webView(_ wv: WKWebView, didFinish nav: WKNavigation!) {
             loaded = true
-            if let p = pending { pending = nil; wv.evaluateJavaScript("window.rally.render(\(p.0), \(p.1))", completionHandler: nil) }
+            if let l = last { wv.evaluateJavaScript("window.rally.render(\(l.0), \(l.1))", completionHandler: nil) }
             if let t = lastStream { wv.evaluateJavaScript("window.rally.setStream(\(jsonStr(t)))", completionHandler: nil) }
+            pending = nil
         }
     }
-}
-
-private func jsonStr(_ s: String) -> String {
-    guard let d = try? JSONSerialization.data(withJSONObject: [s]), let j = String(data: d, encoding: .utf8) else { return "\"\"" }
-    return "\(j)[0]"
 }
