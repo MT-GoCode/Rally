@@ -69,6 +69,7 @@ enum VoiceState: Equatable {
         // init, so neither fires for its initial value (the old dropFirst / "act only on change").
         trackReady()
         trackScreen()
+        if engine.ready { postVoiceConfig() }   // replay: withObservationTracking only fires on a SUBSEQUENT change
         // settings writes (SK keys, from the Settings sheet / modes bar): refresh stored copies and
         // post config; a MODE change additionally re-posts context (mirrors onChange(modeRaw)).
         NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
@@ -83,6 +84,9 @@ enum VoiceState: Equatable {
 
     // engine readiness → post config once it flips ready. onChange fires on the willSet; the Task defers
     // to read the settled value, then re-arms (onChange is one-shot).
+    // onChange is nonisolated + one-shot; the deferred Task both reads the SETTLED value and re-arms on the
+    // main actor. (A change landing between the fire and the re-arm is dropped, but the FINAL state is
+    // always handled because each fire re-reads live state — a narrow, self-correcting gap.)
     private func trackReady() {
         withObservationTracking { _ = engine.ready } onChange: { [weak self] in
             Task { @MainActor in
@@ -95,7 +99,6 @@ enum VoiceState: Equatable {
             }
         }
     }
-    // screen changes → post config on every enter/leave. Re-arms after each change.
     private func trackScreen() {
         withObservationTracking { _ = store.screen } onChange: { [weak self] in
             Task { @MainActor in
@@ -498,6 +501,7 @@ enum VoiceState: Equatable {
 
     // reset the per-chat transient voice state when the open chat changes
     private func resetForChatSwitch() {
+        askTask?.cancel(); streaming = ""; busy = false    // cancel any in-flight turn so its reply can't land in the new chat
         voiceSeq = -1; livePartial = ""
         if dictating { endDictation() }                   // don't carry a locked field / muted audio across chats
         selectedMessageID = nil; sourceShownIDs = []      // nav highlight + source toggles are per-chat

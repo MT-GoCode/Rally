@@ -62,12 +62,14 @@ struct AsyncBlockImage<Content: View>: View {
         .task(id: block.id) {
             let key = block.id.uuidString
             if let c = ImageCache.get(key) { img = c; return }
+            img = nil                          // clear any recycled-slot / prior-block image before decoding
             let b64 = block.data ?? ""
             let decoded = await Task.detached(priority: .userInitiated) { () -> SendableImage? in
                 guard let d = Data(base64Encoded: b64), let ns = NSImage(data: d) else { return nil }
                 return SendableImage(image: ns)
             }.value
-            if let decoded { ImageCache.set(key, decoded.image); img = decoded.image }
+            img = decoded?.image               // nil on failure → placeholder, never a stale image
+            if let i = img { ImageCache.set(key, i) }
         }
     }
 }

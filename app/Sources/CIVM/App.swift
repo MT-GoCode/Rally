@@ -57,12 +57,11 @@ struct ChatSettings: Codable, Equatable {
     var muteDictation = true
     var transcription = Transcription.after.rawValue
     var speechLocale = "en-US"
-    var cacheTrigger = 5000                 // X: trim conversation cache when it exceeds this
-    var cacheTarget = 3000                  // Y: …down to this (hysteresis)
-    var recacheMode = RecacheMode.recent.rawValue
+    // NOTE: the conversation-cache budget/mode are GLOBAL, not per-chat — they live in SK.* and are read
+    // live via ChatSession.trimTrigger/trimTarget/recacheMode. They are intentionally NOT stored here.
 
     init() {}
-    enum CodingKeys: String, CodingKey { case agentOutput, reminderMode, voiceInput, submode, autoSend, muteDictation, transcription, speechLocale, cacheTrigger, cacheTarget, recacheMode }
+    enum CodingKeys: String, CodingKey { case agentOutput, reminderMode, voiceInput, submode, autoSend, muteDictation, transcription, speechLocale }
     init(from d: Decoder) throws {   // per-field lenient: a new field added later won't wipe saved settings
         let c = try d.container(keyedBy: CodingKeys.self)
         if let v = try? c.decode(String.self, forKey: .agentOutput)   { agentOutput = v }
@@ -73,9 +72,6 @@ struct ChatSettings: Codable, Equatable {
         if let v = try? c.decode(Bool.self,   forKey: .muteDictation) { muteDictation = v }
         if let v = try? c.decode(String.self, forKey: .transcription) { transcription = v }
         if let v = try? c.decode(String.self, forKey: .speechLocale)  { speechLocale = v }
-        if let v = try? c.decode(Int.self,    forKey: .cacheTrigger)  { cacheTrigger = v }
-        if let v = try? c.decode(Int.self,    forKey: .cacheTarget)   { cacheTarget = v }
-        if let v = try? c.decode(String.self, forKey: .recacheMode)   { recacheMode = v }
     }
 
     var agentOutputV: AgentOutput   { AgentOutput(rawValue: agentOutput) ?? .text }
@@ -83,10 +79,6 @@ struct ChatSettings: Codable, Equatable {
     var submodeV: Submode           { Submode(rawValue: submode) ?? .hold }
     var autoSendV: AutoSend         { AutoSend(rawValue: autoSend) ?? .ifAlone }
     var transcriptionV: Transcription { Transcription(rawValue: transcription) ?? .after }
-    var recacheModeV: RecacheMode   { RecacheMode(rawValue: recacheMode) ?? .recent }
-    // clamped budget the engine is actually told (trigger ≤ cap, target < trigger)
-    var trimTrigger: Int { max(200, min(cacheTrigger, SK.cacheTriggerCap)) }
-    var trimTarget: Int  { max(100, min(cacheTarget, trimTrigger - 1)) }
 
     // Snapshot the current DEFAULTS store (SK.*) — used when a NEW chat is created.
     static func fromDefaults() -> ChatSettings {
@@ -99,9 +91,6 @@ struct ChatSettings: Codable, Equatable {
         s.muteDictation = SK.muteDictationOn
         s.transcription = Transcription.current.rawValue
         s.speechLocale = SK.speechLocaleValue
-        s.cacheTrigger = SK.cacheTriggerValue
-        s.cacheTarget = SK.cacheTargetValue
-        s.recacheMode = RecacheMode.current.rawValue
         return s
     }
 }
@@ -173,14 +162,18 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
         try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
         return d
     }
-    func save() {
+    // Serial queue so encodes/writes land in ORDER (fire-and-forget Task.detached could finish out of
+    // order and clobber newer content with stale). Off the main thread so a big chat never hitches the UI.
+    private let writeQueue = DispatchQueue(label: "civm.chat.save")
+    func save(thenRefresh refresh: Bool = false) {
         // don't litter home with pristine empty chats
-        guard !(chat.messages.isEmpty && nonEmpty(chat.system).isEmpty && nonEmpty(chat.context).isEmpty) else { return }
-        // Encode + write OFF the main thread (a big chat with base64 images can take real time) so a
-        // save after every turn never hitches the UI. Snapshot the value type first.
+        guard !(chat.messages.isEmpty && nonEmpty(chat.system).isEmpty && nonEmpty(chat.context).isEmpty) else {
+            if refresh { refreshStubs() }; return
+        }
         let snapshot = chat, url = dir.appendingPathComponent("\(chat.id).json")
-        Task.detached(priority: .utility) {
+        writeQueue.async { [weak self] in
             if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: url) }
+            if refresh { Task { @MainActor in self?.refreshStubs() } }   // refresh AFTER the write lands (not before)
         }
     }
 
@@ -200,13 +193,14 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
         // noticeable moment, which must NEVER freeze the UI. Transition immediately + show a spinner;
         // the real content swaps in when the decode finishes.
         let url = dir.appendingPathComponent("\(id).json")
+        openSeq &+= 1; let mySeq = openSeq   // request token — a slower earlier decode must not overwrite a later open
         loadingChat = true
         chat = Chat(name: "Loading…")        // placeholder so the chat pane isn't showing the previous chat
         screen = .chat
         Task.detached(priority: .userInitiated) { [weak self] in
             let c = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Chat.self, from: $0) }
             await MainActor.run {
-                guard let self else { return }
+                guard let self, self.openSeq == mySeq else { return }   // a newer open() superseded this one → drop it
                 self.loadingChat = false
                 guard let c else { self.screen = .home; return }
                 self.chat = c
@@ -214,7 +208,8 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
             }
         }
     }
-    func goHome() { save(); refreshStubs(); screen = .home }
+    private var openSeq = 0
+    func goHome() { save(thenRefresh: true); screen = .home }   // refresh the sidebar AFTER the save write lands
     func startNew() {
         var c = Chat()
         c.settings = .fromDefaults()          // snapshot the current DEFAULTS store into the new chat
@@ -481,7 +476,7 @@ struct RootView: View {
     var cs: ChatSettings { store.chat.settings }         // the open chat's live settings (read by the input UI)
     var submode: Submode { cs.submodeV }
     var transcription: Transcription { cs.transcriptionV }
-    var hk: String { hotkeySymbols(hotkey) }
+    var hk: String { bindingSymbols(hotkey) }   // full key+mods (e.g. ⌃⌥␣) — hotkeySymbols dropped the base key
 
     @State private var inputOptsOpen = false            // "Your Input" sub-options popover
     @State private var speechLocales: [String] = []     // Apple streaming locales (loaded lazily for the popover)
@@ -764,14 +759,18 @@ struct RootView: View {
                         // Render only the trailing `visibleCount` messages so NO chat size can freeze layout
                         // (the markdown/CoreText parse is main-thread). Older turns load on demand — this is a
                         // pure VIEW window, independent of the KV cache window (the "out of context" line).
-                        let startIdx = max(0, store.chat.messages.count - session.visibleCount)
+                        let msgs = store.chat.messages
+                        let startIdx = max(0, msgs.count - session.visibleCount)
                         if startIdx > 0 {
                             Button { session.loadEarlier() } label: {
                                 Label("Load \(startIdx) earlier message\(startIdx == 1 ? "" : "s")", systemImage: "chevron.up.circle")
                                     .font(.caption).foregroundStyle(.secondary)
                             }.buttonStyle(.plain).padding(.vertical, 4)
                         }
-                        ForEach(Array(store.chat.messages.enumerated()).suffix(session.visibleCount), id: \.element.id) { idx, m in
+                        // Enumerate only the VISIBLE slice (msgs[startIdx...]) so the render never allocates
+                        // an O(all-messages) array; `idx` stays the absolute message index for the boundary line.
+                        ForEach(Array(msgs[startIdx...].enumerated()), id: \.element.id) { off, m in
+                            let idx = startIdx + off
                             if let cs = session.convStart, cs == idx, cs > 0 { contextBoundaryLine }
                             messageBubble(id: m.id, role: m.role, text: m.text, interrupted: m.interrupted, isInterruption: m.isInterruption, images: m.content)
                         }

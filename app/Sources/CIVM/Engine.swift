@@ -62,6 +62,7 @@ enum Model {
         .appendingPathComponent("code/contextualized_instant_voice_models/engine")
 
     func start() {
+        if proc != nil { return }   // idempotent — a window reopen must not spawn a 2nd engine + 2nd poll loop
         let py = root.appendingPathComponent(".venv/bin/python")
         let modelPath = root.appendingPathComponent("models/\(Model.dirName)")
         let p = Process()
@@ -125,9 +126,9 @@ enum Model {
                 if let m = j["memGb"] as? Double, m != memGb { memGb = m }
                 if let c = j["memCeilingGb"] as? Double, c != memCeilingGb { memCeilingGb = c }
                 if let o = j["memOver"] as? Bool, o != memOver { memOver = o }
-            } else if !ready && ticks > 600 {
-                status = "engine did not become ready (see serve.log)"
             }
+            // surface a stuck load whether /health is unreachable OR responding with loaded:false
+            if !ready && ticks == 600 { status = "engine did not become ready (see serve.log)" }
             ticks += 1
             try? await Task.sleep(for: .seconds(1))
         }

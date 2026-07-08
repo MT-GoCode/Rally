@@ -49,7 +49,8 @@ CTX_WINDOW = 262_144
 # aggressive reclaim (drop conversation KV to the pin + release the buffer pool) so the process can NEVER
 # run the machine into swap/OOM. Env-tunable; default leaves headroom on a 48GB machine.
 MEM_CEILING_GB = float(os.environ.get("CIVM_MEM_CEILING_GB", "40"))
-MEM = {"active_gb": 0.0, "peak_gb": 0.0, "over": False, "ceiling_gb": MEM_CEILING_GB, "reclaims": 0}
+MEM = {"active_gb": 0.0, "peak_gb": 0.0, "over": False, "ceiling_gb": MEM_CEILING_GB,
+       "reclaims": 0, "reclaim_pending": False}
 ACK = "Understood — I have the reference material. Ask me anything."
 MAX_TOKENS = 2048         # SAFETY CEILING ONLY — the model stops at <end_of_turn>. Length is
                           # controlled by REMINDER, not this.
@@ -163,27 +164,39 @@ def _mem():
     except Exception: return (0.0, 0.0)
 
 def mem_watchdog():
-    """Enforce the hard memory boundary. Polls MLX active memory; if it crosses MEM_CEILING_GB, drop the
-    conversation KV back to the pin (keeps [system+context], loses only the cross-turn conversation cache
-    — instantly rebuilt on the next message) and release the buffer pool. This guarantees the engine
-    can't breach the ceiling for more than one poll interval, no matter what a chat throws at it."""
+    """Enforce the hard memory boundary. This thread ONLY reads a stat (get_active_memory) and, when over
+    the ceiling, ENQUEUES a reclaim job — it never touches the KV/allocator itself. That's essential: the
+    Gemma worker mutates st/PF/KV between decode steps WITHOUT holding MLX_LOCK the whole time, so trimming
+    the cache from here would corrupt an in-flight generation. Running the reclaim as a queued job means it
+    executes on the worker thread, serialized with all other KV work — safe by construction."""
     while True:
         time.sleep(2.0)
-        active, peak = _mem()
+        active, peak = _mem()                               # read-only MLX stat — safe from any thread
         MEM["active_gb"], MEM["peak_gb"] = active, peak
         if active > MEM_CEILING_GB:
-            MEM["over"] = True; MEM["reclaims"] += 1
-            log(f"[mem] OVER CEILING {active:.1f}GB > {MEM_CEILING_GB}GB — reclaiming (drop conversation KV to pin)")
-            try:
-                with MLX_LOCK:
-                    if st.get("kv") is not None and st.get("pin_len") is not None:
-                        trim_kv(st["kv"], st["pin_len"])         # keep the pin; drop conversation KV
-                        PF["ids"] = []; st["conv_start"] = 0; st["stream_start"] = 0
-                _free_mem()
-            except Exception as e:
-                log(f"[mem] reclaim error: {e}")
+            MEM["over"] = True
+            if not MEM["reclaim_pending"]:                  # coalesce: one reclaim in flight at a time
+                MEM["reclaim_pending"] = True
+                log(f"[mem] OVER CEILING {active:.1f}GB > {MEM_CEILING_GB}GB — queued reclaim (worker thread)")
+                GEMMA_Q.put(Job("reclaim"))
         else:
             MEM["over"] = False
+
+def _do_reclaim(job):
+    """Runs on the WORKER thread (serialized with pin/generate/reconcile → no concurrent KV mutation).
+    Release the buffer pool first; if the resident KV itself is still over the ceiling, drop the
+    conversation back to the pin (keep [system+context]; the next message rebuilds the conversation)."""
+    try:
+        _free_mem()
+        if _mem()[0] > MEM_CEILING_GB and st.get("kv") is not None and st.get("pin_len") is not None:
+            with MLX_LOCK:
+                trim_kv(st["kv"], st["pin_len"])
+                PF["ids"] = []; st["conv_start"] = 0; st["stream_start"] = 0
+            _free_mem()
+            MEM["reclaims"] += 1
+            log(f"[mem] reclaimed conversation KV → pin; now {_mem()[0]:.1f}GB")
+    finally:
+        MEM["reclaim_pending"] = False
 
 
 def load_model():
@@ -437,6 +450,8 @@ def gemma_worker():
                 _do_precache(job)
             elif job.kind == "reconcile":
                 _do_reconcile(job)
+            elif job.kind == "reclaim":
+                _do_reclaim(job)
         except Exception as e:
             import traceback
             log("worker ERR", traceback.format_exc())
@@ -624,7 +639,10 @@ def _live_drop(messages, conv_start):
     pf = PF["ids"] or []
     tmpdir = tempfile.mkdtemp(prefix="civm-sd-")
     try:
-        dropped = _render_ids(_mlx_messages(messages[old:conv_start], tmpdir, []), [], add_gen=False)
+        paths = []      # thread a REAL paths list so image tokens in dropped turns expand (match PF)
+        dropped = _render_ids(_mlx_messages(messages[old:conv_start], tmpdir, paths), paths, add_gen=False)
+    except Exception as e:
+        log(f"stream drop: render failed ({e}) → reprefill fallback"); st["stream_start"] = conv_start; return
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     D = len(dropped)
