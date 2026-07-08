@@ -35,10 +35,16 @@ struct SendableImage: @unchecked Sendable { let image: NSImage }
 
 // Decoded-image cache so a given block's base64 is turned into an NSImage AT MOST ONCE.
 enum ImageCache {
-    // NSCache is internally thread-safe; the compiler can't prove it, so opt out explicitly.
-    nonisolated(unsafe) private static let cache: NSCache<NSString, NSImage> = { let c = NSCache<NSString, NSImage>(); c.countLimit = 512; return c }()
+    // NSCache is internally thread-safe; the compiler can't prove it, so opt out explicitly. Bounded by
+    // BYTES (totalCostLimit), not just count, so decoded PDF pages can't grow the app's memory unbounded.
+    nonisolated(unsafe) private static let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>(); c.countLimit = 512; c.totalCostLimit = 256 * 1024 * 1024; return c
+    }()
     static func get(_ key: String) -> NSImage? { cache.object(forKey: key as NSString) }
-    static func set(_ key: String, _ img: NSImage) { cache.setObject(img, forKey: key as NSString) }
+    static func set(_ key: String, _ img: NSImage) {
+        let s = img.size, cost = max(1, Int(s.width * s.height) * 4)   // ~RGBA bytes
+        cache.setObject(img, forKey: key as NSString, cost: cost)
+    }
 }
 
 // Renders an image block WITHOUT ever decoding base64→NSImage on the main thread. Shows a light

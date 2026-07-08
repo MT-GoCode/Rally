@@ -75,6 +75,12 @@ struct CacheHUDView: View {
                     if let cvs = session.convStart, cvs > 0 { Text("· \(cvs) dropped").font(.system(size: 9)).foregroundStyle(.orange) }
                 }.foregroundStyle(.secondary)
             }
+            if engine.memGb > 0 {                          // the memory watcher: live engine mem vs the hard ceiling
+                HStack(spacing: 3) {
+                    Image(systemName: engine.memOver ? "exclamationmark.triangle.fill" : "memorychip").font(.system(size: 9))
+                    Text(String(format: "%.1f/%.0f GB", engine.memGb, engine.memCeilingGb)).font(.system(size: 9, weight: .medium))
+                }.foregroundStyle(engine.memOver ? .red : (engine.memGb > engine.memCeilingGb * 0.85 ? .orange : .secondary))
+            }
         }
         .padding(.horizontal, 12).padding(.vertical, 5)
         .background(st.busy ? Color.accentColor.opacity(0.06) : Color.clear)

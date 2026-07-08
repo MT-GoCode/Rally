@@ -52,6 +52,9 @@ enum Model {
     var status = "starting…"     // human-readable engine state
     var ready = false
     var parakeet = false          // ASR model loaded (from /health.parakeet)
+    var memGb = 0.0               // engine MLX memory (GB) — the "memory watcher"
+    var memCeilingGb = 40.0       // hard boundary the engine enforces
+    var memOver = false           // engine crossed the ceiling (watchdog reclaiming)
     @ObservationIgnored private var proc: Process?
     private let port = 5177
     private var base: String { "http://127.0.0.1:\(port)" }
@@ -108,20 +111,26 @@ enum Model {
         return j["precache"] as? String ?? "idle"
     }
 
-    // Poll /health until BOTH models load (Gemma first → ready; parakeet loads after → parakeet).
+    // Poll /health forever (1s): detect readiness (Gemma → ready; parakeet after) AND keep the memory
+    // watcher live (memGb/memOver) for the whole session. Deduped writes so idle costs nothing.
     private func pollHealth() async {
-        for _ in 0..<600 {
+        var ticks = 0
+        while !Task.isCancelled {
             if let d = try? await get("/health"),
                let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
                 if j["loaded"] as? Bool == true, !ready {
                     status = "model ready — \(j["model"] as? String ?? "")"; ready = true
                 }
                 parakeet = j["parakeet"] as? Bool ?? false
-                if ready && parakeet { return }
+                if let m = j["memGb"] as? Double, m != memGb { memGb = m }
+                if let c = j["memCeilingGb"] as? Double, c != memCeilingGb { memCeilingGb = c }
+                if let o = j["memOver"] as? Bool, o != memOver { memOver = o }
+            } else if !ready && ticks > 600 {
+                status = "engine did not become ready (see serve.log)"
             }
+            ticks += 1
             try? await Task.sleep(for: .seconds(1))
         }
-        if !ready { status = "engine did not become ready (see serve.log)" }
     }
 
     // Encode OFF the main thread — a transcript with base64 images is expensive to serialize and must

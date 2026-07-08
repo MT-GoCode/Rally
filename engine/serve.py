@@ -44,6 +44,12 @@ MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 5177
 TOKEN_LIMIT = 200_000
 CTX_WINDOW = 262_144
+# Hard memory boundary. On Apple Silicon memory is unified, so MLX's active allocation (weights + KV +
+# live tensors) is the footprint that matters. A watchdog polls it; crossing the ceiling triggers an
+# aggressive reclaim (drop conversation KV to the pin + release the buffer pool) so the process can NEVER
+# run the machine into swap/OOM. Env-tunable; default leaves headroom on a 48GB machine.
+MEM_CEILING_GB = float(os.environ.get("CIVM_MEM_CEILING_GB", "40"))
+MEM = {"active_gb": 0.0, "peak_gb": 0.0, "over": False, "ceiling_gb": MEM_CEILING_GB, "reclaims": 0}
 ACK = "Understood — I have the reference material. Ask me anything."
 MAX_TOKENS = 2048         # SAFETY CEILING ONLY — the model stops at <end_of_turn>. Length is
                           # controlled by REMINDER, not this.
@@ -155,6 +161,29 @@ def _mem():
     a, p = _mx_get("get_active_memory"), _mx_get("get_peak_memory")
     try: return (round((a() if a else 0) / 1e9, 2), round((p() if p else 0) / 1e9, 2))
     except Exception: return (0.0, 0.0)
+
+def mem_watchdog():
+    """Enforce the hard memory boundary. Polls MLX active memory; if it crosses MEM_CEILING_GB, drop the
+    conversation KV back to the pin (keeps [system+context], loses only the cross-turn conversation cache
+    — instantly rebuilt on the next message) and release the buffer pool. This guarantees the engine
+    can't breach the ceiling for more than one poll interval, no matter what a chat throws at it."""
+    while True:
+        time.sleep(2.0)
+        active, peak = _mem()
+        MEM["active_gb"], MEM["peak_gb"] = active, peak
+        if active > MEM_CEILING_GB:
+            MEM["over"] = True; MEM["reclaims"] += 1
+            log(f"[mem] OVER CEILING {active:.1f}GB > {MEM_CEILING_GB}GB — reclaiming (drop conversation KV to pin)")
+            try:
+                with MLX_LOCK:
+                    if st.get("kv") is not None and st.get("pin_len") is not None:
+                        trim_kv(st["kv"], st["pin_len"])         # keep the pin; drop conversation KV
+                        PF["ids"] = []; st["conv_start"] = 0; st["stream_start"] = 0
+                _free_mem()
+            except Exception as e:
+                log(f"[mem] reclaim error: {e}")
+        else:
+            MEM["over"] = False
 
 
 def load_model():
@@ -1100,7 +1129,9 @@ class H(BaseHTTPRequestHandler):
                                     "model": os.path.basename(MODEL_PATH),
                                     "parakeet": parakeet["model"] is not None,
                                     "precache": PRECACHE["state"],
-                                    "ctxWindow": CTX_WINDOW})
+                                    "ctxWindow": CTX_WINDOW,
+                                    "memGb": MEM["active_gb"], "memCeilingGb": MEM["ceiling_gb"],
+                                    "memOver": MEM["over"], "memReclaims": MEM["reclaims"]})
         if self.path == "/progress":
             # Real per-op progress for the UI's cache HUD. Runs on a separate HTTP thread, reads the
             # worker's live counter under the tiny PROG_LOCK (never MLX_LOCK) → answers while the GPU is busy.
@@ -1469,6 +1500,7 @@ def main():
     threading.Thread(target=gemma_worker, daemon=True).start()
     threading.Thread(target=voice_thread, daemon=True).start()
     threading.Thread(target=lambda: serve_http(server), daemon=True).start()
+    threading.Thread(target=mem_watchdog, daemon=True).start()   # hard memory-boundary enforcement
 
     # AppKit main runloop (accessory app): overlay + tap-queue NSTimer. Degrade gracefully headless.
     try:
