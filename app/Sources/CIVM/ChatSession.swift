@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Observation
 import AppKit   // NSApp / NSTextView — read & set the chat input's caret for insert-at-cursor dictation
 
 // ---------------------------------------------------------------------------
@@ -45,10 +46,10 @@ enum VoiceState: Equatable {
     }
 }
 
-@MainActor final class ChatSession: ObservableObject {
-    private let engine: Engine
-    private let store: Store
-    private var cancellables = Set<AnyCancellable>()
+@MainActor @Observable final class ChatSession {
+    @ObservationIgnored private let engine: Engine
+    @ObservationIgnored private let store: Store
+    @ObservationIgnored private var cancellables = Set<AnyCancellable>()
 
     init(engine: Engine, store: Store) {
         self.engine = engine
@@ -62,28 +63,12 @@ enum VoiceState: Equatable {
             } }.store(in: &cancellables)
 
         // ---- observe own inputs (fix A) — replaces the view's onChange relays ----
-        // engine readiness: post config once it flips ready (mirrors onChange(engine.ready){ if r }).
-        // receive(on:) defers the sink past @Published's willSet so it reads the SETTLED engine.ready
-        // (symmetry with the screen sink); the emitted `ready` it fires on — rises to true, falls to
-        // false — is unchanged.
-        engine.$ready.removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] ready in MainActor.assumeIsolated {
-                guard let self else { return }
-                if ready {
-                    if self.pinOutcome == .notReady { self.pinOutcome = .none }   // engine up → drop the stale "not ready" gate
-                    self.postVoiceConfig()
-                }
-            } }
-            .store(in: &cancellables)
-        // screen changes: post config on every enter/leave (mirrors onChange(store.screen)). dropFirst
-        // skips the initial .home emission so launch doesn't fire a stray config post. receive(on:)
-        // defers the sink past @Published's willSet so postVoiceConfig reads the SETTLED store.screen
-        // (mirrors onChange, which fires after the value lands — not the stale pre-assignment value).
-        store.$screen.dropFirst().removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in MainActor.assumeIsolated { self?.postVoiceConfig() } }
-            .store(in: &cancellables)
+        // engine/store are @Observable now (no Combine $publishers), so self-observe via
+        // withObservationTracking: onChange fires once when the tracked property changes; the deferred
+        // Task reads the SETTLED value (past the mutation), acts, then re-arms. Tracking starts AFTER
+        // init, so neither fires for its initial value (the old dropFirst / "act only on change").
+        trackReady()
+        trackScreen()
         // settings writes (SK keys, from the Settings sheet / modes bar): refresh stored copies and
         // post config; a MODE change additionally re-posts context (mirrors onChange(modeRaw)).
         NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
@@ -96,20 +81,45 @@ enum VoiceState: Equatable {
             .store(in: &cancellables)
     }
 
+    // engine readiness → post config once it flips ready. onChange fires on the willSet; the Task defers
+    // to read the settled value, then re-arms (onChange is one-shot).
+    private func trackReady() {
+        withObservationTracking { _ = engine.ready } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                if self.engine.ready {
+                    if self.pinOutcome == .notReady { self.pinOutcome = .none }   // engine up → drop the stale gate
+                    self.postVoiceConfig()
+                }
+                self.trackReady()
+            }
+        }
+    }
+    // screen changes → post config on every enter/leave. Re-arms after each change.
+    private func trackScreen() {
+        withObservationTracking { _ = store.screen } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.postVoiceConfig()
+                self.trackScreen()
+            }
+        }
+    }
+
     // ---- in-flight turn (ask pipeline) ----
-    @Published private(set) var busy = false
-    @Published private(set) var streaming = ""
+    private(set) var busy = false
+    private(set) var streaming = ""
     // per-message accounting from the last /chat done meta — explicit cache-vs-new breakdown.
-    @Published private(set) var lastReused = 0    // history tokens reused from the cross-turn KV cache
-    @Published private(set) var lastNew = 0       // tokens actually fed/processed anew this message
-    @Published private(set) var lastPinned = 0    // pinned prefix (system+context) — always reused
-    @Published private(set) var lastTtft = 0.0    // measured time-to-first-token (s), from the actual run
+    private(set) var lastReused = 0    // history tokens reused from the cross-turn KV cache
+    private(set) var lastNew = 0       // tokens actually fed/processed anew this message
+    private(set) var lastPinned = 0    // pinned prefix (system+context) — always reused
+    private(set) var lastTtft = 0.0    // measured time-to-first-token (s), from the actual run
     // composition of the anew tokens, IN forward-pass order, summing to lastNew (engine-computed).
-    @Published private(set) var anewParts: [(label: String, n: Int)] = []
-    @Published private(set) var precache = ""     // "" hidden · "working" caching next msg · "done"
-    @Published var convStart: Int? = nil          // oldest in-window message index (out-of-context boundary); nil = unknown
-    @Published var convTokens: Int? = nil         // current conversation+reminder tokens in the cache (live usage vs budget)
-    @Published var visibleCount = 30              // how many trailing messages the view renders (perf window; NOT the KV window)
+    private(set) var anewParts: [(label: String, n: Int)] = []
+    private(set) var precache = ""     // "" hidden · "working" caching next msg · "done"
+    var convStart: Int? = nil          // oldest in-window message index (out-of-context boundary); nil = unknown
+    var convTokens: Int? = nil         // current conversation+reminder tokens in the cache (live usage vs budget)
+    var visibleCount = 30              // how many trailing messages the view renders (perf window; NOT the KV window)
     func loadEarlier() { visibleCount += 30 }
     // Cache budget + resume mode are GLOBAL (read live from settings), NOT a per-chat snapshot — so
     // changing them in Settings or the ⋯ menu applies to EVERY open chat immediately (recompute on
@@ -122,19 +132,43 @@ enum VoiceState: Equatable {
     private var askTask: Task<Void, Never>? = nil
 
     // ---- pin / cache ----
-    @Published private(set) var caching = false
-    @Published private(set) var cacheProgress: Double = 0   // client-side estimated cache progress (0…1), 0 = hidden
+    private(set) var caching = false
+    // Live cache progress — REAL, polled from the engine's /progress (replaces the old estimated 12.5Hz
+    // ticker that beachballed the whole tree). Read ONLY inside the isolated CacheHUD/CacheProgressBar
+    // leaf views, so ticks never invalidate the message list or the context pane.
+    private(set) var progOp = "idle"      // idle|pin|reconcile|precache|generate
+    private(set) var progStage = ""       // encode|prefill|replay|feed|decode
+    private(set) var progFrac = 0.0       // 0 = indeterminate (decode); else done/total
+    private(set) var progDone = 0
+    private(set) var progTotal = 0
+    private(set) var progLabel = ""
+    var progBusy: Bool { progOp != "idle" }
+    // Poll the engine's real progress ~8Hz into the fields above (deduped so idle never invalidates).
+    func pollProgress() async {
+        while !Task.isCancelled {
+            if !engine.ready { try? await Task.sleep(for: .milliseconds(400)); continue }
+            if let s = await engine.progress() {
+                if progOp    != s.op    { progOp = s.op }
+                if progStage != s.stage { progStage = s.stage }
+                if progFrac  != s.frac  { progFrac = s.frac }
+                if progDone  != s.done  { progDone = s.done }
+                if progTotal != s.total { progTotal = s.total }
+                if progLabel != s.label { progLabel = s.label }
+            }
+            try? await Task.sleep(for: .milliseconds(120))
+        }
+    }
     // sticky outcome of the last pin attempt (cleared when a fresh non-empty pin starts) — supersedes
     // the old free-form cacheMsg string; CacheState is composed from it plus the derived flags.
     private enum PinOutcome: Equatable { case none, notReady, overLimit(Int), failed(String) }
-    @Published private var pinOutcome: PinOutcome = .none
+    private var pinOutcome: PinOutcome = .none
 
     // ---- compose buffer + capture staging (fix E — intent methods mutate; views only read) ----
-    @Published var input = ""                             // typed chat input (bound two-way to the TextField)
-    @Published private(set) var pastedImages: [Block] = []   // chat-input pasted images (thumbnail bar → ride with the question)
+    var input = ""                             // typed chat input (bound two-way to the TextField)
+    private(set) var pastedImages: [Block] = []   // chat-input pasted images (thumbnail bar → ride with the question)
 
     // ---- hybrid dictation: the field locks while talking; the transcript lands at the caret ----
-    @Published private(set) var dictating = false         // a dictation is live → the input field is uneditable
+    private(set) var dictating = false         // a dictation is live → the input field is uneditable
     private var dictCaret = 0                              // UTF-16 caret offset captured at dictation start (field is
                                                           // locked while dictating, so it can't move → valid at insert)
     private var dictWasAlone = false                      // input box was empty at dictation start (drives .ifAlone auto-send)
@@ -143,11 +177,11 @@ enum VoiceState: Equatable {
     // ---- keyboard navigation (Slack-like): arrow through AGENT messages, act with s/c/r ----
     // selectedMessageID and input focus are MUTUALLY EXCLUSIVE (one owns keyboard focus at a time):
     // selecting a message defocuses the input; focusing the input clears the selection.
-    @Published var selectedMessageID: UUID? = nil        // the highlighted agent message (nil = none)
-    @Published var sourceShownIDs: Set<UUID> = []        // agent messages flipped to raw-markdown source view
-    @Published private(set) var inputFocusToken = 0      // bump → the view moves keyboard focus to the input
+    var selectedMessageID: UUID? = nil        // the highlighted agent message (nil = none)
+    var sourceShownIDs: Set<UUID> = []        // agent messages flipped to raw-markdown source view
+    private(set) var inputFocusToken = 0      // bump → the view moves keyboard focus to the input
     var inputIsFocused = false                           // mirrored from the view's @FocusState (read by the key monitor)
-    @Published private(set) var justCopied = false       // brief "Copied" toast after any copy action
+    private(set) var justCopied = false       // brief "Copied" toast after any copy action
     private var copyFlashTask: Task<Void, Never>? = nil
 
     func flashCopied() {
@@ -186,9 +220,9 @@ enum VoiceState: Equatable {
     }
 
     // ---- Voice·Text live state (from GET /voice/poll) ----
-    @Published private(set) var voiceState: VoiceState = .idle
-    @Published private(set) var livePartial = ""
-    @Published private(set) var preSent = 0        // tokens prefilled into Gemma so far this utterance (live)
+    private(set) var voiceState: VoiceState = .idle
+    private(set) var livePartial = ""
+    private(set) var preSent = 0        // tokens prefilled into Gemma so far this utterance (live)
     private var voiceSeq = -1
 
     // ---- Apple SpeechTranscriber (streaming submode; on-device, Swift-side). Python drives the
@@ -243,11 +277,6 @@ enum VoiceState: Equatable {
     }
     // disable a bit below the real 200K ceiling to leave slack for estimate error (engine overLimit is the backstop)
     var estOverLimit: Bool { estTokens > 190_000 }
-    // rough expected cache time (s) for the estimated progress bar — no engine progress endpoint
-    private var expectedCacheSeconds: Double {
-        let images = cacheBlocks.filter { $0.type == "image" }.count
-        return Double(estTokens) / 350.0 + Double(images) * 0.7 + 3.0
-    }
 
     // ---- enablement predicates the buttons bind to (fix E) — exactly today's disable expressions ----
     var canCache: Bool { !caching && engine.ready && !cachedCurrent && !contentEmpty && !estOverLimit }
@@ -283,18 +312,9 @@ enum VoiceState: Equatable {
             store.enginePinnedChat = id; store.enginePinnedHash = hash
             return
         }
-        caching = true; pinOutcome = .none; cacheProgress = 0
-        // estimated progress: fill toward 0.97 over the expected duration while caching (no engine endpoint)
-        let start = Date(); let expected = max(0.5, expectedCacheSeconds)
-        let ticker = Task { [self] in
-            while !Task.isCancelled && caching {
-                let v = min(Date().timeIntervalSince(start) / expected, 0.97)
-                if v != cacheProgress { cacheProgress = v }   // skip identical writes (no 12.5Hz invalidation once clamped at 0.97)
-                try? await Task.sleep(for: .milliseconds(80))
-            }
-        }
-        let sys = nonEmpty(store.chat.system), ctx = nonEmpty(store.chat.context)
-        do {
+        caching = true; pinOutcome = .none        // caching is a low-freq bool for cacheState; the LIVE
+        let sys = nonEmpty(store.chat.system), ctx = nonEmpty(store.chat.context)   // progress bar reads the
+        do {                                       // real /progress poll (progFrac), not a fake ticker.
             let (tokens, over) = try await engine.pin(system: sys, context: ctx)
             if over { pinOutcome = .overLimit(tokens); store.chat.pinnedTokens = nil }
             else {
@@ -304,13 +324,6 @@ enum VoiceState: Equatable {
             }
         } catch { pinOutcome = .failed(error.localizedDescription) }
         caching = false
-        ticker.cancel()
-        if pinOutcome == .none {                     // success → snap full briefly, then hide
-            cacheProgress = 1.0
-            Task { [self] in try? await Task.sleep(for: .milliseconds(350)); if !caching { cacheProgress = 0 } }
-        } else {
-            cacheProgress = 0
-        }
     }
 
     // Typed input → AskPipeline. Fires an interruption when busy, a normal ask otherwise.

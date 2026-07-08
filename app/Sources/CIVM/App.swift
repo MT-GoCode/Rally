@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Combine
+import Observation
 import UniformTypeIdentifiers
 import AVFoundation
 import ApplicationServices
@@ -152,19 +153,19 @@ func nonEmpty(_ blocks: [Block]) -> [Block] {
     blocks.filter { $0.type == "image" || !($0.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 }
 
-@MainActor final class Store: ObservableObject {
+@MainActor @Observable final class Store {
     enum Screen { case home, chat }
     // How the current chat was activated — the session listens on `activated` and reacts once per
     // activation (opened → re-pin; created/seeded → no pin), keeping today's per-path behavior.
     enum Activation { case opened, created, seeded }
     let activated = PassthroughSubject<Activation, Never>()
-    @Published var screen: Screen = .home
-    @Published var chat = Chat()
-    @Published var stubs: [ChatStub] = []
-    @Published var loadingChat = false        // decoding a chat off-main → UI shows a spinner, never freezes
+    var screen: Screen = .home
+    var chat = Chat()
+    var stubs: [ChatStub] = []
+    var loadingChat = false        // decoding a chat off-main → UI shows a spinner, never freezes
     // what the engine's ONE global KV currently holds (chat + content version)
-    @Published var enginePinnedChat: UUID? = nil
-    @Published var enginePinnedHash: Int? = nil
+    var enginePinnedChat: UUID? = nil
+    var enginePinnedHash: Int? = nil
 
     private var dir: URL {
         let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -288,7 +289,7 @@ struct ChatRow: View {
 
 // Non-publishing dependency container: holds the app's long-lived objects so the App scene can
 // own them via a SINGLE @StateObject without re-rendering per token/keystroke/tick. It has NO
-// @Published members, so it never fires objectWillChange; the three runtimes are still observed by
+// members, so it never fires objectWillChange; the three runtimes are still observed by
 // the views that need them, injected below via environmentObject.
 @MainActor final class AppDeps: ObservableObject {
     let engine: Engine
@@ -326,7 +327,7 @@ struct ChatRow: View {
                             .foregroundStyle(.secondary).multilineTextAlignment(.center)
                     }.padding(40).frame(minWidth: 460, minHeight: 240)
                 } else {
-                    RootView().environmentObject(deps.engine).environmentObject(deps.store).environmentObject(deps.promptLib).environmentObject(deps.session)
+                    RootView().environment(deps.engine).environment(deps.store).environment(deps.promptLib).environment(deps.session)
                         .onAppear {
                             deps.engine.start()
                             if !UserDefaults.standard.bool(forKey: "permsRequested") {
@@ -452,10 +453,10 @@ struct BlockStream: View {
 }
 
 struct RootView: View {
-    @EnvironmentObject var engine: Engine
-    @EnvironmentObject var store: Store
-    @EnvironmentObject var promptLib: PromptLib
-    @EnvironmentObject var session: ChatSession   // conversation runtime — all behavior lives here
+    @Environment(Engine.self) var engine
+    @Environment(Store.self) var store
+    @Environment(PromptLib.self) var promptLib
+    @Environment(ChatSession.self) var session    // conversation runtime — all behavior lives here (@Observable)
     @AppStorage(SK.sidebarCollapsed) private var sidebarCollapsed = false
     @State private var lastSidebarW: CGFloat = 0   // direction tracking for auto-collapse (shrink-only)
     @State private var saveTarget: SaveTarget? = nil     // chat sidebar "Save current as…" sheet
@@ -493,18 +494,6 @@ struct RootView: View {
     var reminderDirty: Bool { reminderDraft != store.chat.reminder }
 
     // ---- cache status / estimate wording (the view owns the strings; the session owns the state) ----
-    var cacheStatusText: String {
-        switch session.cacheState {
-        case .idle:                return "not cached"
-        case .nothingToCache:      return "nothing to cache — just ask"
-        case .caching:             return "caching…"
-        case .cached(let t):       return "cached ✓ · \(t) tok"
-        case .changed:             return "cache changed"
-        case .overLimit(let t):    return "context is \(t) tok — over the 200K limit"
-        case .failed(let m):       return "cache failed: \(m)"
-        case .notReady:            return "engine not ready yet"
-        }
-    }
     var cacheStatusIsError: Bool {
         switch session.cacheState { case .overLimit, .failed: return true; default: return false }
     }
@@ -566,7 +555,7 @@ struct RootView: View {
         Group {
             if store.screen == .home { homeBody } else { chatBody }
         }
-        .sheet(isPresented: $showSettings) { SettingsView().environmentObject(promptLib) }
+        .sheet(isPresented: $showSettings) { SettingsView().environment(promptLib) }
         // Voice-config lifecycle (launch, engine-ready, entering/leaving a chat, settings changes) is
         // owned by the session itself — it subscribes to engine.ready / store.screen / the SK keys and
         // re-posts /voice/config on its own. No view-side relays remain.
@@ -649,6 +638,7 @@ struct RootView: View {
         // are the session's own subscriptions now; the view only tracks its own draft/edit state.
         .onAppear { reminderDraft = store.chat.reminder }
         .task { await session.pollLoop() }
+        .task { await session.pollProgress() }        // real cache-progress poll (drives the isolated HUD)
         .onChange(of: store.chat.id) { _, _ in
             reminderDraft = store.chat.reminder
             editingChatName = false
@@ -657,7 +647,8 @@ struct RootView: View {
 
     // ---------- left: collapsible SYSTEM / CONTEXT / REMINDER panes (share height) ----------
     var sidebar: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        @Bindable var store = store   // @Observable → local bindable shadow for $store.chat.* pane bindings
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Button { sidebarCollapsed = true } label: {
                     Image(systemName: "sidebar.left")
@@ -673,8 +664,8 @@ struct RootView: View {
             HStack(spacing: 8) {
                 Button(session.caching ? "Caching…" : "Cache") { session.cache() }
                     .disabled(!session.canCache)
-                if session.caching || session.cacheProgress > 0 { cacheProgressBar }
-                Text(cacheStatusText).font(.caption).foregroundStyle(cacheStatusIsError ? .red : .secondary)
+                if session.progBusy { CacheProgressBar(session: session) }
+                Text(cacheStatusText(session.cacheState)).font(.caption).foregroundStyle(cacheStatusIsError ? .red : .secondary)
                 Spacer()
             }
             HStack(spacing: 6) {
@@ -733,14 +724,6 @@ struct RootView: View {
         editingChatName = false
     }
 
-    // Minimal estimated cache-progress bar: a thin filling capsule (no percentage text).
-    var cacheProgressBar: some View {
-        ZStack(alignment: .leading) {
-            Capsule().fill(Color.secondary.opacity(0.20)).frame(width: 120, height: 4)
-            Capsule().fill(Color.accentColor).frame(width: 120 * max(0, min(session.cacheProgress, 1)), height: 4)
-        }.frame(width: 120, height: 4)
-    }
-
     // SYSTEM pane header menu — load a saved system prompt (replaces chat.system with a copy) or save the current one.
     var systemPromptMenu: some View {
         Menu("Load") {
@@ -774,7 +757,7 @@ struct RootView: View {
                 inputOutputBar
             }
             Divider()
-            cacheHUD                                // always-visible background-cache pipeline status
+            CacheHUDView(session: session, engine: engine, store: store)   // isolated: progress ticks re-render only this
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 14) {
@@ -792,14 +775,17 @@ struct RootView: View {
                             if let cs = session.convStart, cs == idx, cs > 0 { contextBoundaryLine }
                             messageBubble(id: m.id, role: m.role, text: m.text, interrupted: m.interrupted, isInterruption: m.isInterruption, images: m.content)
                         }
-                        if session.busy { messageBubble(role: "assistant", text: session.streaming.isEmpty ? "…" : session.streaming) }
+                        // Streaming bubble is its OWN leaf: it reads session.streaming (+ follow-scroll)
+                        // internally, so a per-token update never re-evaluates this message list.
+                        StreamingBubble(session: session, onGrow: { scrollDown(proxy, animated: false) }) {
+                            messageBubble(role: "assistant", text: $0)
+                        }
                         Color.clear.frame(height: 1).id(chatBottomID)      // stable bottom anchor for auto-scroll
                     }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onAppear { scrollDown(proxy, animated: false) }
                 .onChange(of: store.chat.id) { _, _ in scrollDown(proxy, animated: false) }
                 .onChange(of: store.chat.messages.count) { _, _ in scrollDown(proxy) }
-                .onChange(of: session.streaming.count / 40) { _, _ in scrollDown(proxy, animated: false) }   // throttle: ~every 40 streamed chars
                 .onChange(of: session.selectedMessageID) { _, id in   // keep the keyboard-selected reply on screen
                     if let id { withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) } }
                 }
@@ -837,51 +823,8 @@ struct RootView: View {
         }
     }
 
-    // Bottom-right status: the engine warming the KV for the next message after each reply.
-    // Prominent, ALWAYS-VISIBLE status of the whole background cache pipeline: engine load → context pin
-    // (with progress) → conversation-cache warm/reconcile → ready. Decoupled from the work itself — it
-    // only reads @Published state, so it stays live even while the engine is busy.
-    var cacheHUD: some View {
-        let st = cacheHUDStage
-        return HStack(spacing: 8) {
-            if st.busy { ProgressView().controlSize(.mini).scaleEffect(0.8) }
-            else { Image(systemName: st.icon).font(.system(size: 11)).foregroundStyle(st.color) }
-            Text(st.text).font(.caption2.weight(.medium)).foregroundStyle(.secondary)
-            if session.caching || session.cacheProgress > 0 { cacheProgressBar }
-            Spacer(minLength: 8)
-            // Live conversation-cache usage vs budget — always visible so the current behavior is obvious.
-            if let ct = session.convTokens {
-                let trig = session.trimTrigger
-                HStack(spacing: 4) {
-                    Image(systemName: "gauge.with.dots.needle.33percent").font(.system(size: 9))
-                    Text("\(ct)/\(trig) tok").font(.system(size: 9, weight: .medium))
-                    if let cvs = session.convStart, cvs > 0 {
-                        Text("· \(cvs) dropped").font(.system(size: 9)).foregroundStyle(.orange)
-                    }
-                }.foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 5)
-        .background(st.busy ? Color.accentColor.opacity(0.06) : Color.clear)
-        .overlay(alignment: .bottom) { Divider() }
-        .animation(.easeInOut(duration: 0.2), value: st.text)
-    }
-    // (icon, text, busy, color) for the current pipeline stage — ordered by precedence.
-    var cacheHUDStage: (icon: String, text: String, busy: Bool, color: Color) {
-        if !engine.ready                { return ("hourglass", engine.status, true, .secondary) }
-        if store.loadingChat            { return ("hourglass", "loading chat…", true, .secondary) }
-        if session.caching              { return ("externaldrive.badge.plus", "caching context (system + reference)…", true, .accentColor) }
-        if session.precache == "working"{ return ("arrow.triangle.2.circlepath", "warming conversation cache…", true, .accentColor) }
-        if session.busy                 { return ("bubble.left.and.text.bubble.right", "generating…", true, .accentColor) }
-        if session.precache == "done"   { return ("checkmark.seal.fill", "cache ready", false, .green) }
-        switch session.cacheState {
-        case .overLimit, .failed:       return ("exclamationmark.triangle.fill", cacheStatusText, false, .red)
-        case .cached(let t):            return ("checkmark.seal.fill", "cached ✓ · \(t) tok context", false, .green)
-        case .changed:                  return ("pencil.circle", "context changed — re-cache to apply", false, .orange)
-        case .nothingToCache:           return ("checkmark.seal", "ready — just ask", false, .secondary)
-        default:                        return ("circle", cacheStatusText, false, .secondary)
-        }
-    }
+    // (cache pipeline HUD + progress bar moved to CacheUI.swift as isolated leaf views — CacheHUDView /
+    // CacheProgressBar — so their real-time progress updates never re-evaluate this monolithic RootView.)
 
     // Boundary between turns that are OUT of the conversation cache (above) and in-context (below).
     // Position is engine-determined (session.convStart); hidden until known (nil on a fresh open).
@@ -1052,7 +995,8 @@ struct RootView: View {
 
     // ---- input region (ONE hybrid box: type, or dictate at the caret when voice is armed) ----
     var inputRegion: some View {
-        VStack(spacing: 6) {
+        @Bindable var session = session   // @Observable → local bindable shadow for $session.input
+        return VStack(spacing: 6) {
             if !session.pastedImages.isEmpty { thumbnailBar }
             // Voice adornments: status dot + (while dictating) the live streaming partial preview.
             if cs.voiceInput {

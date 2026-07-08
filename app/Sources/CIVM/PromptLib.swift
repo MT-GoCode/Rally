@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import Observation
 
 // ---------------------------------------------------------------------------
 // Prompt library — reusable SYSTEM prompts and REMINDERs, each an ordered
@@ -17,8 +18,8 @@ struct SavedPrompt: Codable, Identifiable {
 // which pane's "Save current as…" sheet is open (drives the chat-sidebar save flow)
 enum SaveTarget: String, Identifiable { case system, reminder; var id: String { rawValue } }
 
-@MainActor final class PromptLib: ObservableObject {
-    @Published var prompts: [SavedPrompt] = []
+@MainActor @Observable final class PromptLib {
+    var prompts: [SavedPrompt] = []
 
     private var dir: URL {
         let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -48,7 +49,7 @@ enum SaveTarget: String, Identifiable { case system, reminder; var id: String { 
 
 // ---- HOME: "PROMPT LIBRARY" section (segmented System / Reminders filter) ----
 struct PromptLibrarySection: View {
-    @EnvironmentObject var lib: PromptLib
+    @Environment(PromptLib.self) var lib
     @State private var kind = "system"
     @State private var editing: SavedPrompt? = nil     // non-nil → editor sheet (new or existing)
 

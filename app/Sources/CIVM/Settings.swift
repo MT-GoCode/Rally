@@ -283,7 +283,7 @@ func bindingSymbols(_ s: String) -> String {
 // ---- Settings sheet (opened from the gear on BOTH home and chat) — one section per mode ----
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject var promptLib: PromptLib
+    @Environment(PromptLib.self) var promptLib
     @AppStorage(SK.submode) private var submodeRaw = SK.defaultSubmode
     @AppStorage(SK.transcription) private var transcriptionRaw = Transcription.after.rawValue
     @AppStorage(SK.hotkey) private var hotkey = SK.defaultHotkey

@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 // Content block — the interro-verbatim stream shape (text | base64 image).
 struct Block: Codable, Identifiable, Equatable, Sendable {
@@ -47,11 +48,11 @@ enum Model {
     static let weightsGB = 16.0
 }
 
-@MainActor final class Engine: ObservableObject {
-    @Published var status = "starting…"     // human-readable engine state
-    @Published var ready = false
-    @Published var parakeet = false          // ASR model loaded (from /health.parakeet)
-    private var proc: Process?
+@MainActor @Observable final class Engine {
+    var status = "starting…"     // human-readable engine state
+    var ready = false
+    var parakeet = false          // ASR model loaded (from /health.parakeet)
+    @ObservationIgnored private var proc: Process?
     private let port = 5177
     private var base: String { "http://127.0.0.1:\(port)" }
     private let root = FileManager.default.homeDirectoryForCurrentUser
@@ -91,6 +92,13 @@ enum Model {
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
               let cs = j["conv_start"] as? Int else { return nil }
         return (cs, j["conv_tokens"] as? Int ?? 0)   // both, so the HUD gauge populates on open (not just after a send)
+    }
+
+    // GET /progress — real per-op progress (pin encode/prefill, reconcile replay, generate decode).
+    struct ProgressSnapshot: Decodable { var op = "idle"; var stage = ""; var frac = 0.0; var done = 0; var total = 0; var label = "" }
+    func progress() async -> ProgressSnapshot? {
+        guard let d = try? await get("/progress") else { return nil }
+        return try? JSONDecoder().decode(ProgressSnapshot.self, from: d)
     }
 
     // Read the engine's post-response precache state ("idle"|"working"|"done") from /health.
