@@ -119,8 +119,25 @@ enum VoiceState: Equatable {
     private(set) var precache = ""     // "" hidden · "working" caching next msg · "done"
     var convStart: Int? = nil          // oldest in-window message index (out-of-context boundary); nil = unknown
     var convTokens: Int? = nil         // current conversation+reminder tokens in the cache (live usage vs budget)
-    var visibleCount = 30              // how many trailing messages the view renders (perf window; NOT the KV window)
-    func loadEarlier() { visibleCount += 30 }
+    // How many trailing messages the view renders NOW. Grows progressively (startReveal) so a big chat's
+    // markdown never lays out all at once — Textual's per-bubble CoreText layout on the main thread pegged
+    // it ~10s. Small batches + a breather between them keep the app responsive the whole time.
+    private(set) var visibleCount = 5
+    @ObservationIgnored private var revealTask: Task<Void, Never>? = nil
+    func loadEarlier() { visibleCount = min(visibleCount + 12, store.chat.messages.count) }
+    // Widen the render window a few messages at a time, yielding between batches so the runloop always
+    // services events (no sustained main-thread block → no beachball, regardless of chat size).
+    private func startReveal() {
+        revealTask?.cancel()
+        visibleCount = min(5, store.chat.messages.count)
+        revealTask = Task { [weak self] in
+            while let self, !Task.isCancelled, visibleCount < store.chat.messages.count {
+                try? await Task.sleep(for: .milliseconds(140))    // breather: lets the main thread breathe
+                if Task.isCancelled { return }
+                visibleCount = min(visibleCount + 4, store.chat.messages.count)
+            }
+        }
+    }
     // Cache budget + resume mode are GLOBAL (read live from settings), NOT a per-chat snapshot — so
     // changing them in Settings or the ⋯ menu applies to EVERY open chat immediately (recompute on
     // change and on chat visit). This is why an old chat now trims to the current budget on open.
@@ -485,7 +502,7 @@ enum VoiceState: Equatable {
         if dictating { endDictation() }                   // don't carry a locked field / muted audio across chats
         selectedMessageID = nil; sourceShownIDs = []      // nav highlight + source toggles are per-chat
         convStart = nil; convTokens = nil                 // boundary + usage unknown until this chat's cache reports
-        visibleCount = 30                                  // reset the view render-window (perf) for the new chat
+        revealTask?.cancel(); visibleCount = 5             // reset the progressive render-window for the new chat
     }
 
     // Single chat-activation path (fix A). Fires once per open / new / seed, AFTER store.chat settled.
@@ -502,6 +519,7 @@ enum VoiceState: Equatable {
                 self?.reconcileCache()
             }
         }
+        startReveal()                               // progressively widen the render window (no open-time freeze)
         postVoiceConfig()                           // the new chat may have different voice settings → re-arm hotkeys
     }
 
