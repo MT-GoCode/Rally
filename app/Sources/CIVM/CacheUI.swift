@@ -71,15 +71,18 @@ struct CacheHUDView: View {
             if let ct = session.convTokens {              // live conversation-cache usage vs budget
                 HStack(spacing: 4) {
                     Image(systemName: "gauge.with.dots.needle.33percent").font(.system(size: 9))
-                    Text("\(ct)/\(session.trimTrigger) tok").font(.system(size: 9, weight: .medium))
+                    Text("context \(ct)/\(session.trimTrigger) tok").font(.system(size: 9, weight: .medium))
                     if let cvs = session.convStart, cvs > 0 { Text("· \(cvs) dropped").font(.system(size: 9)).foregroundStyle(.orange) }
                 }.foregroundStyle(.secondary)
+                .help("Conversation held live in the model's cache: \(ct) of your \(session.trimTrigger)-token budget. Turns beyond the budget fall out of context"
+                      + ((session.convStart ?? 0) > 0 ? " — \(session.convStart!) older messages have dropped so far." : "."))
             }
             if engine.memGb > 0 {                          // the memory watcher: live engine mem vs the hard ceiling
                 HStack(spacing: 3) {
                     Image(systemName: engine.memOver ? "exclamationmark.triangle.fill" : "memorychip").font(.system(size: 9))
-                    Text(String(format: "%.1f/%.0f GB", engine.memGb, engine.memCeilingGb)).font(.system(size: 9, weight: .medium))
+                    Text(String(format: "engine %.1f/%.0f GB", engine.memGb, engine.memCeilingGb)).font(.system(size: 9, weight: .medium))
                 }.foregroundStyle(engine.memOver ? .red : (engine.memGb > engine.memCeilingGb * 0.85 ? .orange : .secondary))
+                .help("Engine memory vs the \(Int(engine.memCeilingGb)) GB safety ceiling. As it nears the ceiling, the engine trims the conversation cache to stay under it.")
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 5)

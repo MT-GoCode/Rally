@@ -764,8 +764,7 @@ struct RootView: View {
             // it owns all conversation keyboard handling in JS. No SwiftUI keyMonitor → no double-handling.
             ChatWebView(session: session,
                         messagesJSON: conversationJSON(store.chat.messages),
-                        convStart: session.convStart ?? -1,
-                        streamingText: session.streaming, isBusy: session.busy)
+                        convStart: session.convStart ?? -1)
                 .id(store.chat.id)
                 .overlay(alignment: .bottomTrailing) { precacheChip.padding(10) }
             Divider()

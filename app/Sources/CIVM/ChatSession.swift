@@ -400,7 +400,10 @@ enum VoiceState: Equatable {
             let s = store.chat.settings
             let meta = try await engine.chat(messages: buildEngineMessages(), reminder: store.chat.reminder,
                                               reminderMode: s.reminderMode, trimTrigger: trimTrigger,
-                                              trimTarget: trimTarget, recacheMode: recacheMode) { self.streaming += $0 }
+                                              trimTarget: trimTarget, recacheMode: recacheMode) {
+                self.streaming += $0
+                self.web?.streamSet(self.streaming)   // push each token straight to the WebView (SwiftUI coalesces → jumpy)
+            }
             if Task.isCancelled {               // interrupted right as the stream ended
                 stashInterrupted(); return
             }

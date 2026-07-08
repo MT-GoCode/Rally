@@ -99,7 +99,7 @@ function render(msgs, convStart){
   const stick = atBottom();
   if (msgs!==undefined) MSGS = msgs;
   if (convStart!==undefined) CONV_START = convStart;
-  messagesEl.innerHTML = "";
+  messagesEl.innerHTML = ""; streamEl = null;   // committed render replaces any live streaming bubble
   MSGS.forEach((m,i)=>{
     if (CONV_START>0 && i===CONV_START){ const dv=document.createElement("div"); dv.className="divider"; dv.textContent="earlier turns are out of context"; messagesEl.appendChild(dv); }
     const row=document.createElement("div");
@@ -128,10 +128,13 @@ function render(msgs, convStart){
 document.addEventListener("click", ()=>document.querySelectorAll(".menu.open").forEach(x=>x.classList.remove("open")));
 
 // ---- streaming (live reply, not re-rendering the whole list) ----
-function setStream(text){ const stick=atBottom();
-  if(!streamEl){ const row=document.createElement("div"); row.className="row assistant"; const bub=document.createElement("div"); bub.className="bubble"; streamEl=document.createElement("div"); bub.appendChild(streamEl); row.appendChild(bub); messagesEl.appendChild(row); }
-  renderBody(streamEl, text||"…"); if(stick) toBottom(); }
-function endStream(){ if(streamEl){ streamEl.closest(".row")?.remove(); streamEl=null; } }
+let pendingStream=null, streamRAF=0;
+function setStream(text){ pendingStream=(text||"…");
+  if(streamRAF) return;                              // coalesce rapid per-token pushes to one render/frame
+  streamRAF=requestAnimationFrame(()=>{ streamRAF=0; const stick=atBottom();
+    if(!streamEl){ const row=document.createElement("div"); row.className="row assistant"; const bub=document.createElement("div"); bub.className="bubble"; streamEl=document.createElement("div"); bub.appendChild(streamEl); row.appendChild(bub); messagesEl.appendChild(row); }
+    renderBody(streamEl, pendingStream); if(stick) toBottom(); }); }
+function endStream(){ if(streamRAF){ cancelAnimationFrame(streamRAF); streamRAF=0; } if(streamEl){ streamEl.closest(".row")?.remove(); streamEl=null; } }
 
 // ---- selection / keyboard nav (seamless composer <-> messages) ----
 function setSel(i){ SEL=i; render(); const rows=messagesEl.querySelectorAll(".row"); if(i>=0&&rows[i]) rows[i].scrollIntoView({block:"center"}); }

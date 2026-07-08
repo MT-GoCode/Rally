@@ -16,6 +16,8 @@ import WebKit
     func setComposer(_ t: String)
     func submitComposer()
     func setThumbs(_ dataURIs: [String])
+    func streamSet(_ text: String)   // live reply text (pushed per-token, direct → smooth streaming)
+    func streamEnd()                 // reply committed → remove the live bubble
 }
 
 // [{id,role,text,images:[dataURI],interrupted,isInterruption}] for the web page to render.
@@ -42,8 +44,6 @@ struct ChatWebView: NSViewRepresentable {
     let session: ChatSession
     let messagesJSON: String
     let convStart: Int
-    var streamingText: String = ""
-    var isBusy: Bool = false
 
     func makeNSView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
@@ -62,7 +62,6 @@ struct ChatWebView: NSViewRepresentable {
 
     func updateNSView(_ wv: WKWebView, context: Context) {
         context.coordinator.render(messagesJSON, convStart)
-        context.coordinator.stream(isBusy ? streamingText : nil)
     }
 
     static func dismantleNSView(_ wv: WKWebView, coordinator: Coordinator) {
@@ -85,11 +84,8 @@ struct ChatWebView: NSViewRepresentable {
             last = (json, convStart)
             runJS("window.rally.render(\(json), \(convStart))")
         }
-        func stream(_ text: String?) {
-            if text == lastStream { return }
-            lastStream = text
-            if let t = text { runJS("window.rally.setStream(\(jsonStr(t)))") } else { runJS("window.rally.endStream()") }
-        }
+        func streamSet(_ text: String) { lastStream = text; runJS("window.rally.setStream(\(jsonStr(text)))") }
+        func streamEnd() { lastStream = nil; runJS("window.rally.endStream()") }
         func insertText(_ t: String)  { runJS("window.rally.insertText(\(jsonStr(t)))") }
         func focusComposer()          { runJS("window.rally.focusComposer()") }
         func setComposer(_ t: String) { runJS("window.rally.setComposer(\(jsonStr(t)))") }
