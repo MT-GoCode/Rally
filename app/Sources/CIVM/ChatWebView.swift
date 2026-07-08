@@ -77,7 +77,7 @@ struct ChatWebView: NSViewRepresentable {
         private var loaded = false
         private var pending: (String, Int)?
         private var last: (String, Int)?
-        private var lastStream: String? = ""
+        private var lastStream: String? = nil   // nil = no live stream (was "" → didFinish pushed setStream("") → a phantom "…" bubble on open)
 
         // ---- Swift → JS ----
         func render(_ json: String, _ convStart: Int) {
