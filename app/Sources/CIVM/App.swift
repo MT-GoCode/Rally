@@ -766,7 +766,8 @@ struct RootView: View {
                         messagesJSON: conversationJSON(store.chat.messages),
                         convStart: session.convStart ?? -1)
                 .id(store.chat.id)
-                .overlay(alignment: .bottomTrailing) { precacheChip.padding(10) }
+                // (No bottom "caching…" chip — the top cache HUD is the single status line; a second
+                //  indicator on the same `precache` flag just read as "two loaders for the same thing".)
             Divider()
             chatMetaBar.padding(.horizontal, 12).padding(.vertical, 6)   // token counts + reminder — OUTSIDE the WebView
         }

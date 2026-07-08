@@ -838,13 +838,19 @@ def _do_reconcile(job):
         trigger = int(job.params.get("trigger") or 0); target = int(job.params.get("target") or 0)
         recache = job.params.get("recache") or "recent"
         pin_len = st["pin_len"]
-        if recache == "streaming" and trigger > 0 and messages:
-            conv_start = _stream_replay(messages, reminder, mode, trigger, target)   # rebuild the smear
+        # STREAMING mode only needs the expensive turn-by-turn replay (to rebuild the SMEAR of dropped
+        # turns) when turns are ACTUALLY dropped. If the whole conversation fits under the trigger nothing
+        # drops → no smear → a single-pass prefill produces the identical KV, far faster. (This is why a
+        # large budget on a short chat was spending a minute replaying ~20 turns one forward pass at a time
+        # for no reason.) recent mode never replays.
+        cs0 = _window_start(messages, reminder, mode, 0, trigger, target) if (trigger > 0 and messages) else 0
+        if recache == "streaming" and cs0 > 0:
+            conv_start = _stream_replay(messages, reminder, mode, trigger, target)   # dropping → rebuild the smear
         else:
             with MLX_LOCK:
                 trim_kv(st["kv"], pin_len)
             PF["ids"] = []; st["stream_start"] = 0
-            conv_start = _window_start(messages, reminder, mode, 0, trigger, target)
+            conv_start = cs0                                    # recent, or streaming w/ nothing to drop → single prefill below
         st["conv_start"] = conv_start; st["stream_start"] = conv_start
         # warm the precache target for the NEXT message on top of the rebuilt window (reminder-aware)
         tgt_ids, pv = _precache_target(messages[conv_start:], reminder, mode) if messages else ([], None)
