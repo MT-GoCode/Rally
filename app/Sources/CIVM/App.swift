@@ -634,9 +634,14 @@ struct RootView: View {
         .onAppear { reminderDraft = store.chat.reminder }
         .task { await session.pollLoop() }
         .task { await session.pollProgress() }        // real cache-progress poll (drives the isolated HUD)
-        .onChange(of: store.chat.id) { _, _ in
+        .onChange(of: store.chat.id, initial: true) { _, _ in
             reminderDraft = store.chat.reminder
             editingChatName = false
+            // Collapse content-heavy SYSTEM/CONTEXT panes on open so their (image-heavy) BlockStream isn't
+            // rendered/decoded while you're chatting — pane() only builds BlockStream when open. Empty panes
+            // stay open for editing. One click expands. (Keeps the open path free of the 34-image decode.)
+            systemOpen  = nonEmpty(store.chat.system).isEmpty
+            contextOpen = nonEmpty(store.chat.context).isEmpty
         }
     }
 
