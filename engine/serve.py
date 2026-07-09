@@ -1269,8 +1269,11 @@ class H(BaseHTTPRequestHandler):
                 # state machines are unchanged. kind: chord_down|chord_up|cancel|shot|copy.
                 d = self._body()
                 kind = d.get("kind", "")
-                if kind == "chord_down": TAP_Q.put("chord_down")
-                elif kind == "chord_up": TAP_Q.put("chord_up")
+                # Gate the DICTATION chord on voiceEnabled: in Karabiner mode the app can't unregister the
+                # hook, so the CLI keeps firing chord_down even with this chat's voice OFF — without this it
+                # would start a real listening session (mic + red overlay). Capture (shot/copy) is separate.
+                if kind == "chord_down": (TAP_Q.put("chord_down") if VOICE["enabled"] else None)
+                elif kind == "chord_up": (TAP_Q.put("chord_up") if VOICE["enabled"] else None)
                 elif kind == "cancel":   TAP_Q.put("esc")
                 elif kind == "shot":     TAP_Q.put(("shot_down", float(d.get("x", 0)), float(d.get("y", 0))))
                 elif kind == "shot_up":  TAP_Q.put(("shot_up", float(d.get("x", 0)), float(d.get("y", 0))))

@@ -253,7 +253,11 @@ enum VoiceState: Equatable {
     private(set) var voiceState: VoiceState = .idle {
         didSet {                                            // drive the composer's listening indicator
             guard voiceState != oldValue else { return }
-            web?.setVoice(voiceState == .listening ? "listening" : (voiceState == .processing ? "processing" : ""))
+            // Never show the listening/transcribing indicator when this chat's voice input is OFF — in
+            // Karabiner mode the chord still reaches the engine (the app can't unregister the hook), so
+            // voiceState can flip to .listening even with voice disabled; the UI must not reflect it.
+            let on = store.chat.settings.voiceInput
+            web?.setVoice((on && voiceState == .listening) ? "listening" : ((on && voiceState == .processing) ? "processing" : ""))
         }
     }
     private(set) var livePartial = ""
