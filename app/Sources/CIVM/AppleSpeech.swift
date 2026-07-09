@@ -68,6 +68,7 @@ final class AppleSpeech: ObservableObject {
                 } catch { /* analyzer finished / cancelled */ }
             }
 
+            Self.forceSystemInputToBuiltIn()   // hard guarantee: AirPods stay on A2DP (see note below)
             Self.pinBuiltInMic(engine)
             let tapFmt = engine.inputNode.outputFormat(forBus: 0)
             guard let converter = AVAudioConverter(from: tapFmt, to: fmt) else { throw Err.noFormat }
@@ -133,6 +134,7 @@ final class AppleSpeech: ObservableObject {
     private func teardownAudio() {
         if engine.isRunning { engine.stop() }
         if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }   // only remove a tap we actually installed
+        Self.restoreSystemInput()   // put the user's input device (AirPods) back
     }
     private func reset() { analyzer = nil; transcriber = nil; builder = nil; resultsTask = nil }
 
@@ -187,6 +189,39 @@ final class AppleSpeech: ObservableObject {
                                       &id, UInt32(MemoryLayout<AudioDeviceID>.size))
         NSLog("[Rally] pin built-in mic id=\(dev) status=\(st)")
         return st == noErr
+    }
+    // ---- system default-input override (the reliable guarantee) ----
+    // Setting the input node's CurrentDevice alone doesn't reliably keep the AirPods on A2DP — while
+    // they're the system Default Input Device macOS holds them in the muffled HFP call profile, and
+    // Apple's SpeechAnalyzer may open its own audio path. So for the dictation's duration we point the
+    // SYSTEM default input at the built-in mic, then restore the user's device on teardown. Accessed only
+    // during serialized start/teardown, so the saved value needs no locking.
+    nonisolated(unsafe) private static var savedDefaultInput: AudioDeviceID? = nil
+    nonisolated private static func forceSystemInputToBuiltIn() {
+        guard let builtin = builtInMicID() else { NSLog("[Rally] built-in mic not found (default-input override)"); return }
+        let cur = defaultInputDevice()
+        if cur == builtin { return }                     // already built-in → nothing to change/restore
+        savedDefaultInput = cur
+        setDefaultInputDevice(builtin)
+    }
+    nonisolated private static func restoreSystemInput() {
+        guard let saved = savedDefaultInput else { return }
+        setDefaultInputDevice(saved); savedDefaultInput = nil
+    }
+    nonisolated private static func defaultInputDevice() -> AudioDeviceID {
+        var id = AudioDeviceID(0); var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return id
+    }
+    nonisolated private static func setDefaultInputDevice(_ id: AudioDeviceID) {
+        var dev = id
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        let st = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil,
+                                            UInt32(MemoryLayout<AudioDeviceID>.size), &dev)
+        NSLog("[Rally] set default input device=\(id) status=\(st)")
     }
     nonisolated private static func builtInMicID() -> AudioDeviceID? {
         var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices,
