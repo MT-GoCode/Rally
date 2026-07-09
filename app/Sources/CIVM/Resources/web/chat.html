@@ -220,6 +220,7 @@ composer.addEventListener("paste", (e)=>{ const items=e.clipboardData?.items||[]
 
 document.addEventListener("keydown", (e)=>{
   if (zoomEl.style.display==="flex"){ if(e.key==="Escape"){ zoomEl.style.display="none"; e.preventDefault(); } return; }
+  if (e.key==="Escape" && BUSY){ e.preventDefault(); bridge({action:"stop"}); return; }   // Esc interrupts/stops generation (from anywhere)
   const inComposer = document.activeElement===composer;
   if (inComposer){
     if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); submit(); return; }
