@@ -78,6 +78,11 @@
   @keyframes vpulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
   #zoom { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
   #zoom img { max-width: 92%; max-height: 92%; border-radius: 8px; }
+  #toast { position: fixed; bottom: 84px; left: 50%; transform: translateX(-50%) translateY(6px);
+    background: rgba(38,38,38,0.96); border: 1px solid rgba(160,160,160,0.25); color: #e6e6e6; padding: 6px 14px;
+    border-radius: 9px; font-size: 12px; font-weight: 500; opacity: 0; transition: opacity .16s, transform .16s;
+    pointer-events: none; z-index: 200; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 </style>
 </head>
 <body>
@@ -97,6 +102,7 @@
   </div>
 </div>
 <div id="zoom"><img alt=""></div>
+<div id="toast"></div>
 <script src="markdown-it.min.js"></script>
 <script src="highlight.min.js"></script>
 <script src="katex.min.js"></script>
@@ -115,6 +121,10 @@ const composer = document.getElementById("composer");
 const thumbsEl = document.getElementById("thumbs");
 const zoomEl = document.getElementById("zoom");
 const voiceEl = document.getElementById("voice");
+const toastEl = document.getElementById("toast");
+let toastTimer = 0;
+function toast(msg){ toastEl.textContent = msg; toastEl.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(()=>toastEl.classList.remove("show"), 1100); }
+function copyMsg(text){ bridge({action:"copy", text}); toast("Copied"); }   // write to clipboard (Swift) + flash
 let MSGS = [], CONV_START = -1, SEL = -1, SRC = {}, streamEl = null, BUSY = false;
 
 function zoom(src){ zoomEl.querySelector("img").src = src; zoomEl.style.display = "flex"; }
@@ -161,7 +171,7 @@ function render(msgs, convStart){
       const dots=document.createElement("div"); dots.className="dots"; dots.textContent="⋯";
       const menu=document.createElement("div"); menu.className="menu";
       const mk=(label,fn)=>{const b=document.createElement("button"); b.textContent=label; b.onclick=(e)=>{e.stopPropagation(); menu.classList.remove("open"); fn();}; return b;};
-      menu.appendChild(mk("Copy · C", ()=>bridge({action:"copy", text:(m.text.split("@@APPENDIX@@")[0]).trim()})));
+      menu.appendChild(mk("Copy · C", ()=>copyMsg((m.text.split("@@APPENDIX@@")[0]).trim())));
       menu.appendChild(mk("View source · S", ()=>{ SRC[i]=!SRC[i]; render(); }));
       menu.appendChild(mk("Reset to here · R", ()=>bridge({action:"reset", id:m.id})));
       dots.onclick=(e)=>{ e.stopPropagation(); document.querySelectorAll(".menu.open").forEach(x=>x.classList.remove("open")); menu.classList.toggle("open"); };
@@ -223,7 +233,7 @@ document.addEventListener("keydown", (e)=>{
   else if (e.key==="Escape"){ setSel(-1); }
   else if (SEL>=0){ const m=MSGS[SEL];
     if (e.key==="s"){ SRC[SEL]=!SRC[SEL]; render(); }
-    else if (e.key==="c"){ bridge({action:"copy", text:(m.text.split("@@APPENDIX@@")[0]).trim()}); }
+    else if (e.key==="c"){ copyMsg((m.text.split("@@APPENDIX@@")[0]).trim()); }
     else if (e.key==="r" && m.id){ bridge({action:"reset", id:m.id}); } }
 });
 
