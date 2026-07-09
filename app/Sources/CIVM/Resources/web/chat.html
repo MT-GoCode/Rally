@@ -6,11 +6,15 @@
 <link rel="stylesheet" href="katex.min.css">
 <link rel="stylesheet" href="highlight-github-dark.css">
 <style>
+  @font-face { font-family: "Inter"; font-weight: 400; font-style: normal; font-display: swap; src: url("inter-400.woff2") format("woff2"); }
+  @font-face { font-family: "Inter"; font-weight: 500; font-style: normal; font-display: swap; src: url("inter-500.woff2") format("woff2"); }
+  @font-face { font-family: "Inter"; font-weight: 600; font-style: normal; font-display: swap; src: url("inter-600.woff2") format("woff2"); }
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; height: 100%; }
   body { background: #1e1e1e; color: #e6e6e6;
-    font: 14px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+    font: 14.5px/1.6 "Inter", -apple-system, system-ui, sans-serif; letter-spacing: -0.003em;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
   #app { display: flex; flex-direction: column; height: 100vh; }
   #messages { flex: 1 1 auto; overflow-y: scroll; overflow-x: hidden; padding: 14px; -webkit-user-select: text; }
   .row { display: flex; margin: 0 0 14px; }
@@ -37,10 +41,14 @@
   .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: rgba(160,160,160,0.3); }
   .appendix { margin-top: 8px; font-size: 12px; color: #9a9a9a; }
   .appendix summary { cursor: pointer; color: #7a7a7a; }
+  .usertext { white-space: pre-wrap; }                 /* user messages: the nice sans, not monospace */
   .src { white-space: pre-wrap; font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12px; }
-  .dots { position: absolute; top: 4px; right: 6px; color: #8a8a8a; cursor: pointer; font-size: 13px; opacity: 0; padding: 0 4px; }
-  .assistant .bubble:hover .dots, .row.sel .dots { opacity: 1; }
-  .menu { position: absolute; top: 22px; right: 6px; background: #2b2b2b; border: 1px solid rgba(160,160,160,0.3);
+  /* ⋯ menu sits OUTSIDE the bubble, to its right */
+  .dotswrap { position: relative; align-self: flex-start; margin: 2px 0 0 4px; flex: 0 0 auto; }
+  .dots { color: #8a8a8a; cursor: pointer; font-size: 16px; line-height: 1; opacity: 0; padding: 3px 6px; border-radius: 6px; }
+  .row.assistant:hover .dots, .row.sel .dots { opacity: 1; }
+  .dots:hover { background: rgba(160,160,160,0.15); color: #e6e6e6; }
+  .menu { position: absolute; top: 26px; left: 0; background: #2b2b2b; border: 1px solid rgba(160,160,160,0.3);
     border-radius: 8px; padding: 4px; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,0.4); display: none; }
   .menu.open { display: block; }
   .menu button { display: block; width: 100%; text-align: left; background: none; border: 0; color: #e6e6e6;
@@ -64,6 +72,10 @@
   .btn-stop { background: #d0342c; color: #fff; }
   .btn-ghost { background: rgba(160,160,160,0.22); color: #e6e6e6; }
   #buttons button:disabled { opacity: 0.4; cursor: default; }
+  #voice { display: none; align-items: center; gap: 7px; font-size: 12px; color: #ff6b60; font-weight: 500; margin-bottom: 8px; }
+  #voice .vdot { width: 8px; height: 8px; border-radius: 50%; background: #ff3b30; animation: vpulse 1.1s ease-in-out infinite; }
+  #voice.proc { color: #9a9a9a; } #voice.proc .vdot { background: #9a9a9a; animation: none; }
+  @keyframes vpulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.8); } }
   #zoom { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
   #zoom img { max-width: 92%; max-height: 92%; border-radius: 8px; }
 </style>
@@ -72,6 +84,7 @@
 <div id="app">
   <div id="messages"></div>
   <div id="composer-wrap">
+    <div id="voice"></div>
     <div id="thumbs"></div>
     <div id="composer-row">
       <textarea id="composer" rows="1" placeholder="Space to type · hold ⌃⇧ to talk · ↑ to review replies"></textarea>
@@ -101,6 +114,7 @@ const messagesEl = document.getElementById("messages");
 const composer = document.getElementById("composer");
 const thumbsEl = document.getElementById("thumbs");
 const zoomEl = document.getElementById("zoom");
+const voiceEl = document.getElementById("voice");
 let MSGS = [], CONV_START = -1, SEL = -1, SRC = {}, streamEl = null, BUSY = false;
 
 function zoom(src){ zoomEl.querySelector("img").src = src; zoomEl.style.display = "flex"; }
@@ -136,10 +150,14 @@ function render(msgs, convStart){
     if (m.images&&m.images.length){ const s=document.createElement("div"); s.className="imgstrip";
       m.images.forEach(src=>{const im=document.createElement("img"); im.src=src; im.onclick=()=>zoom(src); s.appendChild(im);}); bub.appendChild(s); }
     const bodyEl=document.createElement("div");
-    if (m.role==="user"||SRC[i]){ bodyEl.className="src"; bodyEl.textContent=m.text.split("@@APPENDIX@@")[0].trim(); } else { renderBody(bodyEl, m.text); }
+    if (SRC[i]){ bodyEl.className="src"; bodyEl.textContent=m.text.split("@@APPENDIX@@")[0].trim(); }         // agent: view source (mono)
+    else if (m.role==="user"){ bodyEl.className="usertext"; bodyEl.textContent=m.text.split("@@APPENDIX@@")[0].trim(); }  // user: sans
+    else { renderBody(bodyEl, m.text); }                                                                     // agent: rendered markdown
     bub.appendChild(bodyEl);
     if (m.interrupted){ const c=document.createElement("div"); c.style.cssText="font-size:11px;color:#8a8a8a"; c.textContent="⎯ interrupted"; bub.appendChild(c); }
-    if (m.role==="assistant" && m.id){
+    row.appendChild(bub);
+    if (m.role==="assistant" && m.id){                    // ⋯ menu OUTSIDE the bubble, to its right
+      const wrap=document.createElement("div"); wrap.className="dotswrap";
       const dots=document.createElement("div"); dots.className="dots"; dots.textContent="⋯";
       const menu=document.createElement("div"); menu.className="menu";
       const mk=(label,fn)=>{const b=document.createElement("button"); b.textContent=label; b.onclick=(e)=>{e.stopPropagation(); menu.classList.remove("open"); fn();}; return b;};
@@ -147,9 +165,9 @@ function render(msgs, convStart){
       menu.appendChild(mk("View source · S", ()=>{ SRC[i]=!SRC[i]; render(); }));
       menu.appendChild(mk("Reset to here · R", ()=>bridge({action:"reset", id:m.id})));
       dots.onclick=(e)=>{ e.stopPropagation(); document.querySelectorAll(".menu.open").forEach(x=>x.classList.remove("open")); menu.classList.toggle("open"); };
-      bub.appendChild(dots); bub.appendChild(menu);
+      wrap.appendChild(dots); wrap.appendChild(menu); row.appendChild(wrap);
     }
-    row.appendChild(bub); messagesEl.appendChild(row);
+    messagesEl.appendChild(row);
   });
   if (stick) toBottom();
 }
@@ -213,7 +231,12 @@ document.addEventListener("keydown", (e)=>{
 function setComposer(t){ composer.value=t||""; composer.style.height="auto"; composer.style.height=Math.min(composer.scrollHeight, window.innerHeight*0.4)+"px"; }
 function insertText(t){ const s=composer.selectionStart||composer.value.length; composer.value = composer.value.slice(0,s)+t+composer.value.slice(composer.selectionEnd||s); composer.style.height="auto"; composer.style.height=Math.min(composer.scrollHeight, window.innerHeight*0.4)+"px"; composer.focus(); bridge({action:"input", text:composer.value}); }
 function submitComposer(){ submit(); }
-window.rally = { render, setStream, endStream, setSel, focusComposer, setComposer, insertText, submitComposer, setThumbs, setBusy };
+function setVoice(state){                                  // "listening" | "processing" | "" (idle)
+  if(state==="listening"){ voiceEl.className=""; voiceEl.innerHTML='<span class="vdot"></span>listening…'; voiceEl.style.display="flex"; }
+  else if(state==="processing"){ voiceEl.className="proc"; voiceEl.innerHTML='<span class="vdot"></span>transcribing…'; voiceEl.style.display="flex"; }
+  else { voiceEl.style.display="none"; }
+}
+window.rally = { render, setStream, endStream, setSel, focusComposer, setComposer, insertText, submitComposer, setThumbs, setBusy, setVoice };
 composer.focus();
 </script>
 </body>

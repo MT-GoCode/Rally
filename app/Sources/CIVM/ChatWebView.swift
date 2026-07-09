@@ -17,6 +17,7 @@ import WebKit
     func submitComposer()
     func setThumbs(_ dataURIs: [String])
     func setBusy(_ busy: Bool)       // toggle Send ↔ Stop / Interrupt&Send + placeholder
+    func setVoice(_ state: String)   // "listening" / "processing" / "" → composer listening indicator
     func streamSet(_ text: String)   // live reply text (pushed per-token, direct → smooth streaming)
     func streamEnd()                 // reply committed → remove the live bubble
 }
@@ -96,6 +97,7 @@ struct ChatWebView: NSViewRepresentable {
             runJS("window.rally.setThumbs(\(arr))")
         }
         func setBusy(_ busy: Bool) { runJS("window.rally.setBusy(\(busy))") }
+        func setVoice(_ state: String) { runJS("window.rally.setVoice(\(jsonStr(state)))") }
         private func runJS(_ js: String) {
             guard loaded, let wv = webView else { if pending == nil { pending = ("", 0) }; return }
             wv.evaluateJavaScript(js, completionHandler: nil)

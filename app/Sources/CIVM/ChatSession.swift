@@ -250,7 +250,12 @@ enum VoiceState: Equatable {
     }
 
     // ---- Voice·Text live state (from GET /voice/poll) ----
-    private(set) var voiceState: VoiceState = .idle
+    private(set) var voiceState: VoiceState = .idle {
+        didSet {                                            // drive the composer's listening indicator
+            guard voiceState != oldValue else { return }
+            web?.setVoice(voiceState == .listening ? "listening" : (voiceState == .processing ? "processing" : ""))
+        }
+    }
     private(set) var livePartial = ""
     private(set) var preSent = 0        // tokens prefilled into Gemma so far this utterance (live)
     private var voiceSeq = -1
