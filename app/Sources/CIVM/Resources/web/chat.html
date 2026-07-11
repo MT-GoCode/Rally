@@ -150,7 +150,11 @@ function render(msgs, convStart){
   const stick = atBottom();
   if (msgs!==undefined) MSGS = msgs;
   if (convStart!==undefined) CONV_START = convStart;
-  messagesEl.innerHTML = ""; streamEl = null;   // committed render replaces any live streaming bubble
+  // Committed render replaces any live streaming bubble. Cancel a pending stream frame FIRST: the last
+  // streamed token schedules a requestAnimationFrame, and if it fires AFTER this render (nondeterministic
+  // vs SwiftUI's update) it would find streamEl==null and recreate a duplicate bubble below the committed one.
+  if (streamRAF){ cancelAnimationFrame(streamRAF); streamRAF = 0; } pendingStream = null;
+  messagesEl.innerHTML = ""; streamEl = null;
   MSGS.forEach((m,i)=>{
     if (CONV_START>0 && i===CONV_START){ const dv=document.createElement("div"); dv.className="divider"; dv.textContent="earlier turns are out of context"; messagesEl.appendChild(dv); }
     const row=document.createElement("div");
