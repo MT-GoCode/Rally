@@ -210,6 +210,12 @@ enum Model {
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return 0 }
         return j["fed"] as? Int ?? 0
     }
+    // POST /keepalive — idle warmth ping (fired while the window is frontmost + a chat is open): the
+    // engine reads its weights + pinned KV so macOS keeps those pages resident and the GPU stays warm,
+    // avoiding the ~3s cold-start on the first token after an idle gap. Fire-and-forget, coalesced engine-side.
+    func keepAlive() async {
+        _ = try? await post("/keepalive", body: Data("{}".utf8), timeout: 8)
+    }
     // GET /voice/poll — app polls ~10Hz while in Voice·Text.
     func voicePoll() async throws -> VoicePoll {
         try JSONDecoder().decode(VoicePoll.self, from: try await get("/voice/poll"))

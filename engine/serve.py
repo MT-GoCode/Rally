@@ -80,6 +80,7 @@ parakeet = {"model": None}                 # set by the voice thread after load
 
 MLX_LOCK = threading.Lock()                # serialize Gemma <-> parakeet GPU work (SPEC concurrency)
 GEMMA_Q = queue.Queue()                    # jobs for the single Gemma worker thread
+KEEPALIVE = {"pending": False}             # coalesce idle keepalive pings (never queue a second while one is in flight)
 
 st = {}                                    # pinned chat: kv, pin_len, ctx_content, ctx_paths, tmpdir, system
 PF = {"ids": None}                         # streaming-prefill: token-id list currently fed past the pin
@@ -432,6 +433,34 @@ class Job:
         self.error = None
 
 
+def _do_keepalive(job):
+    """Idle keepalive (the app pings this every ~45s while its window is frontmost + a chat is open).
+    READ-ONLY: sums every model weight tensor and every pinned-KV key/value, then mx.eval — this faults
+    those pages resident (so macOS won't compress/swap the ~18GB of weights+KV under memory pressure) and
+    runs a little GPU work (so the GPU doesn't sit fully downclocked). It NEVER mutates st['kv'] / PF /
+    offsets, so it cannot corrupt the pinned cache or an eventual generation. ~tens of ms; runs on the
+    worker thread so it's serialized behind any real job. This is what keeps TTFT flat after an idle gap
+    (the ~3s spike was those cold pages faulting back in on the first token)."""
+    try:
+        from mlx.utils import tree_flatten
+        reads = []
+        for _, w in tree_flatten(model.parameters()):        # every weight page (~15GB) → resident + warm
+            if isinstance(w, mx.array) and w.size > 0:
+                reads.append(mx.sum(w))
+        for c in st.get("kv") or []:                          # pinned KV keys/values (~1-2GB) → resident
+            k = getattr(c, "keys", None); v = getattr(c, "values", None)
+            if k is not None: reads.append(mx.sum(k))
+            if v is not None: reads.append(mx.sum(v))
+        if reads:
+            mx.eval(reads)
+    except Exception as e:
+        log(f"[keepalive] {e}")
+    finally:
+        _free_mem()                                           # drop the transient sum buffers back to the OS
+        KEEPALIVE["pending"] = False
+        job.result = {"ok": True, "mem_gb": _mem()[0]}
+
+
 def gemma_worker():
     load_model()
     # baseline EMPTY pin (pin_len=0): fresh/new chats are chat-able instantly, no /pin needed
@@ -452,6 +481,8 @@ def gemma_worker():
                 _do_reconcile(job)
             elif job.kind == "reclaim":
                 _do_reclaim(job)
+            elif job.kind == "keepalive":
+                _do_keepalive(job)
         except Exception as e:
             import traceback
             log("worker ERR", traceback.format_exc())
@@ -1278,6 +1309,16 @@ class H(BaseHTTPRequestHandler):
                 elif kind == "shot":     TAP_Q.put(("shot_down", float(d.get("x", 0)), float(d.get("y", 0))))
                 elif kind == "shot_up":  TAP_Q.put(("shot_up", float(d.get("x", 0)), float(d.get("y", 0))))
                 elif kind == "copy":     TAP_Q.put(("copy",))
+                return self._json(200, {"ok": True})
+
+            if self.path == "/keepalive":
+                # Idle keepalive — the app pings while its window is frontmost + a chat is open, to keep
+                # the ~18GB of weights+KV resident and the GPU warm (else the first token after an idle
+                # gap pays a ~3s cold-page fault). Fire-and-forget + coalesced: never queue a second while
+                # one is pending, and never block the HTTP handler behind a real job.
+                if not KEEPALIVE["pending"]:
+                    KEEPALIVE["pending"] = True
+                    GEMMA_Q.put(Job("keepalive"))
                 return self._json(200, {"ok": True})
 
             if self.path == "/voice/prefill":

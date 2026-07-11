@@ -80,6 +80,11 @@ enum VoiceState: Equatable {
         store.activated
             .sink { [weak self] kind in MainActor.assumeIsolated { self?.onChatActivated(kind) } }
             .store(in: &cancellables)
+        // app frontmost/background → start/stop the idle keepalive (keep the model warm only while in use).
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in MainActor.assumeIsolated { self?.setAppActive(true) } }.store(in: &cancellables)
+        NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
+            .sink { [weak self] _ in MainActor.assumeIsolated { self?.setAppActive(false) } }.store(in: &cancellables)
     }
 
     // engine readiness → post config once it flips ready. onChange fires on the willSet; the Task defers
@@ -104,9 +109,39 @@ enum VoiceState: Equatable {
             Task { @MainActor in
                 guard let self else { return }
                 self.postVoiceConfig()
+                self.updateKeepAlive()          // chat open/close changes whether we keep the engine warm
                 self.trackScreen()
             }
         }
+    }
+
+    // ---- idle keepalive: while the window is frontmost AND a chat is open, keep the engine's weights+KV
+    // resident and the GPU warm (a ~45s /keepalive ping) + hold an App-Nap assertion, so the first token
+    // after an idle gap doesn't pay a ~3s cold-page fault. Frontmost-only: when Rally is backgrounded we
+    // stop pinging and drop the assertion, letting the OS reclaim that ~18GB if it needs it. ----
+    @ObservationIgnored private var appActive = true
+    @ObservationIgnored private var keepAliveTimer: Timer?
+    @ObservationIgnored private var appNapToken: NSObjectProtocol?
+    func setAppActive(_ active: Bool) { appActive = active; updateKeepAlive() }
+    private func updateKeepAlive() {
+        let want = appActive && store.screen == .chat
+        if want && keepAliveTimer == nil {
+            appNapToken = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep, reason: "Rally keeping the local model warm")
+            pingKeepAlive()                     // warm immediately, not 45s from now
+            let t = Timer(timeInterval: 45, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.pingKeepAlive() }
+            }
+            RunLoop.main.add(t, forMode: .common)   // .common so it still fires during menu/scroll tracking
+            keepAliveTimer = t
+        } else if !want, let t = keepAliveTimer {
+            t.invalidate(); keepAliveTimer = nil
+            if let tok = appNapToken { ProcessInfo.processInfo.endActivity(tok); appNapToken = nil }
+        }
+    }
+    private func pingKeepAlive() {
+        guard engine.ready, !busy else { return }   // skip while generating — those pages are already hot
+        Task { await engine.keepAlive() }
     }
 
     // ---- in-flight turn (ask pipeline) ----
