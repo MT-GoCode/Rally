@@ -72,7 +72,7 @@ struct CacheHUDView: View {
             if let ct = session.convTokens {              // live conversation-cache usage vs budget
                 HStack(spacing: 4) {
                     Image(systemName: "gauge.with.dots.needle.33percent").font(.system(size: 9))
-                    Text("context \(ct)/\(session.trimTrigger) tok").font(.system(size: 9, weight: .medium))
+                    Text("conversation context \(ct)/\(session.trimTrigger) tok").font(.system(size: 9, weight: .medium))
                     if let cvs = session.convStart, cvs > 0 { Text("· \(cvs) dropped").font(.system(size: 9)).foregroundStyle(.orange) }
                 }.foregroundStyle(.secondary)
                 .help("Conversation held live in the model's cache: \(ct) of your \(session.trimTrigger)-token budget. Turns beyond the budget fall out of context"

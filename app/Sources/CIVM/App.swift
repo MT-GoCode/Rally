@@ -544,12 +544,15 @@ struct RootView: View {
         let p = store.chat.pinnedTokens ?? 0, c = store.chat.chatTokens
         let cached = session.lastPinned + session.lastReused
         return VStack(alignment: .leading, spacing: 1) {
-            Text("\(p) pinned + \(c) chat = \(p + c) tok\(session.preSent > 0 ? "  ·  ⚡\(session.preSent) pre-sent" : "")")
+            Text("\(p) pinned + \(c) chat = \(p + c) tok\(session.preSent > 0 ? "  ·  ⚡\(session.preSent) of next turn precomputed" : "")")
             if session.lastNew > 0 || session.lastTtft > 0 {
-                Text("last msg: \(cached) read from cache · \(session.lastNew) processed anew · TTFT \(String(format: "%.2f", session.lastTtft))s")
+                // X = the turn's notional cost, Y = precomputed while composing, Z = actually processed.
+                let x = max(session.lastTurnTokens, session.lastNew), z = session.lastNew
+                let y = max(0, x - z)
+                Text("last msg: \(cached) read from cache · turn was \(x) tok\(y > 0 ? " · ⚡\(y) precomputed" : "") · \(z) processed anew · TTFT \(String(format: "%.2f", session.lastTtft))s")
                     .foregroundStyle(session.lastTtft > 1.5 ? .orange : .secondary)
                 if !session.anewParts.isEmpty {
-                    Text("  anew = " + session.anewParts.map { "\($0.n) \($0.label)" }.joined(separator: " + "))
+                    Text("  processed = " + session.anewParts.map { "\($0.n) \($0.label)" }.joined(separator: " + "))
                 }
             }
         }.font(.caption2).foregroundStyle(.secondary)
@@ -726,12 +729,16 @@ struct RootView: View {
             // The header "Load" menu applies Default / a saved reminder DIRECTLY (explicit user action, not a stray edit).
             pane("REMINDER — rides with each question, not pinned", $reminderOpen, $reminderDraft, key: "reminder") { reminderMenu }
             if reminderOpen {
+                let remEst = ChatSession.estBlockTokens(reminderDraft)
+                let remOver = remEst > 10_000
                 HStack(spacing: 10) {
                     Button("Update reminder") { applyReminder(reminderDraft) }
-                        .disabled(!reminderDirty)
-                    if reminderConfirm { Text("reminder updated ✓").font(.caption2).foregroundStyle(.green) }
+                        .disabled(!reminderDirty || remOver)
+                    if remOver { Text("est. ~\(remEst) tok — over the 10K reminder limit").font(.caption2).foregroundStyle(.red) }
+                    else if reminderConfirm { Text("reminder updated ✓").font(.caption2).foregroundStyle(.green) }
                     else if reminderDirty { Text("edited — not applied").font(.caption2).foregroundStyle(.orange) }
                     Spacer()
+                    Text("est. ~\(remEst) tok").font(.caption2).foregroundStyle(remOver ? .red : .secondary)
                 }
             }
         }

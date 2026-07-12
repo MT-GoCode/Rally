@@ -150,7 +150,8 @@ enum VoiceState: Equatable {
     private(set) var streaming = ""
     // per-message accounting from the last /chat done meta — explicit cache-vs-new breakdown.
     private(set) var lastReused = 0    // history tokens reused from the cross-turn KV cache
-    private(set) var lastNew = 0       // tokens actually fed/processed anew this message
+    private(set) var lastNew = 0       // tokens actually PROCESSED anew this message (Z)
+    private(set) var lastTurnTokens = 0 // notional cost of the turn (X: your msg + reminder + structure)
     private(set) var lastPinned = 0    // pinned prefix (system+context) — always reused
     private(set) var lastTtft = 0.0    // measured time-to-first-token (s), from the actual run
     // composition of the anew tokens, IN forward-pass order, summing to lastNew (engine-computed).
@@ -398,6 +399,12 @@ enum VoiceState: Equatable {
     }
     // disable a bit below the real 200K ceiling to leave slack for estimate error (engine overLimit is the backstop)
     var estOverLimit: Bool { estTokens > 190_000 }
+    // Same estimator over arbitrary blocks (used by the reminder pane: est display + the 10K gate).
+    static func estBlockTokens(_ blocks: [Block]) -> Int {
+        let chars = blocks.reduce(0) { $0 + ($1.type == "text" ? ($1.text?.count ?? 0) : 0) }
+        let images = blocks.filter { $0.type == "image" }.count
+        return Int((Double(chars) / 2.2).rounded(.up)) + 300 * images
+    }
 
     // ---- enablement predicates the buttons bind to (fix E) — exactly today's disable expressions ----
     var canCache: Bool { !caching && engine.ready && !cachedCurrent && !contentEmpty && !estOverLimit }
@@ -505,6 +512,7 @@ enum VoiceState: Equatable {
             if let pt = meta["pinned"] as? Int, pt > 0 { store.chat.pinnedTokens = pt }
             lastReused = meta["reused"] as? Int ?? 0
             lastNew = meta["new_tokens"] as? Int ?? 0
+            lastTurnTokens = meta["turn_tokens"] as? Int ?? 0
             lastPinned = meta["pinned"] as? Int ?? 0
             lastTtft = meta["ttft"] as? Double ?? 0
             anewParts = (meta["anew_parts"] as? [[String: Any]] ?? [])
@@ -582,7 +590,7 @@ enum VoiceState: Equatable {
         // the truncated turn's per-message accounting no longer describes any live turn — clear it so the
         // tokenLine breakdown/chip reflect the shortened conversation. Leave pinnedTokens: the pin is
         // unchanged (fix C).
-        lastReused = 0; lastNew = 0; lastPinned = 0; lastTtft = 0
+        lastReused = 0; lastNew = 0; lastPinned = 0; lastTtft = 0; lastTurnTokens = 0
         anewParts = []
         store.chat.chatTokens = 0
         selectedMessageID = nil                 // the anchor turn is now the newest; drop any nav highlight

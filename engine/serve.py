@@ -720,18 +720,27 @@ def _conv_ids(messages, reminder, mode="last"):
     dropping the leading <bos> yields exactly the tokens that sit after the ACK — pure text (plus any
     per-turn chat images), which tokenizes deterministically, so the prefix match is stable.
 
-    Returns (conv_ids: list[int], vision_kwargs, per_turn_paths, tmpdir)."""
+    Returns (conv_ids, vision_kwargs, per_turn_paths, tmpdir, hist_len) — hist_len is the rendered
+    length of the WINDOWED HISTORY alone (reminder included only in 'start' mode, where it rides the
+    first turn), so the caller can report turn_tokens = len(conv_ids) - hist_len: the notional cost of
+    THIS turn (user msg + reminder-if-before/after + structure + gen prompt)."""
     tmpdir = tempfile.mkdtemp(prefix="civm-turn-")
     per_turn_paths = []
-    mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
+    hist = messages[:-1] if (messages and messages[-1].get("role") == "user") else messages
+    hpaths = []
+    mlx_hist = _mlx_messages(hist, tmpdir, hpaths)
     rem_content = _reminder_content(reminder, tmpdir, per_turn_paths)
+    if mode == "start" and mlx_hist:
+        mlx_hist = _place_reminder([dict(m) for m in mlx_hist], rem_content, "start")
+    hist_len = len(_render_ids(mlx_hist, hpaths, add_gen=False)) if mlx_hist else 0
+    mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
     mlx_msgs = _place_reminder(mlx_msgs, rem_content, mode)
     extras = {}
     ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=True, extras_out=extras)   # conversation only
     if not IS_QWEN:
         pv = _per_turn_pixels(per_turn_paths)
         if pv is not None: extras = {"pixel_values": pv}
-    return ids, extras, per_turn_paths, tmpdir
+    return ids, extras, per_turn_paths, tmpdir, hist_len
 
 
 def _lcp(a, b):
@@ -901,29 +910,37 @@ def _do_prefill(job):
     if not st.get("kv"):
         job.result = {"fed": 0}; return
     partial = job.params["partial"]
-    messages = job.params["messages"]
+    # WINDOW the history exactly like /chat and /precache do (messages[conv_start:]). Rendering the
+    # full transcript here diverged from the windowed PF at token 0 → every compose session refed the
+    # ENTIRE unwindowed history (the 5.8K "pre-sent" / memory-spike / wasted-precompute bug).
+    messages = (job.params["messages"] or [])[st.get("conv_start", 0):]
     tmpdir = tempfile.mkdtemp(prefix="civm-pf-")
     try:
         per_turn_paths = []
-        mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
+        mlx_hist = _mlx_messages(messages, tmpdir, per_turn_paths)
+        mode = job.params.get("mode") or "last"
+        rem_content = _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths)
+        if mode == "start":                                 # reminder rides the FIRST windowed user turn (history)
+            mlx_hist = _place_reminder(mlx_hist, rem_content, "start")
+        hist_len = len(_render_ids(mlx_hist, per_turn_paths, add_gen=False)) if mlx_hist else 0
         open_content = content_of(job.params.get("images") or [], tmpdir, per_turn_paths)  # staged images FIRST
         open_content += [{"type": "text", "text": partial}] if partial else []
         if not open_content:
-            job.result = {"fed": len(PF["ids"] or [])}; return
-        mlx_msgs = mlx_msgs + [{"role": "user", "content": open_content}]
-        mode = job.params.get("mode") or "last"
-        if mode in ("before", "start"):                     # keep the precached reminder shape aligned
-            mlx_msgs = _place_reminder(mlx_msgs, _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths), mode)
+            job.result = {"fed": 0}; return
+        if mode == "before" and rem_content:                # reminder prefixes the OPEN turn (aligned with /chat)
+            open_content = list(rem_content) + [{"type": "text", "text": "\n\n"}] + open_content
+        mlx_msgs = mlx_hist + [{"role": "user", "content": open_content}]
         extras = {}
         ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=False, extras_out=extras)
         if not IS_QWEN:
             pv = _per_turn_pixels(per_turn_paths)
             extras = {"pixel_values": pv} if pv is not None else {}
         open_list = _strip_open(ids)               # drop trailing turn-end → user turn stays OPEN
+        turn_tok = max(0, len(open_list) - hist_len)   # tokens of THE NEXT TURN only (what "pre-sent" means)
         lcp = _lcp(PF["ids"] or [], open_list)      # conversation-token reuse (past the frozen pin)
         if lcp >= len(open_list):
             PF["ids"] = open_list                   # nothing new to feed (partial unchanged/shorter)
-            job.result = {"fed": len(open_list), "reused": lcp}; return
+            job.result = {"fed": turn_tok, "reused": lcp}; return
         achieved, tail, tail_vis = _plan_feed(open_list, lcp, per_turn_paths, extras)
         with MLX_LOCK:
             for _ in stream_generate(model, processor, "", input_ids=mx.array([tail]),
@@ -933,7 +950,7 @@ def _do_prefill(job):
         PF["ids"] = open_list
         if per_turn_paths:
             PF["img_sig"] = _img_sig(per_turn_paths)
-        job.result = {"fed": len(open_list), "reused": achieved}
+        job.result = {"fed": turn_tok, "reused": achieved}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1109,7 +1126,7 @@ def _do_generate(job):
     st["conv_start"] = conv_start
     _live_drop(messages, conv_start)                 # ongoing chat: always re-rope-drop the front (no recompute)
     win = messages[conv_start:]
-    conv_ids, vis, per_turn_paths, tmpdir = _conv_ids(win, reminder, mode)
+    conv_ids, vis, per_turn_paths, tmpdir, hist_len = _conv_ids(win, reminder, mode)
     try:
         pin_len = st["pin_len"]              # frozen physical length of the pinned [system+ctx+ACK] KV
         # Cross-turn reuse on the CONVERSATION tokens only (pure text past the pin → deterministic).
@@ -1194,6 +1211,7 @@ def _do_generate(job):
             chat_tokens = len(conv_ids) + gen_count
             meta = {"done": True, "ttft": round(ttft or 0, 3), "gen_s": round(time.time() - start, 2),
                     "new_tokens": new_tokens, "chat_tokens": int(chat_tokens), "pinned": pin_len,
+                    "turn_tokens": max(0, len(conv_ids) - hist_len),   # notional cost of THIS turn (X; precomputed Y = X - new)
                     "reused": int(reused), "gen_tps": round(getattr(last, "generation_tps", 0) or 0, 1),
                     "anew_parts": anew_parts, "mode": mode,
                     "conv_start": conv_start, "conv_tokens": len(conv_ids),   # sliding-window boundary + size
