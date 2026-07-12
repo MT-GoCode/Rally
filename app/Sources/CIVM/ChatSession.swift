@@ -576,6 +576,8 @@ enum VoiceState: Equatable {
     // feedback stay in the view; this owns the store write and the engine re-post.)
     func commitReminder(_ blocks: [Block]) {
         store.chat.reminder = blocks; store.save()
+        rewarmCache()   // reminder text is baked into the prepared cache in before/start modes — rebuild NOW,
+                        // not at the next send (the "any settings change rebuilds the cache" rule)
     }
 
     // Truncate the transcript to everything up to AND including the given message (a "reset to here"
