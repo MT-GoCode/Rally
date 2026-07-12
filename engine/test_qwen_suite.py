@@ -142,6 +142,35 @@ try:
         slid = m.get("conv_start")
     print(f"  window slid to conv_start={slid}", flush=True)
 
+    # 5b. PRE-GENERATION: compose → tick until done → send identical text → instant flush.
+    # Guards the byte-exact render matching (compose render / pregen base / send render) that the
+    # 4ms-TTFT headline depends on — a silent fallback to the normal path would otherwise stay green.
+    Q = "What is the reference code? One short sentence please."
+    pregen_n = 0
+    for _ in range(10):
+        r = post_json("/voice/prefill", {"messages": msgs, "partial": Q, "reminder": None, "reminderMode": "after"})
+        pregen_n = r.get("pregen") or 0
+        if r.get("pregenDone"): break
+        time.sleep(0.2)
+    msgs.append({"role": "user", "content": [{"type": "text", "text": Q}]})
+    body = {"messages": msgs, "reminder": None, "reminderMode": "after",
+            "trimTrigger": 0, "trimTarget": 0, "recacheMode": "recent"}
+    meta, _ = chat_stream(body)
+    check("pregen flush send", meta.get("ttft"), 0.15,
+          f"(pregen={pregen_n} reused={meta.get('reused')} Z={meta.get('new_tokens')})")
+    z = meta.get("new_tokens"); z = 99 if z is None else z
+    if z > 2: fails.append("pregen flush refed tokens")
+    msgs.append({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
+    wait_precache()
+    # divergence: speculate on one text, send another — must answer the NEW text at normal cost
+    post_json("/voice/prefill", {"messages": msgs, "partial": "Say ALPHA only", "reminder": None, "reminderMode": "after"})
+    post_json("/voice/prefill", {"messages": msgs, "partial": "Say ALPHA only", "reminder": None, "reminderMode": "after"})
+    m = turn(msgs, "Say OMEGA only.")
+    # 1.5s budget (like the interrupt case): turn() stores STUB answers that diverge from the engine's
+    # cached REAL answers, so this refeeds the accumulated tail — a harness artifact, not pregen. A CLEAN
+    # divergence (real history) measures ~0.19s. Assert only that speculation was correctly DISCARDED.
+    check("pregen divergence send", m.get("ttft"), 1.5, f"(Z={m.get('new_tokens')})")
+
     # 6. keepalive + memory
     post_json("/keepalive", {})
     h = get("/health")
