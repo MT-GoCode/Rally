@@ -51,7 +51,7 @@ struct CacheHUDView: View {
             return ("arrow.triangle.2.circlepath", lbl.isEmpty ? "warming conversation cache…" : "conversation cache — \(lbl)", true, .accentColor) }
         if session.progOp == "generate" || session.busy {
             return ("bubble.left.and.text.bubble.right", lbl.isEmpty ? "generating…" : "generating — \(lbl)", true, .accentColor) }
-        if !session.composeStatus.isEmpty { return ("bolt.fill", session.composeStatus, false, .accentColor) }
+        if !session.composeStatus.isEmpty { return ("bolt.fill", session.composeStatus, session.livePregen > 0 && !session.livePregenDone, .accentColor) }
         if session.precache == "done"    { return ("checkmark.seal.fill", "cache ready", false, .green) }
         switch session.cacheState {
         case .overLimit, .failed:        return ("exclamationmark.triangle.fill", cacheStatusText(session.cacheState), false, .red)

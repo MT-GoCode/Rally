@@ -299,7 +299,6 @@ struct ChatRow: View {
 
 @main struct CIVMApp: App {
     @StateObject private var deps = AppDeps()
-    let memOK: Bool
     // "cmd+shift+b" → SwiftUI key equivalent (same string format as the capture bindings)
     static func parseShortcut(_ s: String) -> (KeyEquivalent, EventModifiers) {
         var mods: EventModifiers = []; var key: KeyEquivalent = "b"
@@ -321,7 +320,6 @@ struct ChatRow: View {
         // seeds the lowest-priority domain, so a value in NSGlobalDomain overrides it (which is why it
         // kept coming back). `set` writes the app domain, which wins over global — force it off.
         UserDefaults.standard.set(false, forKey: "ApplePressAndHoldEnabled")
-        memOK = Mem.enough
     }
     @AppStorage(SK.sidebarShortcut) private var sidebarShortcutRaw = SK.defaultSidebarShortcut
     var body: some Scene {
@@ -552,7 +550,18 @@ struct RootView: View {
         let p = store.chat.pinnedTokens ?? 0, c = store.chat.chatTokens
         let cached = session.lastPinned + session.lastReused
         return VStack(alignment: .leading, spacing: 1) {
-            Text("\(p) pinned + \(c) chat = \(p + c) tok\(session.preSent > 0 ? "  ·  ⚡\(session.preSent) of next turn precomputed" : "")")
+            Text("\(p) pinned + \(c) chat = \(p + c) tok")
+            // LIVE while composing: exact X/Y/Z + pre-generation, from the engine's send-view render.
+            if session.liveTurnTokens > 0 {
+                let x = session.liveTurnTokens, y = session.livePrecomputed, z = session.liveAnew
+                let pg = session.livePregen > 0
+                    ? (session.livePregenDone ? " · ⚡ reply pre-generated → instant send"
+                                              : " · ⚡ pre-generating reply \(session.livePregen) tok")
+                    : ""
+                Text("next turn: \(x) tok · ⚡\(y) precomputed · \(z) anew on send\(pg)")
+                    .foregroundStyle(.green)
+                    .help("X anew = the whole turn's cost from a cold cache. Y precomputed = already fed into the KV while you type. Z anew on send = X − Y, what pressing send still forward-passes (0 once the reply is pre-generated).")
+            }
             if session.lastNew > 0 || session.lastTtft > 0 {
                 // X = the turn's notional cost, Y = precomputed while composing, Z = actually processed.
                 let x = max(session.lastTurnTokens, session.lastNew), z = session.lastNew

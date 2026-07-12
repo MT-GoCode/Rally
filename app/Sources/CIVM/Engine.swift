@@ -248,18 +248,31 @@ enum EngineModel: String, CaseIterable, Identifiable {
     // POST /voice/prefill — aggressive precompute: prefill the KV with the in-progress composer state
     // (typed text OR Apple partial, plus staged images — images first, so their expensive forward pass
     // happens while the user is still typing). Returns tokens now sitting past the pin ("pre-sent").
+    // Live precompute/pre-generation accounting for THIS composed turn:
+    //  turnTokens  X — notional cost of the turn (what a cold send forward-passes)
+    //  precomputed Y — how much of X is already in the KV (fed while composing)
+    //  anewOnSend  Z — X − Y, what the send still forward-passes (0 once pre-generation runs)
+    //  pregen / pregenDone — speculated reply tokens + whether the reply finished
+    struct PrefillStat { var turnTokens = 0; var precomputed = 0; var anewOnSend = 0
+                         var pregen = 0; var pregenDone = false }
     func voicePrefill(messages: [ChatMessage], partial: String, images: [Block] = [],
-                      reminder: [Block] = [], reminderMode: String = "last")
-        async -> (fed: Int, pregen: Int, pregenDone: Bool) {
+                      reminder: [Block] = [], reminderMode: String = "last",
+                      trimTrigger: Int = 0, trimTarget: Int = 0) async -> PrefillStat {
         struct Req: Encodable {
             let messages: [ChatMessage]; let partial: String
             let images: [Block]; let reminder: [Block]; let reminderMode: String
+            let trimTrigger: Int; let trimTarget: Int
         }
         let body = await Self.encodeOffMain(Req(messages: messages, partial: partial,
-                                                images: images, reminder: reminder, reminderMode: reminderMode))
+                                                images: images, reminder: reminder, reminderMode: reminderMode,
+                                                trimTrigger: trimTrigger, trimTarget: trimTarget))
         guard let d = try? await post("/voice/prefill", body: body, timeout: 60),
-              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return (0, 0, false) }
-        return (j["fed"] as? Int ?? 0, j["pregen"] as? Int ?? 0, j["pregenDone"] as? Bool ?? false)
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return PrefillStat() }
+        return PrefillStat(turnTokens: j["turnTokens"] as? Int ?? 0,
+                           precomputed: j["precomputed"] as? Int ?? 0,
+                           anewOnSend: j["anewOnSend"] as? Int ?? 0,
+                           pregen: j["pregen"] as? Int ?? 0,
+                           pregenDone: j["pregenDone"] as? Bool ?? false)
     }
     // POST /keepalive — idle warmth ping (fired while the window is frontmost + a chat is open): the
     // engine reads its weights + pinned KV so macOS keeps those pages resident and the GPU stays warm,

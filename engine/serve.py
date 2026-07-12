@@ -87,7 +87,7 @@ GEN_WAITING = {"n": 0}                     # sends waiting in the queue — comp
 # sampled tokens; the KV physically holds base + ids[:-1] (last sampled token not yet fed). A send whose
 # render == base flushes `text` instantly and continues from ids[-1]; any divergence just discards —
 # the exactness ledger (PF) makes the rewind automatic.
-PREGEN = {"open": None, "base": None, "ids": [], "text": "", "done": False, "gen": None}
+PREGEN = {"open": None, "base": None, "ids": [], "text": "", "done": False, "gen": None, "sig": None}
 PREGEN_SLICE = 64                          # tokens per compose tick (yields per-token to a waiting send)
 
 
@@ -96,7 +96,7 @@ def _pregen_clear():
         try: PREGEN["gen"].close()
         except Exception: pass
     PREGEN["open"] = None; PREGEN["base"] = None; PREGEN["ids"] = []; PREGEN["text"] = ""
-    PREGEN["done"] = False; PREGEN["gen"] = None
+    PREGEN["done"] = False; PREGEN["gen"] = None; PREGEN["sig"] = None
 
 st = {}                                    # pinned chat: kv, pin_len, ctx_content, ctx_paths, tmpdir, system
 PF = {"ids": None, "img_sig": None}        # streaming-prefill: ids fed past the pin + identity of open-turn images in KV
@@ -812,8 +812,8 @@ def _conv_ids(messages, reminder, mode="last"):
     length of the WINDOWED HISTORY alone (reminder included only in 'start' mode, where it rides the
     first turn), so the caller can report turn_tokens = len(conv_ids) - hist_len: the notional cost of
     THIS turn (user msg + reminder-if-before/after + structure + gen prompt)."""
-    ids, extras, paths, tmpdir, hist_len, _sig = _conv_render(messages, reminder, mode, None, add_gen=True)
-    return ids, extras, paths, tmpdir, hist_len
+    ids, extras, paths, tmpdir, hist_len, sig = _conv_render(messages, reminder, mode, None, add_gen=True)
+    return ids, extras, paths, tmpdir, hist_len, sig
 
 
 def _lcp(a, b):
@@ -979,42 +979,37 @@ def _plan_feed(ids, want_lcp, paths, vis):
     return achieved, tail, tail_vis
 
 
-def _pregen_step(messages, reminder, mode, staged, partial, open_list):
-    """One compose-tick of speculative reply generation — runs only when the composer is fully fed and
-    UNCHANGED. First tick renders the SEND view (closed turn + gen prompt) and creates ONE persistent
-    generator (max_tokens=MAX_TOKENS); every tick consumes ≤PREGEN_SLICE tokens from it, stopping
-    between tokens when a real send is waiting (GEN_WAITING). The SAME generator is resumed by the
-    flush, so token pipeline state AND detokenizer text stay continuous. mlx generates one step ahead:
-    after k yielded tokens the KV physically holds base + all k — PF records exactly that, so any
-    divergence rewinds through the normal rails. Returns (n_pregenerated, done)."""
+def _pregen(base, paths, vis, sig, open_list):
+    """Speculate the reply on the ALREADY-rendered SEND view `base` (composer is fully fed = PF is a
+    prefix of base). First call feeds the framing delta (turn-close + gen prompt + reminder-after) via
+    the shared _plan_feed rail and starts ONE persistent generator (max_tokens=MAX); each call consumes
+    ≤PREGEN_SLICE tokens, yielding between tokens to a waiting send. The SAME generator is resumed by the
+    flush, so pipeline + detokenizer state stay continuous. PF = base + ids (mlx feeds one step ahead) —
+    exact, so any divergence rewinds through the normal rails. Returns (n_reply_tokens, done)."""
     if PREGEN["open"] is not None and PREGEN["open"] != open_list:
         _pregen_clear()                                   # composer changed → speculation is stale
     if PREGEN["done"]:
         return len(PREGEN["ids"]), True
-    if PREGEN["gen"] is None:                             # first tick: render the send view + start the gen
-        tmpdir = tempfile.mkdtemp(prefix="civm-pg-")
-        try:
-            paths0 = []
-            content = content_of(staged or [], tmpdir, paths0, inline=IS_QWEN)
-            content += [{"type": "text", "text": partial}] if partial else []
-            base, vis, paths, tmpdir2, _hl, _sig = _conv_render(
-                messages + [{"role": "user", "content": content}], reminder, mode, None, add_gen=True)
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        try:
-            lcp = _lcp(PF["ids"] or [], base)
-            if len(base) - lcp > 64:
-                return 0, False                           # composer not actually fed — not our tick
-            # the framing tail is pure text (turn close + gen prompt) — the generator prefills it
-            PREGEN["gen"] = stream_generate(model, processor, "", input_ids=mx.array([base[lcp:]]),
-                                            prompt_cache=st["kv"], max_tokens=MAX_TOKENS,
-                                            temperature=TEMPERATURE, prefill_step_size=PREFILL_STEP)
-            PREGEN["base"] = list(base); PREGEN["open"] = list(open_list)
-            PF["ids"] = list(base)                        # the gen's prefill makes the KV hold base
-        finally:
-            shutil.rmtree(tmpdir2, ignore_errors=True)
-    n_now, done = _pregen_consume(PREGEN_SLICE, None)
-    return len(PREGEN["ids"]), done
+    if PREGEN["gen"] is None:                             # first tick: feed the framing delta, start gen
+        lcp = _lcp(PF["ids"] or [], base)
+        achieved, tail, tail_vis = _plan_feed(base, lcp, paths, vis)
+        # composer is fed (PF prefix of base) → `tail` is exactly the framing (+reminder-after, which
+        # may be large or carry images); feed it however big — no size guard (that used to disable
+        # pregen for any reminder over ~60 tokens in 'after' mode).
+        PF["ids"] = list(base[:achieved])
+        PREGEN["gen"] = stream_generate(model, processor, "", input_ids=mx.array([tail]),
+                                        prompt_cache=st["kv"], max_tokens=MAX_TOKENS,
+                                        temperature=TEMPERATURE, prefill_step_size=PREFILL_STEP, **tail_vis)
+        PREGEN["base"] = list(base); PREGEN["open"] = list(open_list); PREGEN["sig"] = sig
+    _pregen_consume(PREGEN_SLICE, None)
+    return len(PREGEN["ids"]), PREGEN["done"]
+
+
+def _dup_final(chunk, ids):
+    """mlx's stream_generate appends a finalize chunk on BUDGET exhaustion that re-yields the last
+    token (on EOS it carries the genuinely-new EOS id) — counting it twice breaks PF == KV by one."""
+    return bool(ids) and getattr(chunk, "finish_reason", None) == "length" \
+        and getattr(chunk, "token", None) == ids[-1]
 
 
 def _pregen_consume(limit, emit):
@@ -1031,13 +1026,14 @@ def _pregen_consume(limit, emit):
             except StopIteration:
                 done = True; break
         tok = getattr(chunk, "token", None)
-        if tok is not None:
+        if tok is not None and not _dup_final(chunk, PREGEN["ids"]):
             PREGEN["ids"].append(int(tok)); n += 1
         if chunk.text:
             PREGEN["text"] += chunk.text
             if emit is not None:
                 emit(chunk)
-    PF["ids"] = PREGEN["base"] + PREGEN["ids"]
+    if PREGEN["ids"]:                                     # prefill+sampling actually ran → KV = base + ids
+        PF["ids"] = PREGEN["base"] + PREGEN["ids"]
     if done:
         PREGEN["done"] = True
         try: gen.close()
@@ -1055,40 +1051,57 @@ def _do_prefill(job):
     if not st.get("kv") or GEN_WAITING["n"] > 0:
         job.result = {"fed": 0}; return        # a send is queued behind us — yield (it feeds the same tokens)
     partial = job.params["partial"]
-    # WINDOW the history exactly like /chat and /precache do (messages[conv_start:]). Rendering the
-    # full transcript here diverged from the windowed PF at token 0 → every compose session refed the
-    # ENTIRE unwindowed history (the 5.8K "pre-sent" / memory-spike / wasted-precompute bug).
-    messages = (job.params["messages"] or [])[st.get("conv_start", 0):]
+    # WINDOW the history with the IDENTICAL expression /chat uses (same trigger/target, same 2× backstop,
+    # same monotonic cursor) — a stale st.conv_start (e.g. after a chat switch) or any drift here makes
+    # the compose render diverge from the send render at token 0 and the whole precompute is wasted.
+    trigger = int(job.params.get("trigger") or 0); target = int(job.params.get("target") or 0)
+    all_msgs = job.params["messages"] or []
+    cs = _window_start(all_msgs, job.params.get("reminder"), job.params.get("mode") or "last",
+                       st.get("conv_start", 0), 2 * trigger if trigger > 0 else 0, target)
+    messages = all_msgs[cs:]
     staged = job.params.get("images") or []
     if not staged and not partial:
-        job.result = {"fed": 0}; return
-    tmpdir = None
+        _pregen_clear()                             # composer emptied → drop any speculation
+        job.result = {"fed": 0, "turnTokens": 0, "precomputed": 0, "anewOnSend": 0,
+                      "pregen": 0, "pregenDone": False}; return
+    tmpdir = tmpdir2 = None
     try:
         mode = job.params.get("mode") or "last"
-        # ONE render path with /chat and /precache (_conv_render) — the prefix property between the
-        # compose render and the send render holds by construction, not by kept-in-sync copies.
-        ids, extras, per_turn_paths, tmpdir, hist_len, sig = _conv_render(
-            messages, job.params.get("reminder"), mode, open_turn=(staged, partial), add_gen=False)
-        open_list = _strip_open(ids)               # drop trailing turn-end → user turn stays OPEN
-        turn_tok = max(0, len(open_list) - hist_len)   # tokens of THE NEXT TURN only (what "pre-sent" means)
-        unchanged = (PF["ids"] or []) == open_list or (PREGEN["open"] == open_list)
-        if unchanged:                                   # composer fully fed + unchanged → SPECULATE the reply
-            n, done = _pregen_step(messages, job.params.get("reminder"), mode, staged, partial, open_list)
-            job.result = {"fed": turn_tok, "reused": len(open_list), "pregen": n, "pregenDone": done}; return
-        lcp = min(_lcp(PF["ids"] or [], open_list), len(open_list))
-        # (a shrunken composer — backspace — lands here too: rewind physically evicts the deleted tail;
-        # skipping used to leave ghost tokens live in the qwen cache, since its fast path trusts len(PF))
-        if st.get("pin_len", 0) + len(open_list) > TOKEN_LIMIT:
-            job.result = {"fed": 0, "overLimit": True}; return   # composing past the context window — don't feed garbage
-        _pregen_clear()                                 # composer changed — speculation (if any) is stale
-        achieved, tail, tail_vis = _plan_feed(open_list, lcp, per_turn_paths, extras)
-        _feed(st["kv"], tail, tail_vis)
-        PF["ids"] = open_list
-        if per_turn_paths:
-            PF["img_sig"] = sig
-        job.result = {"fed": turn_tok, "reused": achieved}
+        reminder = job.params.get("reminder")
+        # OPEN render — what we FEED (user turn stays open so the next keystroke appends).
+        ids, extras, paths, tmpdir, _hl, sig = _conv_render(
+            messages, reminder, mode, open_turn=(staged, partial), add_gen=False)
+        open_list = _strip_open(ids)
+        # SEND render — what /chat renders if the user hits send NOW: the accounting baseline AND the
+        # pregen base. Same _conv_render, add_gen=True. bhist = everything before the final user turn.
+        base, bvis, bpaths, tmpdir2, bhist, bsig = _conv_render(
+            messages, reminder, mode, open_turn=(staged, partial), add_gen=True)
+        X = max(0, len(base) - bhist)               # turn's NOTIONAL cost (the "anew" a clean send pays)
+        sig_ok = not paths or sig == PF.get("img_sig")
+        composer_fed = ((PF["ids"] or []) == open_list) and sig_ok
+        n, done = 0, False
+        if not composer_fed:                        # feed the composer this tick (speculate next tick)
+            if st.get("pin_len", 0) + len(open_list) > TOKEN_LIMIT:
+                _pregen_clear(); job.result = {"fed": 0, "overLimit": True}; return
+            _pregen_clear()                         # composer changed → speculation stale
+            lcp = min(_lcp(PF["ids"] or [], open_list), len(open_list))
+            achieved, tail, tail_vis = _plan_feed(open_list, lcp, paths, extras)
+            _feed(st["kv"], tail, tail_vis)
+            PF["ids"] = open_list
+            if paths: PF["img_sig"] = sig
+        else:                                       # composer stable + fed → speculate the reply
+            n, done = _pregen(base, bpaths, bvis, bsig, open_list)
+        # PRECISE accounting from the ledger vs the send view:
+        #   precomputed Y = matched prefix of `base` already in the KV, minus history
+        #   anewOnSend Z  = X - Y  (what /chat still forward-passes; 0 once pregen has run)
+        matched = _lcp(PF["ids"] or [], base)
+        Y = max(0, min(matched, len(base)) - bhist)
+        Z = max(0, X - Y)
+        job.result = {"fed": Y, "turnTokens": X, "precomputed": Y, "anewOnSend": Z,
+                      "pregen": n, "pregenDone": done}
     finally:
-        if tmpdir: shutil.rmtree(tmpdir, ignore_errors=True)
+        for d in (tmpdir, tmpdir2):
+            if d: shutil.rmtree(d, ignore_errors=True)
 
 
 def _precache_target(messages, reminder, mode):
@@ -1248,7 +1261,7 @@ def _do_generate(job):
     _live_drop(messages, conv_start)                 # (no-op unless the emergency backstop fired)
     win = messages[conv_start:]
     _t0 = time.time()
-    conv_ids, vis, per_turn_paths, tmpdir, hist_len = _conv_ids(win, reminder, mode)
+    conv_ids, vis, per_turn_paths, tmpdir, hist_len, conv_sig = _conv_ids(win, reminder, mode)
     _t_render = time.time() - _t0
     try:
         pin_len = st["pin_len"]              # frozen physical length of the pinned [system+ctx+ACK] KV
@@ -1257,7 +1270,12 @@ def _do_generate(job):
         # match lands right after the previous user message — ~[last ai + new user + reminder] re-feeds.
         # PRE-GENERATION flush: if the reply was speculated on EXACTLY this send render, its tokens are
         # already in the KV — emit the text instantly and RESUME the same generator for the rest.
-        pregen_flush = PREGEN["base"] == conv_ids and bool(PREGEN["ids"])
+        pregen_flush = (PREGEN["base"] == conv_ids and bool(PREGEN["ids"])
+                        and PREGEN.get("sig") == conv_sig)   # image identity must match too
+        if PREGEN["base"] is not None and not pregen_flush:
+            b, c = PREGEN["base"], conv_ids
+            d = next((k for k in range(min(len(b), len(c))) if b[k] != c[k]), min(len(b), len(c)))
+            log(f"[pregen-miss] base={len(b)} conv={len(c)} diverge@{d} base[d:d+6]={b[d:d+6]} conv[d:d+6]={c[d:d+6]}")
         if not pregen_flush:
             _pregen_clear()                   # mismatch → stale (the PF ledger rewinds it below)
         pf = PF["ids"] or []
@@ -1283,28 +1301,29 @@ def _do_generate(job):
         # cached last-reply contributes 0 (that's the whole point of the reminder modes).
         if pregen_flush:
             anew_parts = []
-        def _txt(bl): return "".join(b.get("text", "") for b in (bl or []) if b.get("type") == "text")
-        _tok = getattr(processor, "tokenizer", processor)
-        def _n(s):
-            try: return len(_tok.encode(s)) if s else 0
-            except Exception: return 0
-        try: fed_text = _tok.decode(feed_list)
-        except Exception: fed_text = ""
-        def _fed(s): return bool(s.strip()) and s.strip()[:60] in fed_text
-        rem_txt = REMINDER if reminder is None else _txt(reminder)
-        user_txt = _txt(messages[-1]["content"]) if messages and messages[-1].get("role") == "user" else ""
-        ai_txt = _txt(messages[-2]["content"]) if len(messages) >= 2 and messages[-2].get("role") == "assistant" else ""
-        rem_n = _n(rem_txt) if _fed(rem_txt) else 0
-        ai_n = _n(ai_txt) if _fed(ai_txt) else 0
-        user_n = _n(user_txt) if _fed(user_txt) else 0
-        parts = []                           # in forward-pass order
-        if ai_n: parts.append(("last reply", ai_n))
-        if mode == "before" and rem_n: parts.append(("reminder", rem_n))
-        if user_n: parts.append(("your msg", user_n))
-        if mode not in ("before", "start") and rem_n: parts.append(("reminder", rem_n))
-        struct_n = max(0, new_tokens - sum(n for _, n in parts))   # turn markers / gen prompt (NOT the model appendix)
-        if struct_n: parts.append(("structure", struct_n))
-        anew_parts = [] if pregen_flush else [{"label": l, "n": n} for l, n in parts]
+        else:
+            def _txt(bl): return "".join(b.get("text", "") for b in (bl or []) if b.get("type") == "text")
+            _tok = getattr(processor, "tokenizer", processor)
+            def _n(s):
+                try: return len(_tok.encode(s)) if s else 0
+                except Exception: return 0
+            try: fed_text = _tok.decode(feed_list)
+            except Exception: fed_text = ""
+            def _fed(s): return bool(s.strip()) and s.strip()[:60] in fed_text
+            rem_txt = REMINDER if reminder is None else _txt(reminder)
+            user_txt = _txt(messages[-1]["content"]) if messages and messages[-1].get("role") == "user" else ""
+            ai_txt = _txt(messages[-2]["content"]) if len(messages) >= 2 and messages[-2].get("role") == "assistant" else ""
+            rem_n = _n(rem_txt) if _fed(rem_txt) else 0
+            ai_n = _n(ai_txt) if _fed(ai_txt) else 0
+            user_n = _n(user_txt) if _fed(user_txt) else 0
+            parts = []                           # in forward-pass order
+            if ai_n: parts.append(("last reply", ai_n))
+            if mode == "before" and rem_n: parts.append(("reminder", rem_n))
+            if user_n: parts.append(("your msg", user_n))
+            if mode not in ("before", "start") and rem_n: parts.append(("reminder", rem_n))
+            struct_n = max(0, new_tokens - sum(n for _, n in parts))   # turn markers / gen prompt (NOT the model appendix)
+            if struct_n: parts.append(("structure", struct_n))
+            anew_parts = [{"label": l, "n": n} for l, n in parts]
         _prog(op="generate", stage="prefill", done=0, total=new_tokens, label="prefilling", bump=True)
         _t_pre = time.time()
         gen = None
@@ -1353,7 +1372,7 @@ def _do_generate(job):
             gen_count = chunk.generation_tokens or gen_count   # running total (every chunk)
             _prog(done=gen_count, label=f"{gen_count} tok")
             tok = getattr(chunk, "token", None)
-            if tok is not None:
+            if tok is not None and not _dup_final(chunk, gen_ids):
                 gen_ids.append(int(tok))
             if chunk.text:
                 last = chunk
@@ -1700,7 +1719,8 @@ class H(BaseHTTPRequestHandler):
                     return self._json(200, {"fed": 0})
                 job = Job("prefill", messages=d.get("messages") or [], partial=str(d.get("partial") or ""),
                           images=d.get("images") or [], reminder=d.get("reminder"),
-                          mode=d.get("reminderMode") or "last")
+                          mode=d.get("reminderMode") or "last",
+                          trigger=d.get("trimTrigger"), target=d.get("trimTarget"))
                 GEMMA_Q.put(job)
                 job.done.wait()
                 return self._json(200, job.result or {"fed": 0})

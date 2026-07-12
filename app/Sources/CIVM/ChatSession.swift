@@ -303,15 +303,23 @@ enum VoiceState: Equatable {
     }
     private(set) var livePartial = ""
     private(set) var preSent = 0        // tokens prefilled into Gemma so far this utterance (live)
+    // LIVE per-turn observability while composing (all exact, from the engine's send-view render):
+    private(set) var liveTurnTokens = 0   // X: notional cost of the turn a cold send would forward-pass
+    private(set) var livePrecomputed = 0  // Y: how much of X is already in the KV (fed while composing)
+    private(set) var liveAnew = 0         // Z = X − Y: what the send still forward-passes (0 once pregen runs)
+    private(set) var livePregen = 0       // reply tokens speculatively generated so far
+    private(set) var livePregenDone = false
     private var voiceSeq = -1
 
     // ---- aggressive precompute: while the cache is READY and the user is composing, sample the
     // composer every 0.5s and prefill [history + OPEN user(images-first + text)] into the KV, so the
     // send only pays for the un-typed tail (and images are forward-passed while the user types). ----
-    private(set) var composeStatus = ""                 // HUD line: "precomputing next turn — N tok"
+    private(set) var composeStatus = ""                 // HUD line — precompute/pre-generation state
     @ObservationIgnored private var composeLoopRunning = false
-    @ObservationIgnored private var lastComposeKey = ""
-    @ObservationIgnored private var pregenDone = false
+    private func clearComposeState() {                  // composer empty / turn sent → every live number to 0
+        composeStatus = ""; preSent = 0
+        liveTurnTokens = 0; livePrecomputed = 0; liveAnew = 0; livePregen = 0; livePregenDone = false
+    }
     private func startComposeLoop() {
         guard !composeLoopRunning else { return }
         composeLoopRunning = true
@@ -321,7 +329,7 @@ enum VoiceState: Equatable {
                 // gate: chat open, engine ready, NOT generating, conversation cache ready (not warming)
                 guard self.store.screen == .chat, self.engine.ready, !self.busy,
                       self.precache != "working", !self.appleRunning else {
-                    if !self.composeStatus.isEmpty { self.composeStatus = "" }
+                    if !self.composeStatus.isEmpty { self.clearComposeState() }
                     continue
                 }
                 // trim EXACTLY like ask()/sendText do — the pre-generation flush requires the compose
@@ -329,26 +337,27 @@ enum VoiceState: Equatable {
                 let text = self.input.trimmingCharacters(in: .whitespacesAndNewlines)
                 let imgs = self.pastedImages
                 guard !text.isEmpty || !imgs.isEmpty else {
-                    if !self.composeStatus.isEmpty { self.composeStatus = "" }
-                    self.lastComposeKey = ""; self.pregenDone = false
+                    self.clearComposeState()            // composer empty → numbers must read 0, not stale
                     continue
                 }
-                let key = text + "|" + imgs.map { $0.id.uuidString }.joined()
-                if key == self.lastComposeKey && self.pregenDone { continue }   // fed + reply finished — idle
+                // ALWAYS ping (no done-latch skip): keeps the live numbers honest AND self-heals if the
+                // engine discarded the speculation (a memory reclaim, a settings rebuild). The engine
+                // early-returns cheaply when the composed turn is already fed + speculated.
                 let s = self.store.chat.settings
                 let r = await self.engine.voicePrefill(messages: self.buildEngineMessages(),
                                                        partial: text, images: imgs,
                                                        reminder: self.store.chat.reminder,
-                                                       reminderMode: s.reminderMode)
-                self.lastComposeKey = key
-                self.pregenDone = r.pregenDone
-                if r.pregen > 0 {
-                    self.preSent = r.fed
-                    self.composeStatus = r.pregenDone
-                        ? "next turn processed ⚡ reply pre-generated — instant on send"
-                        : "next turn processed ⚡ pre-generating reply — \(r.pregen) tok"
-                } else if r.fed > 0 {
-                    self.preSent = r.fed; self.composeStatus = "precomputing next turn — \(r.fed) tok ready"
+                                                       reminderMode: s.reminderMode,
+                                                       trimTrigger: self.trimTrigger, trimTarget: self.trimTarget)
+                self.liveTurnTokens = r.turnTokens; self.livePrecomputed = r.precomputed
+                self.liveAnew = r.anewOnSend; self.livePregen = r.pregen; self.livePregenDone = r.pregenDone
+                self.preSent = r.precomputed
+                if r.pregen > 0 && r.pregenDone {
+                    self.composeStatus = "next turn ready ⚡ reply pre-generated — instant send"
+                } else if r.pregen > 0 {
+                    self.composeStatus = "next turn precomputed ⚡ pre-generating reply — \(r.pregen) tok"
+                } else if r.turnTokens > 0 {
+                    self.composeStatus = "precomputing next turn — \(r.precomputed)/\(r.turnTokens) tok · \(r.anewOnSend) anew on send"
                 }
             }
         }
@@ -488,8 +497,7 @@ enum VoiceState: Equatable {
     private func ask(text: String, images: [Block] = []) {
         let q = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!q.isEmpty || !images.isEmpty), engine.ready else { return }
-        composeStatus = ""; lastComposeKey = ""; preSent = 0   // compose state belongs to the turn being sent —
-                                                               // reset HERE (the one funnel every send path shares)
+        clearComposeState()   // compose state belongs to the turn being sent — reset HERE (the one funnel)
         let prev = askTask                      // the in-flight turn (if any) that we're interrupting
         let interrupting = busy
         askTask = Task { await self.runTurn(q, images: images, interrupting: interrupting, prev: prev) }
@@ -659,7 +667,7 @@ enum VoiceState: Equatable {
         if dictating { endDictation() }                   // don't carry a locked field / muted audio across chats
         selectedMessageID = nil; sourceShownIDs = []      // nav highlight + source toggles are per-chat
         convStart = nil; convTokens = nil                 // boundary + usage unknown until this chat's cache reports
-        composeStatus = ""; lastComposeKey = ""; preSent = 0   // precompute state is per-chat
+        clearComposeState()   // precompute state is per-chat
         resetRenderWindow()                                // reset the bounded render-window for the new chat
     }
 
@@ -701,7 +709,6 @@ enum VoiceState: Equatable {
     // on it. Drives the "conversation cache" spinner and the out-of-context boundary (convStart).
     func reconcileCache() {
         guard engine.ready, store.screen == .chat, !store.chat.messages.isEmpty else { convStart = nil; return }
-        lastComposeKey = ""                          // rebuild evicts the open-turn precompute → resample
         precache = "working"
         let msgs = buildEngineMessages(), rem = store.chat.reminder, s = store.chat.settings
         let trig = trimTrigger, tgt = trimTarget, mode = recacheMode
@@ -800,8 +807,12 @@ enum VoiceState: Equatable {
                 let s = self.store.chat.settings
                 let r = await self.engine.voicePrefill(messages: self.buildEngineMessages(), partial: partial,
                                                        images: self.pastedImages,
-                                                       reminder: self.store.chat.reminder, reminderMode: s.reminderMode)
-                if self.appleRunning { self.preSent = r.fed }
+                                                       reminder: self.store.chat.reminder, reminderMode: s.reminderMode,
+                                                       trimTrigger: self.trimTrigger, trimTarget: self.trimTarget)
+                if self.appleRunning {
+                    self.preSent = r.precomputed
+                    self.liveTurnTokens = r.turnTokens; self.livePrecomputed = r.precomputed; self.liveAnew = r.anewOnSend
+                }
             }
         }
     }
@@ -823,7 +834,6 @@ enum VoiceState: Equatable {
         guard engine.ready, !store.chat.messages.isEmpty else { precache = ""; return }
         if busy { rewarmAfterTurn = true; return }   // mid-generation: the turn's own precache (old settings)
                                                      // is already queued and would overwrite ours — defer
-        lastComposeKey = ""                          // rebuild evicts the open-turn precompute → resample
         precache = "working"
         let msgs = buildEngineMessages(), rem = store.chat.reminder, s = store.chat.settings
         let trig = trimTrigger, tgt = trimTarget, mode = recacheMode
