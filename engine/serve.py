@@ -87,12 +87,16 @@ GEN_WAITING = {"n": 0}                     # sends waiting in the queue — comp
 # sampled tokens; the KV physically holds base + ids[:-1] (last sampled token not yet fed). A send whose
 # render == base flushes `text` instantly and continues from ids[-1]; any divergence just discards —
 # the exactness ledger (PF) makes the rewind automatic.
-PREGEN = {"open": None, "base": None, "ids": [], "text": "", "done": False}
+PREGEN = {"open": None, "base": None, "ids": [], "text": "", "done": False, "gen": None}
 PREGEN_SLICE = 64                          # tokens per compose tick (yields per-token to a waiting send)
 
 
 def _pregen_clear():
-    PREGEN["open"] = None; PREGEN["base"] = None; PREGEN["ids"] = []; PREGEN["text"] = ""; PREGEN["done"] = False
+    if PREGEN.get("gen") is not None:
+        try: PREGEN["gen"].close()
+        except Exception: pass
+    PREGEN["open"] = None; PREGEN["base"] = None; PREGEN["ids"] = []; PREGEN["text"] = ""
+    PREGEN["done"] = False; PREGEN["gen"] = None
 
 st = {}                                    # pinned chat: kv, pin_len, ctx_content, ctx_paths, tmpdir, system
 PF = {"ids": None, "img_sig": None}        # streaming-prefill: ids fed past the pin + identity of open-turn images in KV
@@ -977,16 +981,17 @@ def _plan_feed(ids, want_lcp, paths, vis):
 
 def _pregen_step(messages, reminder, mode, staged, partial, open_list):
     """One compose-tick of speculative reply generation — runs only when the composer is fully fed and
-    UNCHANGED (PF == open render). Renders the SEND view (closed turn + generation prompt), feeds the
-    framing delta once, then samples up to PREGEN_SLICE tokens per tick, checking GEN_WAITING per token
-    so a real send never waits. Ledger invariant throughout: PF = base + sampled[:-1] — exactly what the
-    KV physically holds — so ANY later divergence (edit, mode change, different send) rewinds through
-    the normal rails with zero special cases. Returns (n_pregenerated, done)."""
+    UNCHANGED. First tick renders the SEND view (closed turn + gen prompt) and creates ONE persistent
+    generator (max_tokens=MAX_TOKENS); every tick consumes ≤PREGEN_SLICE tokens from it, stopping
+    between tokens when a real send is waiting (GEN_WAITING). The SAME generator is resumed by the
+    flush, so token pipeline state AND detokenizer text stay continuous. mlx generates one step ahead:
+    after k yielded tokens the KV physically holds base + all k — PF records exactly that, so any
+    divergence rewinds through the normal rails. Returns (n_pregenerated, done)."""
     if PREGEN["open"] is not None and PREGEN["open"] != open_list:
         _pregen_clear()                                   # composer changed → speculation is stale
-    if PREGEN["done"] or len(PREGEN["ids"]) >= MAX_TOKENS:
+    if PREGEN["done"]:
         return len(PREGEN["ids"]), True
-    if PREGEN["base"] is None:                            # start: build + feed the framing delta
+    if PREGEN["gen"] is None:                             # first tick: render the send view + start the gen
         tmpdir = tempfile.mkdtemp(prefix="civm-pg-")
         try:
             paths0 = []
@@ -1000,35 +1005,45 @@ def _pregen_step(messages, reminder, mode, staged, partial, open_list):
             lcp = _lcp(PF["ids"] or [], base)
             if len(base) - lcp > 64:
                 return 0, False                           # composer not actually fed — not our tick
-            _feed(st["kv"], base[lcp:-1], {})             # framing only (text-only tail); keep 1 seed token
-            PF["ids"] = list(base[:-1])
+            # the framing tail is pure text (turn close + gen prompt) — the generator prefills it
+            PREGEN["gen"] = stream_generate(model, processor, "", input_ids=mx.array([base[lcp:]]),
+                                            prompt_cache=st["kv"], max_tokens=MAX_TOKENS,
+                                            temperature=TEMPERATURE, prefill_step_size=PREFILL_STEP)
             PREGEN["base"] = list(base); PREGEN["open"] = list(open_list)
+            PF["ids"] = list(base)                        # the gen's prefill makes the KV hold base
         finally:
             shutil.rmtree(tmpdir2, ignore_errors=True)
-    # sample one slice, seeded on the last un-fed token (KV = base + ids[:-1] at all times)
-    seed = PREGEN["ids"][-1] if PREGEN["ids"] else PREGEN["base"][-1]
-    gen = stream_generate(model, processor, "", input_ids=mx.array([[seed]]),
-                          prompt_cache=st["kv"], max_tokens=PREGEN_SLICE, temperature=TEMPERATURE,
-                          prefill_step_size=PREFILL_STEP)
-    done = False
-    while True:
-        if GEN_WAITING["n"] > 0:                          # a real send arrived — stop speculating NOW
-            try: gen.close()
-            except Exception: pass
-            break
+    n_now, done = _pregen_consume(PREGEN_SLICE, None)
+    return len(PREGEN["ids"]), done
+
+
+def _pregen_consume(limit, emit):
+    """Advance the persistent speculation generator by ≤limit tokens (None limit = to completion),
+    yielding between tokens to a waiting send unless we ARE the send (emit != None streams deltas).
+    Maintains PF = base + ids (the KV's true content — mlx feeds one step ahead)."""
+    gen = PREGEN["gen"]
+    n = 0; done = False
+    while gen is not None and (limit is None or n < limit):
+        if emit is None and GEN_WAITING["n"] > 0:
+            break                                         # a real send arrived — it resumes this generator
         with MLX_LOCK:
             try: chunk = next(gen)
             except StopIteration:
                 done = True; break
         tok = getattr(chunk, "token", None)
         if tok is not None:
-            PREGEN["ids"].append(int(tok))
+            PREGEN["ids"].append(int(tok)); n += 1
         if chunk.text:
             PREGEN["text"] += chunk.text
-    PF["ids"] = PREGEN["base"] + PREGEN["ids"][:-1] if PREGEN["ids"] else list(PREGEN["base"][:-1])
-    PREGEN["done"] = done
-    _prog(op="idle", stage="", done=0, total=0, label="")
-    return len(PREGEN["ids"]), done
+            if emit is not None:
+                emit(chunk)
+    PF["ids"] = PREGEN["base"] + PREGEN["ids"]
+    if done:
+        PREGEN["done"] = True
+        try: gen.close()
+        except Exception: pass
+        PREGEN["gen"] = None
+    return n, done
 
 
 def _do_prefill(job):
@@ -1241,11 +1256,10 @@ def _do_generate(job):
         # LCP against last turn's conversation tokens; the reminder rides the last user turn so the
         # match lands right after the previous user message — ~[last ai + new user + reminder] re-feeds.
         # PRE-GENERATION flush: if the reply was speculated on EXACTLY this send render, its tokens are
-        # already in the KV — emit the text instantly and continue from the last sampled token.
-        pregen_flush = None
-        if PREGEN["base"] == conv_ids and PREGEN["ids"]:
-            pregen_flush = (list(PREGEN["ids"]), PREGEN["text"], PREGEN["done"])
-        _pregen_clear()                       # match → consumed; mismatch → stale (PF ledger rewinds it)
+        # already in the KV — emit the text instantly and RESUME the same generator for the rest.
+        pregen_flush = PREGEN["base"] == conv_ids and bool(PREGEN["ids"])
+        if not pregen_flush:
+            _pregen_clear()                   # mismatch → stale (the PF ledger rewinds it below)
         pf = PF["ids"] or []
         lcp_conv = _lcp(pf, conv_ids)
         # Images in HISTORY turns (or the reminder) sit in the reused prefix → _plan_feed refeeds from
@@ -1253,12 +1267,9 @@ def _do_generate(job):
         # UNCHANGED sig (compose-prefill already forward-passed them) keep the full LCP — the send
         # skips the image forward pass entirely (that's the aggressive-precompute payoff).
         if pregen_flush:
-            pg_ids, _pg_text, pg_done = pregen_flush
-            # KV = conv_ids + pg_ids[:-1] (the pregen invariant) — feed just the last sampled token to
-            # continue, or nothing if the reply already finished.
-            feed_list = [] if pg_done else [pg_ids[-1]]
-            reused = len(conv_ids) + len(pg_ids) - (0 if pg_done else 1)
-            new_tokens = len(feed_list)
+            feed_list = []                    # nothing to feed — the speculation generator owns the KV tail
+            reused = len(conv_ids) + len(PREGEN["ids"])
+            new_tokens = 0
         else:
             lcp_conv, feed_list, vis = _plan_feed(conv_ids, lcp_conv, per_turn_paths, vis)
             if not feed_list:                    # nothing new (shouldn't happen — genprompt differs each turn)
@@ -1297,22 +1308,33 @@ def _do_generate(job):
         _prog(op="generate", stage="prefill", done=0, total=new_tokens, label="prefilling", bump=True)
         _t_pre = time.time()
         gen = None
-        if not (pregen_flush and pregen_flush[2]):   # a FINISHED speculation needs no generator at all
+        if not pregen_flush:
             gen = stream_generate(model, processor, "", input_ids=feed_ids,
                                   prompt_cache=st["kv"],
-                                  max_tokens=MAX_TOKENS - (len(pregen_flush[0]) if pregen_flush else 0),
-                                  temperature=TEMPERATURE,
+                                  max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
                                   prefill_step_size=PREFILL_STEP, **vis)   # vis: gemma pixels / qwen pixels+grid
         ttft, last, start = None, None, time.time()
         gen_count = 0
         gen_ids = []                             # sampled token ids (to record the KV's physical tail)
         answer = []                              # delta texts (to reconstruct the answer for precache)
-        if pregen_flush:                         # FLUSH: the speculated reply is already computed — emit now
-            pg_ids, pg_text, pg_done = pregen_flush
+        if pregen_flush:                         # FLUSH: emit the speculated text, then RESUME its generator
             ttft = time.time() - start
-            _prog(stage="decode", done=len(pg_ids), total=0, label=f"⚡ {len(pg_ids)} pre-generated")
-            gen_ids.extend(pg_ids); gen_count = len(pg_ids); answer.append(pg_text)
-            job.q.put(("delta", pg_text))
+            _prog(stage="decode", done=len(PREGEN["ids"]), total=0, label=f"⚡ {len(PREGEN['ids'])} pre-generated")
+            gen_ids.extend(PREGEN["ids"]); gen_count = len(PREGEN["ids"]); answer.append(PREGEN["text"])
+            job.q.put(("delta", PREGEN["text"]))
+            if not PREGEN["done"]:
+                def _emit(chunk):
+                    nonlocal gen_count, last
+                    gen_count += 1 if getattr(chunk, "token", None) is not None else 0
+                    last = chunk
+                    job.q.put(("delta", chunk.text))
+                    _prog(done=gen_count, label=f"{gen_count} tok")
+                while not job.cancelled:
+                    _n, _d = _pregen_consume(64, _emit)
+                    if _d or _n == 0: break
+                gen_ids = list(PREGEN["ids"]); answer = [PREGEN["text"]]
+                gen_count = len(gen_ids)
+            _pregen_clear()                      # consumed (or cancelled — the ledger stays exact either way)
         while gen is not None:
             if job.cancelled:
                 try: gen.close()
