@@ -39,5 +39,12 @@ else:
 PY
 
 echo "[4/4] models — run in FOREGROUND (sandbox blocks backgrounded downloads)"
-.venv/bin/hf download unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit --local-dir ./models/gemma-4-26b-a4b-4bit 2>&1 | tail -2   # ~16GB
+# Rally runs EITHER model (home-screen picker). Download what your Mac fits — skip one with
+# CIVM_SKIP_GEMMA=1 / CIVM_SKIP_QWEN=1 (e.g. 16-24 GB Macs: skip gemma, use the 6 GB qwen).
+if [ -z "${CIVM_SKIP_GEMMA:-}" ]; then
+  .venv/bin/hf download unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit --local-dir ./models/gemma-4-26b-a4b-4bit 2>&1 | tail -2   # ~16GB
+fi
+if [ -z "${CIVM_SKIP_QWEN:-}" ]; then
+  .venv/bin/hf download mlx-community/Qwen3.5-9B-MLX-4bit --local-dir ./models/qwen3.5-9b-4bit 2>&1 | tail -2             # ~6GB
+fi
 echo "SETUP DONE"

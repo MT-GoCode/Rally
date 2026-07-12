@@ -1148,9 +1148,14 @@ def _do_generate(job):
     # Bounded sliding window: drop oldest whole turns so only messages[conv_start:] sit past the pin.
     recache = job.params.get("recache") or "recent"
     _mem_reset_peak()                                # so mem_peak in the meta is THIS turn's peak (spike check)
-    conv_start = _window_start(messages, reminder, mode, st.get("conv_start", 0), trigger, target)
+    # SEND TIME NEVER SLIDES THE WINDOW in normal flow — dropping is the READY phase's job (the post-
+    # turn precache pre-slides with headroom while the user reads), so a slide's drop/refeed cost can
+    # never land on TTFT. The 2× trigger here is an EMERGENCY backstop only (a chain of interrupts can
+    # grow the window without an intervening precache); the memory watchdog remains the hard ceiling.
+    conv_start = _window_start(messages, reminder, mode, st.get("conv_start", 0),
+                               2 * trigger if trigger > 0 else 0, target)
     st["conv_start"] = conv_start
-    _live_drop(messages, conv_start)                 # ongoing chat: always re-rope-drop the front (no recompute)
+    _live_drop(messages, conv_start)                 # (no-op unless the emergency backstop fired)
     win = messages[conv_start:]
     conv_ids, vis, per_turn_paths, tmpdir, hist_len = _conv_ids(win, reminder, mode)
     try:

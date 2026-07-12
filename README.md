@@ -3,14 +3,19 @@
 **Contextualized Consistent Instantaneous Voice-enabled Agent with Noninterruptive Context Truncation.**
 
 A native macOS app that pins large multimodal reference material (text + images) into a local
-Gemma-4's KV cache **once**, then answers typed or spoken questions about it in **~0.5 s** —
-every model runs on-device via MLX (Gemma 4 26B-A4B for chat+vision, Parakeet for speech).
+VLM's KV cache **once**, then answers typed or spoken questions about it in **~0.1–0.3 s** —
+every model runs on-device via MLX. Two switchable models (home-screen picker): **Gemma 4 26B-A4B**
+(strongest reasoning, ~18 GB) and **Qwen3.5 9B** (near-Gemma intelligence, ~7 GB, 262 K ctx);
+Parakeet handles speech. While you type, Rally **precomputes your next message** into the KV
+cache (images first — their forward pass happens as you compose), so send-time work is ~a dozen
+tokens. See `aggressive-pre-compute.md` for the cache state machine.
 
 ## Requirements
 
-- Apple Silicon Mac, macOS 14+, **48 GB unified memory recommended** (launch needs ~26 GB free:
-  16 GB weights + headroom; Parakeet adds ~1.2 GB)
-- ~20 GB disk for the model
+- Apple Silicon Mac, macOS 14+. **Gemma**: 48 GB unified memory recommended (~26 GB free at
+  launch). **Qwen3.5 9B runs comfortably on 16–24 GB Macs** (~9 GB free) — set
+  `CIVM_SKIP_GEMMA=1` before `setup.sh` to skip the big download.
+- ~22 GB disk for both models (~6 GB qwen-only)
 - Xcode 16+ or Command Line Tools with **Swift 6** (`xcode-select --install`)
 - **uv** and **ffmpeg**: `brew install uv ffmpeg`
 
@@ -47,7 +52,8 @@ Ad-hoc works, but macOS resets the permission grants on every rebuild.
 
 ## Using Rally
 
-- **Home** — model + Parakeet status, chat list (rename ✎ / delete), prompt library
+- **Home** — model picker (Gemma ↔ Qwen; greyed if it doesn't fit in free memory; switching
+  unloads/reloads the engine), Parakeet status, chat list (rename ✎ / delete), prompt library
   (named system prompts & reminders), settings ⚙.
 - **New chat** — just ask; no caching needed. To pin reference material: paste/type text and
   images (or `JSON…` import) into **SYSTEM PROMPT** and **CONTEXT**, hit **Cache**
@@ -60,7 +66,12 @@ Ad-hoc works, but macOS resets the permission grants on every rebuild.
 - **REMINDER pane** — a short instruction block that rides with *every* question (the terse
   "Rally" persona by default); edit it live or load one from the library. Not part of the
   pinned cache, so changing it is free.
-- **Interrupt & Ask** — cut the model off mid-answer, in any mode (in voice, just talk).
+- **Interrupt & Ask** — cut the model off mid-answer, in any mode (in voice, just talk);
+  Esc stops generation.
+- **Message actions** — hover any message: user msgs get **✎ edit** (resend from that point —
+  inline editor, Enter commits, Esc cancels) and **⧉ copy**; VLM replies get copy, **</>**
+  view-source, and **↺ reset-to-here**. ↑/↓ walk the transcript; E/C/S/R are the key
+  equivalents; ⌃B toggles the sidebar.
 - **Capture shortcuts** (Settings → Capture) — screenshot-to-chat (default ⌘⇧2; native
   crosshair or hold-a-mouse-button-and-drag) and copy-to-chat (default ⌃⌥C: sends the
   current selection in any app to the chat).
