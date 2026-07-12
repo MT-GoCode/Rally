@@ -628,6 +628,20 @@ def _drop_pin():
     PF["ids"] = None; PF["img_sig"] = None
 
 
+def _feed(kv, ids, vis=None):
+    """Prefill `ids` into `kv` under MLX_LOCK (max_tokens=0 → no generated token pollutes the cache;
+    chunked at PREFILL_STEP). THE one feed rail — every warm path uses it, so lock/step/kwargs changes
+    happen in exactly one place."""
+    is_arr = hasattr(ids, "shape")
+    if (int(ids.size) if is_arr else len(ids)) == 0:
+        return
+    with MLX_LOCK:
+        for _ in stream_generate(model, processor, "", input_ids=ids if is_arr else mx.array([ids]),
+                                 prompt_cache=kv, max_tokens=0, temperature=0.0,
+                                 prefill_step_size=PREFILL_STEP, **(vis or {})):
+            pass
+
+
 def _do_pin(job):
     d = job.params["body"]
     _prog(op="pin", stage="reading", done=0, total=0, label="reading context", bump=True)
@@ -656,11 +670,7 @@ def _do_pin(job):
             # qwen: plain chunked feed (stream_generate handles prefill_step_size); no gemma-style
             # bidirectional-image chunking needed — MRoPE handles image spans inside the generic path.
             _prog(stage="prefill", done=0, total=pin_len, label="prefilling context")
-            with MLX_LOCK:
-                for _ in stream_generate(model, processor, "", input_ids=input_ids, prompt_cache=kv,
-                                         max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP,
-                                         **pin_vis):
-                    pass
+            _feed(kv, input_ids, pin_vis)
         else:
             # gemma: encode images in small batches, then prefill the KV in chunks (one image per chunk,
             # text in PREFILL_STEP pieces) — both cap the memory peak. KV is exactly pin_len.
@@ -725,6 +735,51 @@ def _place_reminder(mlx_msgs, rem_content, mode):
     return _append_reminder(mlx_msgs, rem_content)
 
 
+def _n_images_in(mlx_msgs):
+    """Image count a render will expand — gemma {"type":"image"} items + qwen inline pad markup."""
+    n = 0
+    for m in mlx_msgs or []:
+        for c in m.get("content") or []:
+            if c.get("type") == "image":
+                n += 1
+            else:
+                n += (c.get("text") or "").count("<|image_pad|>")
+    return n
+
+
+def _conv_render(messages, reminder, mode, open_turn=None, add_gen=False):
+    """THE conversation render. Every cache path — /chat (add_gen=True, question inside `messages`),
+    compose prefill (open_turn=(staged_image_blocks, partial_text)), precache target (([], "") in
+    'before' mode → an open turn holding just the reminder; None otherwise) — builds its token view
+    HERE, which is what guarantees the prefix property between them by construction.
+    Reminder placement: /chat places every mode; open-turn renders place before/start only ('after'
+    rides the /chat render, of which they are a strict prefix). An appended open turn that ends up
+    EMPTY (no content, no reminder) is dropped rather than rendered as a junk empty turn.
+    Returns (ids, vis, paths, tmpdir, hist_len, sig); caller owns tmpdir cleanup. hist_len = rendered
+    length of everything before the final user turn → turn_tokens/pre-sent = len(ids) - hist_len."""
+    tmpdir = tempfile.mkdtemp(prefix="civm-cr-")
+    paths = []
+    mlx = _mlx_messages(messages, tmpdir, paths)          # message images first in path order
+    if open_turn is not None:
+        blocks, text = open_turn
+        oc = content_of(blocks or [], tmpdir, paths, inline=IS_QWEN)   # staged images (files → OUR paths)
+        oc += [{"type": "text", "text": text}] if text else []
+        mlx = mlx + [{"role": "user", "content": oc}]
+    rem = _reminder_content(reminder, tmpdir, paths)      # reminder images after (image-reminders in
+    if add_gen or mode in ("before", "start"):            # before/start stay a known ordering edge)
+        mlx = _place_reminder(mlx, rem, mode)
+    if open_turn is not None and not mlx[-1]["content"]:
+        mlx = mlx[:-1]                                    # empty open turn (no content, no reminder)
+    hist_mlx = mlx[:-1] if (mlx and mlx[-1].get("role") == "user") else mlx
+    hist_len = len(_render_ids(hist_mlx, paths[:_n_images_in(hist_mlx)], add_gen=False)) if hist_mlx else 0
+    extras = {}
+    ids = _render_ids(mlx, paths, add_gen=add_gen, extras_out=extras) if mlx else []
+    if not IS_QWEN:
+        pv = _per_turn_pixels(paths)
+        extras = {"pixel_values": pv} if pv is not None else {}
+    return ids, extras, paths, tmpdir, hist_len, _img_sig(paths)
+
+
 def _conv_ids(messages, reminder, mode="last"):
     """Tokenize ONLY the conversation (messages + reminder placed per `mode`) with turn markers — the
     tokens that FOLLOW the pinned [system+ctx+ACK] prefix in the KV.
@@ -739,23 +794,8 @@ def _conv_ids(messages, reminder, mode="last"):
     length of the WINDOWED HISTORY alone (reminder included only in 'start' mode, where it rides the
     first turn), so the caller can report turn_tokens = len(conv_ids) - hist_len: the notional cost of
     THIS turn (user msg + reminder-if-before/after + structure + gen prompt)."""
-    tmpdir = tempfile.mkdtemp(prefix="civm-turn-")
-    per_turn_paths = []
-    hist = messages[:-1] if (messages and messages[-1].get("role") == "user") else messages
-    hpaths = []
-    mlx_hist = _mlx_messages(hist, tmpdir, hpaths)
-    mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)   # message images FIRST in per_turn_paths —
-    rem_content = _reminder_content(reminder, tmpdir, per_turn_paths)  # reminder images after (matches 'last'
-    if mode == "start" and mlx_hist:                                   # placeholder order; image-reminders in
-        mlx_hist = _place_reminder([dict(m) for m in mlx_hist], rem_content, "start")  # before/start stay a known edge)
-    hist_len = len(_render_ids(mlx_hist, hpaths, add_gen=False)) if mlx_hist else 0
-    mlx_msgs = _place_reminder(mlx_msgs, rem_content, mode)
-    extras = {}
-    ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=True, extras_out=extras)   # conversation only
-    if not IS_QWEN:
-        pv = _per_turn_pixels(per_turn_paths)
-        if pv is not None: extras = {"pixel_values": pv}
-    return ids, extras, per_turn_paths, tmpdir, hist_len
+    ids, extras, paths, tmpdir, hist_len, _sig = _conv_render(messages, reminder, mode, None, add_gen=True)
+    return ids, extras, paths, tmpdir, hist_len
 
 
 def _lcp(a, b):
@@ -934,30 +974,16 @@ def _do_prefill(job):
     # full transcript here diverged from the windowed PF at token 0 → every compose session refed the
     # ENTIRE unwindowed history (the 5.8K "pre-sent" / memory-spike / wasted-precompute bug).
     messages = (job.params["messages"] or [])[st.get("conv_start", 0):]
-    tmpdir = tempfile.mkdtemp(prefix="civm-pf-")
+    staged = job.params.get("images") or []
+    if not staged and not partial:
+        job.result = {"fed": 0}; return
+    tmpdir = None
     try:
-        per_turn_paths = []
-        mlx_hist = _mlx_messages(messages, tmpdir, per_turn_paths)
         mode = job.params.get("mode") or "last"
-        open_content = content_of(job.params.get("images") or [], tmpdir, per_turn_paths, inline=IS_QWEN)  # staged images FIRST
-        open_content += [{"type": "text", "text": partial}] if partial else []
-        if not open_content:
-            job.result = {"fed": 0}; return
-        mlx_msgs = mlx_hist + [{"role": "user", "content": open_content}]
-        if mode in ("before", "start"):
-            # SAME placement function /chat uses, over the SAME combined list — this is what guarantees
-            # the compose render is a strict prefix of the send render. (History-only placement broke
-            # start mode on a chat's FIRST message: empty history → reminder never placed → /chat's
-            # render diverged at the turn start and the whole precompute was discarded.)
-            rem = _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths)
-            mlx_msgs = _place_reminder(mlx_msgs, rem, mode)
-        # turn-only accounting: everything except the (placed) open turn is "history".
-        hist_len = len(_render_ids(mlx_msgs[:-1], list(per_turn_paths), add_gen=False)) if mlx_msgs[:-1] else 0
-        extras = {}
-        ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=False, extras_out=extras)
-        if not IS_QWEN:
-            pv = _per_turn_pixels(per_turn_paths)
-            extras = {"pixel_values": pv} if pv is not None else {}
+        # ONE render path with /chat and /precache (_conv_render) — the prefix property between the
+        # compose render and the send render holds by construction, not by kept-in-sync copies.
+        ids, extras, per_turn_paths, tmpdir, hist_len, sig = _conv_render(
+            messages, job.params.get("reminder"), mode, open_turn=(staged, partial), add_gen=False)
         open_list = _strip_open(ids)               # drop trailing turn-end → user turn stays OPEN
         turn_tok = max(0, len(open_list) - hist_len)   # tokens of THE NEXT TURN only (what "pre-sent" means)
         if (PF["ids"] or []) == open_list:              # UNCHANGED → nothing to do (the only safe skip:
@@ -968,18 +994,13 @@ def _do_prefill(job):
         if st.get("pin_len", 0) + len(open_list) > TOKEN_LIMIT:
             job.result = {"fed": 0, "overLimit": True}; return   # composing past the context window — don't feed garbage
         achieved, tail, tail_vis = _plan_feed(open_list, lcp, per_turn_paths, extras)
-        if tail:
-            with MLX_LOCK:
-                for _ in stream_generate(model, processor, "", input_ids=mx.array([tail]),
-                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
-                                         prefill_step_size=PREFILL_STEP, **tail_vis):
-                    pass
+        _feed(st["kv"], tail, tail_vis)
         PF["ids"] = open_list
         if per_turn_paths:
-            PF["img_sig"] = _img_sig(per_turn_paths)
+            PF["img_sig"] = sig
         job.result = {"fed": turn_tok, "reused": achieved}
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir: shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _precache_target(messages, reminder, mode):
@@ -987,25 +1008,11 @@ def _precache_target(messages, reminder, mode):
     includes the just-generated answer). 'last' mode → clean history through the answer. 'before'
     mode → clean history + an OPEN user turn holding just the reminder (so only the next question is
     left to feed). Returns (target_ids, vision_kwargs, img_sig)."""
-    tmpdir = tempfile.mkdtemp(prefix="civm-pc-")
+    # 'before' → an OPEN turn holding just the reminder (open_content=[] + placement); other modes → none.
+    ids, extras, _paths, tmpdir, _hl, sig = _conv_render(
+        messages, reminder, mode, open_turn=(([], "") if mode == "before" else None), add_gen=False)
     try:
-        paths = []
-        extras = {}
-        mlx = _mlx_messages(messages, tmpdir, paths)
-        if mode == "before":
-            rem = _reminder_content(reminder, tmpdir, paths)
-            if rem:
-                mlx = mlx + [{"role": "user", "content": list(rem) + [{"type": "text", "text": "\n\n"}]}]
-            ids = _strip_open(_render_ids(mlx, paths, add_gen=False, extras_out=extras))   # + open user turn
-        elif mode == "start":
-            mlx = _place_reminder(mlx, _reminder_content(reminder, tmpdir, paths), "start")
-            ids = _render_ids(mlx, paths, add_gen=False, extras_out=extras)   # reminder pinned on Q1
-        else:  # after/last
-            ids = _render_ids(mlx, paths, add_gen=False, extras_out=extras)   # clean history; reminder rides next Q
-        if not IS_QWEN:
-            pv = _per_turn_pixels(paths)
-            if pv is not None: extras = {"pixel_values": pv}
-        return ids, extras, _img_sig(paths)
+        return _strip_open(ids) if mode == "before" else ids, extras, sig
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1025,13 +1032,7 @@ def _warm_target(tgt_ids, vis, sig):
         if vis and first < achieved and any(t == img_id for t in tgt_ids[achieved:]):
             achieved = _rewind_to(min(achieved, first))   # never split an image group between KV and tail
         tail = tgt_ids[achieved:]
-        if tail:
-            tail_vis = vis if (vis and any(t == img_id for t in tail)) else {}
-            with MLX_LOCK:
-                for _ in stream_generate(model, processor, "", input_ids=mx.array([tail]),
-                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
-                                         prefill_step_size=PREFILL_STEP, **tail_vis):
-                    pass
+        _feed(st["kv"], tail, vis if (vis and any(t == img_id for t in tail)) else {})
     PF["ids"] = tgt_ids; PF["img_sig"] = sig
     if IS_QWEN:                                       # anchor: clean next-msg target — divergences restore here
         QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
@@ -1084,10 +1085,7 @@ def _stream_replay(messages, reminder, mode, trigger, target):
             paths = []
             seg_ids = _render_ids(_mlx_messages(messages[starts[b]:starts[b + 1]], tmproot, paths), paths, add_gen=False)
             pv = _per_turn_pixels(paths)
-            with MLX_LOCK:
-                for _ in stream_generate(model, processor, "", input_ids=mx.array([seg_ids]),
-                                         pixel_values=pv, prompt_cache=st["kv"], max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP):
-                    pass
+            _feed(st["kv"], seg_ids, {"pixel_values": pv} if pv is not None else {})
             fed += seg_ids; seg_lens.append(len(seg_ids))
             if len(fed) > trigger:                 # hysteresis: over X → drop oldest whole turns to ≤ Y
                 while len(fed) > target and win < b:
