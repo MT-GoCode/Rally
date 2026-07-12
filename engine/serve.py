@@ -190,9 +190,9 @@ def _do_reclaim(job):
     try:
         _free_mem()
         if _mem()[0] > MEM_CEILING_GB and st.get("kv") is not None and st.get("pin_len") is not None:
-            with MLX_LOCK:
-                trim_kv(st["kv"], st["pin_len"])
-                PF["ids"] = []; st["conv_start"] = 0; st["stream_start"] = 0
+            _rewind_to(0)                       # drop conversation → bare pin (gemma trim / qwen snapshot)
+            PF["ids"] = []; st["conv_start"] = 0; st["stream_start"] = 0
+            QSNAP["conv"] = None                # the conv snapshot holds conversation KV — release it too
             _free_mem()
             MEM["reclaims"] += 1
             log(f"[mem] reclaimed conversation KV → pin; now {_mem()[0]:.1f}GB")
@@ -213,7 +213,22 @@ def load_model():
     log(f"loading {MODEL_PATH} …")
     model, processor = load(MODEL_PATH)
     config = model.config
-    log("Gemma loaded")
+    global IS_QWEN
+    IS_QWEN = str(getattr(config, "model_type", "")).startswith("qwen")
+    log(f"loaded ({getattr(config, 'model_type', '?')})")
+
+
+IS_QWEN = False   # set by load_model; qwen3_5 = hybrid SSM+attention → snapshot/restore instead of trim/re-rope
+
+
+def make_kv():
+    """Model-appropriate fresh prompt cache. Qwen3.5 NEEDS its own factory (ArraysCache for the ~75%
+    linear-attention layers + KVCache for the rest); mlx_lm's generic make_prompt_cache hands it plain
+    KVCaches and the SSM mask construction crashes. Gemma keeps the proven mlx_lm path untouched."""
+    lm = getattr(model, "language_model", None)
+    if IS_QWEN and lm is not None and hasattr(lm, "make_cache"):
+        return lm.make_cache()
+    return make_prompt_cache(model)
 
 
 # ---------------- prompt building (proven helpers, preserved) ----------------
@@ -253,13 +268,23 @@ def build_messages(system, ctx_content, history):
 
 
 def prompt_str(msgs, nimg, add_gen=True):
-    return apply_chat_template(processor, config, msgs, num_images=nimg, add_generation_prompt=add_gen)
+    # qwen3.5 thinks by default (template opens '<think>\n'); enable_thinking=False pre-closes the block
+    # so answers start immediately — matching gemma's instant-answer behavior. No-op for add_gen=False.
+    kw = {"enable_thinking": False} if IS_QWEN else {}
+    return apply_chat_template(processor, config, msgs, num_images=nimg, add_generation_prompt=add_gen, **kw)
 
 
 def token_ids(prompt, paths):
+    """(input_ids, vision_kwargs). Gemma feeds pixels separately (_per_turn_pixels) so extras stay empty
+    for it; qwen must pass everything prepare_inputs produced alongside the ids (pixel_values +
+    image_grid_thw) or the vision scatter mismatches."""
     inp = prepare_inputs(processor, images=paths or None, prompts=prompt,
                          image_token_index=getattr(config, "image_token_index", None))
-    return inp["input_ids"]
+    extras = {}
+    if IS_QWEN and paths:
+        extras = {k: v for k, v in inp.items()
+                  if k not in ("input_ids", "attention_mask") and v is not None}
+    return inp["input_ids"], extras
 
 
 def trim_kv(kv, n):
@@ -270,6 +295,63 @@ def trim_kv(kv, n):
             c.values = c.values[:, :, :n, :]
             if hasattr(c, "offset"):
                 c.offset = n
+
+
+# ---- qwen (hybrid SSM+attention) cache snapshots — replaces arbitrary-point trim_kv ----------------
+# The DeltaNet layers hold recurrent STATE (ArraysCache), which can't be trimmed/re-roped to an arbitrary
+# token like a KV cache — but it CAN be snapshotted and restored exactly (probe-verified: restored-cache
+# output == fresh-cache output). Two snapshots mirror the engine's two anchor points:
+#   QSNAP["pin"]  — right after the pin ([system+ctx+ACK]); conversation length 0.
+#   QSNAP["conv"] — (ids, snap) after the last background precache (clean history / next-msg target).
+# Snapshots are IMMUTABLE: restore slices the KV back to the snapshot offset, so all subsequent writes
+# land in fresh buffers and never touch a snapshot's arrays; SSM states are force-copied both ways.
+QSNAP = {"pin": None, "conv": None}
+
+
+def snap_cache(kv):
+    out = []
+    for c in kv:
+        if getattr(c, "keys", None) is not None:
+            out.append(("kv", c.keys, c.values, c.offset))
+        elif hasattr(c, "cache"):
+            out.append(("arr", [mx.array(x) if x is not None else None for x in c.cache]))
+        else:
+            out.append(("kv", None, None, getattr(c, "offset", 0)))
+    return out
+
+
+def restore_cache(kv, snap):
+    for c, s in zip(kv, snap):
+        if s[0] == "kv":
+            c.keys = s[1][:, :, :s[3], :] if s[1] is not None else None
+            c.values = s[2][:, :, :s[3], :] if s[2] is not None else None
+            if hasattr(c, "offset"):
+                c.offset = s[3]
+        else:
+            c.cache[:] = [mx.array(x) if x is not None else None for x in s[1]]
+
+
+def _rewind_to(want):
+    """Make the cache hold exactly the first `want` conversation tokens (past the pin), returning the
+    ACHIEVED reuse length — the caller feeds target[achieved:]. Gemma: trim_kv to any point (achieved ==
+    want). Qwen: append-only (want == len(PF)) needs nothing; otherwise restore the deepest snapshot
+    whose ids are a prefix of the current PF at ≤ want (conv, else pin) — the fed tail is then a bit
+    longer than gemma's, but it's the same ~[last reply + question + reminder] scale."""
+    pf = PF["ids"] or []
+    if not IS_QWEN:
+        with MLX_LOCK:
+            trim_kv(st["kv"], st["pin_len"] + want)
+        return want
+    if want == len(pf):
+        return want                                   # cache already ends exactly there
+    c = QSNAP.get("conv")
+    if c is not None and len(c[0]) <= want and pf[:len(c[0])] == c[0]:
+        with MLX_LOCK:
+            restore_cache(st["kv"], c[1])
+        return len(c[0])
+    with MLX_LOCK:
+        restore_cache(st["kv"], QSNAP["pin"])
+    return 0
 
 
 def _rerope_const(rope, x, delta):
@@ -451,6 +533,8 @@ def _do_keepalive(job):
             k = getattr(c, "keys", None); v = getattr(c, "values", None)
             if k is not None: reads.append(mx.sum(k))
             if v is not None: reads.append(mx.sum(v))
+            for x in getattr(c, "cache", None) or []:         # qwen SSM recurrent states (ArraysCache)
+                if x is not None: reads.append(mx.sum(x))
         if reads:
             mx.eval(reads)
     except Exception as e:
@@ -515,31 +599,43 @@ def _do_pin(job):
     msgs = build_messages(d.get("system"), ctx_content, [])
     if msgs:
         pin_prompt = prompt_str(msgs, len(paths), add_gen=False)
-        input_ids = token_ids(pin_prompt, paths)
+        input_ids, pin_vis = token_ids(pin_prompt, paths)
         pin_len = int(input_ids.shape[-1])
         if pin_len > TOKEN_LIMIT:
             shutil.rmtree(tmpdir, ignore_errors=True)
             job.result = {"ok": False, "overLimit": True, "tokens": pin_len}
             return
-        kv = make_prompt_cache(model)
-        # encode images in small batches, then prefill the KV in chunks (one image per chunk, text in
-        # PREFILL_STEP pieces) — both cap the memory peak. No generated token, so the KV is exactly pin_len.
-        with MLX_LOCK:
-            # _batch_encode_images is a full vision-tower forward and must be serialized against the
-            # Parakeet voice thread's MLX ops (the old one-shot pin ran the vision encode inside
-            # stream_generate under the lock), so encode INSIDE the lock, before _pin_prefill.
-            pv = _per_turn_pixels(paths) if paths else None
-            if pv is not None:
-                _prog(stage="encode", done=0, total=len(paths), label=f"encoding {len(paths)} images")
-            feats = _batch_encode_images(pv) if pv is not None else None
+        kv = make_kv()
+        if IS_QWEN:
+            # qwen: plain chunked feed (stream_generate handles prefill_step_size); no gemma-style
+            # bidirectional-image chunking needed — MRoPE handles image spans inside the generic path.
             _prog(stage="prefill", done=0, total=pin_len, label="prefilling context")
-            _pin_prefill(kv, input_ids, pv, feats)
+            with MLX_LOCK:
+                for _ in stream_generate(model, processor, "", input_ids=input_ids, prompt_cache=kv,
+                                         max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP,
+                                         **pin_vis):
+                    pass
+        else:
+            # gemma: encode images in small batches, then prefill the KV in chunks (one image per chunk,
+            # text in PREFILL_STEP pieces) — both cap the memory peak. KV is exactly pin_len.
+            with MLX_LOCK:
+                # _batch_encode_images is a full vision-tower forward and must be serialized against the
+                # Parakeet voice thread's MLX ops (the old one-shot pin ran the vision encode inside
+                # stream_generate under the lock), so encode INSIDE the lock, before _pin_prefill.
+                pv = _per_turn_pixels(paths) if paths else None
+                if pv is not None:
+                    _prog(stage="encode", done=0, total=len(paths), label=f"encoding {len(paths)} images")
+                feats = _batch_encode_images(pv) if pv is not None else None
+                _prog(stage="prefill", done=0, total=pin_len, label="prefilling context")
+                _pin_prefill(kv, input_ids, pv, feats)
     else:
-        kv, pin_len = make_prompt_cache(model), 0
+        kv, pin_len = make_kv(), 0
     _drop_pin()
     st.update(kv=kv, pin_len=pin_len, ctx_content=ctx_content, ctx_paths=paths,
               tmpdir=tmpdir, system=d.get("system"), conv_start=0, stream_start=0)   # fresh pin → window restarts at turn 0
     PF["ids"] = None
+    if IS_QWEN:                                # the frozen anchor every divergence can rewind to
+        QSNAP["pin"] = snap_cache(kv); QSNAP["conv"] = None
     peak = _mem()[1]
     _free_mem()                # release the pin's transient buffers so the process drops to ~weights+KV
     job.result = {"ok": True, "overLimit": False, "tokens": pin_len, "mem_peak_gb": peak}
@@ -550,11 +646,15 @@ def _bos_id():
     return getattr(tok, "bos_token_id", None)
 
 
-def _render_ids(mlx_msgs, paths, add_gen):
+def _render_ids(mlx_msgs, paths, add_gen, extras_out=None):
     """Tokenize conversation-only mlx messages (no system/ctx), drop the leading <bos> so the ids are
-    exactly the tokens that follow the pinned [system+ctx+ACK] prefix. Deterministic (pure text)."""
+    exactly the tokens that follow the pinned [system+ctx+ACK] prefix. Deterministic (pure text).
+    extras_out (dict): receives qwen vision kwargs (pixel_values + image_grid_thw) when images present."""
     prompt = prompt_str(mlx_msgs, len(paths), add_gen=add_gen)
-    ids = token_ids(prompt, paths).flatten().tolist()
+    ids_arr, extras = token_ids(prompt, paths)
+    if extras_out is not None:
+        extras_out.update(extras)
+    ids = ids_arr.flatten().tolist()
     bos = _bos_id()
     if bos is not None and ids and ids[0] == bos:
         ids = ids[1:]
@@ -589,15 +689,18 @@ def _conv_ids(messages, reminder, mode="last"):
     dropping the leading <bos> yields exactly the tokens that sit after the ACK — pure text (plus any
     per-turn chat images), which tokenizes deterministically, so the prefix match is stable.
 
-    Returns (conv_ids: list[int], per_turn_pixels, per_turn_paths, tmpdir)."""
+    Returns (conv_ids: list[int], vision_kwargs, per_turn_paths, tmpdir)."""
     tmpdir = tempfile.mkdtemp(prefix="civm-turn-")
     per_turn_paths = []
     mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
     rem_content = _reminder_content(reminder, tmpdir, per_turn_paths)
     mlx_msgs = _place_reminder(mlx_msgs, rem_content, mode)
-    ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=True)   # conversation only (no system/ctx)
-    per_pv = _per_turn_pixels(per_turn_paths)
-    return ids, per_pv, per_turn_paths, tmpdir
+    extras = {}
+    ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=True, extras_out=extras)   # conversation only
+    if not IS_QWEN:
+        pv = _per_turn_pixels(per_turn_paths)
+        if pv is not None: extras = {"pixel_values": pv}
+    return ids, extras, per_turn_paths, tmpdir
 
 
 def _lcp(a, b):
@@ -673,6 +776,12 @@ def _live_drop(messages, conv_start):
     The RECENT-vs-STREAMING choice is a RESUME concern (/reconcile), not a live one. Fires once per drop."""
     if not st.get("kv") or conv_start <= 0:
         return
+    if IS_QWEN:
+        # No re-rope on SSM state. The window still bounds what gets FED after a snapshot restore; the
+        # dropped turns' influence lingers in the recurrent state until the next pin-restore (a free
+        # "smear"), and the 8 full-attention layers' extra rows are reclaimed at the next rebuild.
+        st["stream_start"] = conv_start
+        return
     old = st.get("stream_start", 0)
     if conv_start <= old:
         st["stream_start"] = conv_start
@@ -701,7 +810,7 @@ _EOT = {"id": "unset"}
 def _eot_id():
     if _EOT["id"] == "unset":
         tok = getattr(processor, "tokenizer", processor)
-        try: _EOT["id"] = tok.convert_tokens_to_ids("<end_of_turn>")
+        try: _EOT["id"] = tok.convert_tokens_to_ids("<|im_end|>" if IS_QWEN else "<end_of_turn>")
         except Exception: _EOT["id"] = None
     return _EOT["id"]
 
@@ -731,26 +840,29 @@ def _do_prefill(job):
         mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
         mlx_msgs = mlx_msgs + [{"role": "user", "content": [{"type": "text", "text": partial}]}]
         prompt = prompt_str(mlx_msgs, len(per_turn_paths), add_gen=False)   # conversation only (no system/ctx)
-        ids = token_ids(prompt, per_turn_paths).flatten().tolist()
+        ids_arr, vis = token_ids(prompt, per_turn_paths)
+        ids = ids_arr.flatten().tolist()
         bos = _bos_id()
         if bos is not None and ids and ids[0] == bos:
             ids = ids[1:]
-        open_list = _strip_open(ids)               # drop trailing <end_of_turn> → user turn stays OPEN
-        pin_len = st["pin_len"]
+        open_list = _strip_open(ids)               # drop trailing turn-end → user turn stays OPEN
         lcp = _lcp(PF["ids"] or [], open_list)      # conversation-token reuse (past the frozen pin)
         if per_turn_paths:
-            # per_pv must match the image placeholders in the fed tokens: with per-turn images their
+            # pixels must match the image placeholders in the fed tokens: with per-turn images their
             # placeholders sit in the reused prefix, so re-feed the whole conversation past the pin.
             lcp = 0
         if lcp >= len(open_list):
             PF["ids"] = open_list                   # nothing new to feed (partial unchanged/shorter)
             job.result = {"fed": len(open_list)}; return
-        trim_kv(st["kv"], pin_len + lcp)            # a revised partial diverged → drop the wrong tail
+        lcp = _rewind_to(lcp)                       # a revised partial diverged → drop the wrong tail
         feed = mx.array([open_list[lcp:]])
-        per_pv = _per_turn_pixels(per_turn_paths)
+        if not IS_QWEN:
+            pv = _per_turn_pixels(per_turn_paths)
+            vis = {"pixel_values": pv} if pv is not None else {}
         with MLX_LOCK:
-            for _ in stream_generate(model, processor, "", input_ids=feed, pixel_values=per_pv,
-                                     prompt_cache=st["kv"], max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP):
+            for _ in stream_generate(model, processor, "", input_ids=feed,
+                                     prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
+                                     prefill_step_size=PREFILL_STEP, **vis):
                 pass
         PF["ids"] = open_list
         job.result = {"fed": len(open_list)}
@@ -766,18 +878,22 @@ def _precache_target(messages, reminder, mode):
     tmpdir = tempfile.mkdtemp(prefix="civm-pc-")
     try:
         paths = []
+        extras = {}
         mlx = _mlx_messages(messages, tmpdir, paths)
         if mode == "before":
             rem = _reminder_content(reminder, tmpdir, paths)
             if rem:
                 mlx = mlx + [{"role": "user", "content": list(rem) + [{"type": "text", "text": "\n\n"}]}]
-            ids = _strip_open(_render_ids(mlx, paths, add_gen=False))   # + open user turn (reminder only)
+            ids = _strip_open(_render_ids(mlx, paths, add_gen=False, extras_out=extras))   # + open user turn
         elif mode == "start":
             mlx = _place_reminder(mlx, _reminder_content(reminder, tmpdir, paths), "start")
-            ids = _render_ids(mlx, paths, add_gen=False)                # reminder pinned on Q1, through answer
+            ids = _render_ids(mlx, paths, add_gen=False, extras_out=extras)   # reminder pinned on Q1
         else:  # after/last
-            ids = _render_ids(mlx, paths, add_gen=False)                # clean history; reminder rides next Q
-        return ids, _per_turn_pixels(paths)
+            ids = _render_ids(mlx, paths, add_gen=False, extras_out=extras)   # clean history; reminder rides next Q
+        if not IS_QWEN:
+            pv = _per_turn_pixels(paths)
+            if pv is not None: extras = {"pixel_values": pv}
+        return ids, extras
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -795,21 +911,23 @@ def _do_precache(job):
         conv_start = _window_start(messages, reminder, mode, st.get("conv_start", 0), trigger, target)
         st["conv_start"] = conv_start
         _live_drop(messages, conv_start)                 # ongoing chat: always re-rope-drop the front (no recompute)
-        tgt_ids, pv = _precache_target(messages[conv_start:], reminder, mode)
-        pin_len = st["pin_len"]
+        tgt_ids, vis = _precache_target(messages[conv_start:], reminder, mode)
         lcp = _lcp(PF["ids"] or [], tgt_ids)
-        if pv is not None:
-            # pv must match the image placeholders in the fed tokens: with per-turn images their
+        if vis:
+            # pixels must match the image placeholders in the fed tokens: with per-turn images their
             # placeholders sit in the reused prefix, so re-feed the whole target past the pin.
             lcp = 0
         if lcp < len(tgt_ids):
-            trim_kv(st["kv"], pin_len + lcp)
+            lcp = _rewind_to(lcp)
             feed = mx.array([tgt_ids[lcp:]])
             with MLX_LOCK:
-                for _ in stream_generate(model, processor, "", input_ids=feed, pixel_values=pv,
-                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP):
+                for _ in stream_generate(model, processor, "", input_ids=feed,
+                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
+                                         prefill_step_size=PREFILL_STEP, **vis):
                     pass
         PF["ids"] = tgt_ids                     # next /chat's LCP reuses everything up to the question
+        if IS_QWEN:                             # anchor: clean next-msg target — divergent turns restore here
+            QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
     finally:
         PRECACHE["state"] = "done"
         _free_mem()
@@ -875,25 +993,27 @@ def _do_reconcile(job):
         # large budget on a short chat was spending a minute replaying ~20 turns one forward pass at a time
         # for no reason.) recent mode never replays.
         cs0 = _window_start(messages, reminder, mode, 0, trigger, target) if (trigger > 0 and messages) else 0
-        if recache == "streaming" and cs0 > 0:
+        if recache == "streaming" and cs0 > 0 and not IS_QWEN:
             conv_start = _stream_replay(messages, reminder, mode, trigger, target)   # dropping → rebuild the smear
         else:
-            with MLX_LOCK:
-                trim_kv(st["kv"], pin_len)
+            _rewind_to(0)                                       # back to the bare pin (gemma trim / qwen snapshot)
             PF["ids"] = []; st["stream_start"] = 0
-            conv_start = cs0                                    # recent, or streaming w/ nothing to drop → single prefill below
+            conv_start = cs0                                    # recent (or qwen, or nothing to drop) → single prefill below
         st["conv_start"] = conv_start; st["stream_start"] = conv_start
         # warm the precache target for the NEXT message on top of the rebuilt window (reminder-aware)
-        tgt_ids, pv = _precache_target(messages[conv_start:], reminder, mode) if messages else ([], None)
+        tgt_ids, vis = _precache_target(messages[conv_start:], reminder, mode) if messages else ([], {})
         lcp = _lcp(PF["ids"] or [], tgt_ids)
-        if pv is not None: lcp = 0
+        if vis: lcp = 0
         if lcp < len(tgt_ids):
+            lcp = _rewind_to(lcp)
             with MLX_LOCK:
-                trim_kv(st["kv"], pin_len + lcp)
                 for _ in stream_generate(model, processor, "", input_ids=mx.array([tgt_ids[lcp:]]),
-                                         pixel_values=pv, prompt_cache=st["kv"], max_tokens=0, temperature=0.0, prefill_step_size=PREFILL_STEP):
+                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
+                                         prefill_step_size=PREFILL_STEP, **vis):
                     pass
         PF["ids"] = tgt_ids
+        if IS_QWEN:
+            QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
         job.result = {"conv_start": conv_start, "conv_tokens": len(tgt_ids), "mem_peak_gb": _mem()[1]}
     finally:
         PRECACHE["state"] = "done"
@@ -916,7 +1036,7 @@ def _do_generate(job):
     st["conv_start"] = conv_start
     _live_drop(messages, conv_start)                 # ongoing chat: always re-rope-drop the front (no recompute)
     win = messages[conv_start:]
-    conv_ids, per_pv, per_turn_paths, tmpdir = _conv_ids(win, reminder, mode)
+    conv_ids, vis, per_turn_paths, tmpdir = _conv_ids(win, reminder, mode)
     try:
         pin_len = st["pin_len"]              # frozen physical length of the pinned [system+ctx+ACK] KV
         # Cross-turn reuse on the CONVERSATION tokens only (pure text past the pin → deterministic).
@@ -925,17 +1045,16 @@ def _do_generate(job):
         pf = PF["ids"] or []
         lcp_conv = _lcp(pf, conv_ids)
         if per_turn_paths:
-            # per_pv holds pixels for ALL per-turn chat images, whose placeholder tokens live in the
+            # vis holds pixels for ALL per-turn chat images, whose placeholder tokens live in the
             # reused prefix. Cross-turn LCP reuse would feed a tail with no image placeholders while
-            # per_pv still carries those pixels → masked_scatter shape mismatch. Disable conversation
-            # reuse (pin stays reused via trim_kv below) so feed_list = conv_ids carries every image
-            # placeholder that per_pv describes. Text-only chats (per_turn_paths empty) stay cached.
+            # vis still carries those pixels → masked_scatter shape mismatch. Disable conversation
+            # reuse (the pin stays reused) so feed_list = conv_ids carries every image placeholder.
             lcp_conv = 0
-        trim_kv(st["kv"], pin_len + lcp_conv)
+        lcp_conv = _rewind_to(lcp_conv)      # gemma: trim_kv; qwen: snapshot restore (achieved ≤ wanted)
         feed_list = conv_ids[lcp_conv:]
         if not feed_list:                    # nothing new (shouldn't happen — genprompt differs each turn)
-            feed_list = conv_ids[-1:]; lcp_conv = len(conv_ids) - 1
-            trim_kv(st["kv"], pin_len + lcp_conv)
+            feed_list = conv_ids[-1:]; lcp_conv = _rewind_to(len(conv_ids) - 1)
+            feed_list = conv_ids[lcp_conv:]
         feed_ids = mx.array([feed_list])
         reused = lcp_conv                    # conversation tokens reused from the cross-turn cache
         new_tokens = len(feed_list)
@@ -966,9 +1085,9 @@ def _do_generate(job):
         anew_parts = [{"label": l, "n": n} for l, n in parts]
         _prog(op="generate", stage="prefill", done=0, total=new_tokens, label="prefilling", bump=True)
         gen = stream_generate(model, processor, "", input_ids=feed_ids,
-                              pixel_values=per_pv, prompt_cache=st["kv"],
+                              prompt_cache=st["kv"],
                               max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
-                              prefill_step_size=PREFILL_STEP)   # chunk the generation prefill like the pin (was 2048)
+                              prefill_step_size=PREFILL_STEP, **vis)   # vis: gemma pixel_values / qwen pixels+grid
         ttft, last, start = None, None, time.time()
         gen_count = 0
         gen_ids = []                             # sampled token ids (to record the KV's physical tail)
