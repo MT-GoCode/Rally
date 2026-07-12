@@ -221,7 +221,6 @@ enum VoiceState: Equatable {
     func sendText(_ text: String) {
         let imgs = pastedImages
         pastedImages = []; input = ""; web?.setThumbs([])
-        composeStatus = ""; lastComposeKey = ""          // composed state is now the sent turn
         ask(text: text, images: imgs)
     }
     // A "data:<mediaType>;base64,<data>" URI pasted into the composer → a pasted image (+ refresh thumbs).
@@ -473,6 +472,8 @@ enum VoiceState: Equatable {
     private func ask(text: String, images: [Block] = []) {
         let q = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (!q.isEmpty || !images.isEmpty), engine.ready else { return }
+        composeStatus = ""; lastComposeKey = ""; preSent = 0   // compose state belongs to the turn being sent —
+                                                               // reset HERE (the one funnel every send path shares)
         let prev = askTask                      // the in-flight turn (if any) that we're interrupting
         let interrupting = busy
         askTask = Task { await self.runTurn(q, images: images, interrupting: interrupting, prev: prev) }

@@ -919,16 +919,20 @@ def _do_prefill(job):
         per_turn_paths = []
         mlx_hist = _mlx_messages(messages, tmpdir, per_turn_paths)
         mode = job.params.get("mode") or "last"
-        rem_content = _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths)
         if mode == "start":                                 # reminder rides the FIRST windowed user turn (history)
-            mlx_hist = _place_reminder(mlx_hist, rem_content, "start")
-        hist_len = len(_render_ids(mlx_hist, per_turn_paths, add_gen=False)) if mlx_hist else 0
-        open_content = content_of(job.params.get("images") or [], tmpdir, per_turn_paths)  # staged images FIRST
+            mlx_hist = _place_reminder(mlx_hist, _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths), "start")
+        # hist render sees EXACTLY the images its prompt contains (per_turn_paths so far) — a polluted
+        # list skews hist_len and therefore the turn-only "pre-sent"/turn_tokens numbers.
+        hist_len = len(_render_ids(mlx_hist, list(per_turn_paths), add_gen=False)) if mlx_hist else 0
+        open_content = []
+        if mode == "before":                                # reminder prefixes the OPEN turn (aligned with /chat);
+            rem = _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths)   # built BEFORE staged →
+            if rem:                                         # path order matches prompt order (rem imgs, then staged)
+                open_content += list(rem) + [{"type": "text", "text": "\n\n"}]
+        open_content += content_of(job.params.get("images") or [], tmpdir, per_turn_paths)  # staged images
         open_content += [{"type": "text", "text": partial}] if partial else []
         if not open_content:
             job.result = {"fed": 0}; return
-        if mode == "before" and rem_content:                # reminder prefixes the OPEN turn (aligned with /chat)
-            open_content = list(rem_content) + [{"type": "text", "text": "\n\n"}] + open_content
         mlx_msgs = mlx_hist + [{"role": "user", "content": open_content}]
         extras = {}
         ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=False, extras_out=extras)
