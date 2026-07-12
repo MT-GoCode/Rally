@@ -191,7 +191,9 @@ def _do_reclaim(job):
         _free_mem()
         if _mem()[0] > MEM_CEILING_GB and st.get("kv") is not None and st.get("pin_len") is not None:
             _rewind_to(0)                       # drop conversation → bare pin (gemma trim / qwen snapshot)
-            PF["ids"] = []; PF["img_sig"] = None; st["conv_start"] = 0; st["stream_start"] = 0
+            # keep conv_start: the window boundary (a MESSAGE index) is still valid — resetting it made
+            # the next compose sample render the FULL transcript (reclaim → giant refeed → reclaim thrash).
+            PF["ids"] = []; PF["img_sig"] = None; st["stream_start"] = st.get("conv_start", 0)
             QSNAP["conv"] = None                # the conv snapshot holds conversation KV — release it too
             _free_mem()
             MEM["reclaims"] += 1
@@ -250,8 +252,16 @@ def make_kv():
 
 
 # ---------------- prompt building (proven helpers, preserved) ----------------
-def content_of(blocks, tmpdir, paths):
-    """blocks -> mlx_vlm message content; images written to tmpdir ONCE (paths appended in order)."""
+QWEN_IMG_MARKUP = "<|vision_start|><|image_pad|><|vision_end|>"
+
+
+def content_of(blocks, tmpdir, paths, inline=False):
+    """blocks -> mlx_vlm message content; images written to tmpdir ONCE (paths appended in order).
+    inline=True (qwen CONVERSATION renders): emit the literal vision markup as TEXT at the block's
+    position — mlx_vlm's qwen template RELOCATES {"type":"image"} placeholders to the LAST user turn,
+    which both misattributes the image and shatters cross-turn LCP reuse the moment a later turn
+    exists. The Qwen processor expands each <|image_pad|> in order, so pixels stay position-bound.
+    The PIN keeps the classic path (single context turn — relocation can't move anything)."""
     out = []
     for b in blocks or []:
         if b.get("type") == "image":
@@ -259,7 +269,7 @@ def content_of(blocks, tmpdir, paths):
             with open(p, "wb") as f:
                 f.write(base64.b64decode(b["source"]["data"]))
             paths.append(p)
-            out.append({"type": "image"})
+            out.append({"type": "text", "text": QWEN_IMG_MARKUP} if inline else {"type": "image"})
         else:
             out.append({"type": "text", "text": b.get("text", "")})
     return out
@@ -483,12 +493,13 @@ def _pin_prefill(kv, input_ids, pv, feats):
 
 
 def _mlx_messages(messages, tmpdir, paths):
-    """App messages [{role,content:[block]}] -> mlx messages; per-turn images -> tmpdir (paths appended)."""
+    """App messages [{role,content:[block]}] -> mlx messages; per-turn images -> tmpdir (paths appended).
+    Qwen: images inlined as literal markup at their positions (see content_of)."""
     out = []
     for m in messages or []:
         c = m.get("content")
         if isinstance(c, list):
-            out.append({"role": m.get("role", "user"), "content": content_of(c, tmpdir, paths)})
+            out.append({"role": m.get("role", "user"), "content": content_of(c, tmpdir, paths, inline=IS_QWEN)})
         else:
             out.append({"role": m.get("role", "user"), "content": [{"type": "text", "text": str(c)}]})
     return out
@@ -522,7 +533,7 @@ def _reminder_content(reminder, tmpdir, paths):
     if reminder is None:
         return [{"type": "text", "text": REMINDER}]
     if isinstance(reminder, list):
-        return content_of(reminder, tmpdir, paths)
+        return content_of(reminder, tmpdir, paths, inline=IS_QWEN)
     t = str(reminder).strip()
     return [{"type": "text", "text": ("\n\n" + t) if t else ""}]
 
@@ -561,6 +572,10 @@ def _do_keepalive(job):
             if v is not None: reads.append(mx.sum(v))
             for x in getattr(c, "cache", None) or []:         # qwen SSM recurrent states (ArraysCache)
                 if x is not None: reads.append(mx.sum(x))
+        for snap in (QSNAP.get("pin"), (QSNAP.get("conv") or (None, None))[1]):   # snapshot buffers — a cold
+            for s in snap or []:                                                  # snapshot makes the NEXT rewind
+                for x in s[1:] if s[0] == "kv" else s[1]:                          # pay the page-fault spike
+                    if isinstance(x, mx.array): reads.append(mx.sum(x))
         if reads:
             mx.eval(reads)
     except Exception as e:
@@ -681,7 +696,7 @@ def _render_ids(mlx_msgs, paths, add_gen, extras_out=None):
     """Tokenize conversation-only mlx messages (no system/ctx), drop the leading <bos> so the ids are
     exactly the tokens that follow the pinned [system+ctx+ACK] prefix. Deterministic (pure text).
     extras_out (dict): receives qwen vision kwargs (pixel_values + image_grid_thw) when images present."""
-    prompt = prompt_str(mlx_msgs, len(paths), add_gen=add_gen)
+    prompt = prompt_str(mlx_msgs, 0 if IS_QWEN else len(paths), add_gen=add_gen)   # qwen: markup is inline
     ids_arr, extras = token_ids(prompt, paths)
     if extras_out is not None:
         extras_out.update(extras)
@@ -729,11 +744,11 @@ def _conv_ids(messages, reminder, mode="last"):
     hist = messages[:-1] if (messages and messages[-1].get("role") == "user") else messages
     hpaths = []
     mlx_hist = _mlx_messages(hist, tmpdir, hpaths)
-    rem_content = _reminder_content(reminder, tmpdir, per_turn_paths)
-    if mode == "start" and mlx_hist:
-        mlx_hist = _place_reminder([dict(m) for m in mlx_hist], rem_content, "start")
+    mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)   # message images FIRST in per_turn_paths —
+    rem_content = _reminder_content(reminder, tmpdir, per_turn_paths)  # reminder images after (matches 'last'
+    if mode == "start" and mlx_hist:                                   # placeholder order; image-reminders in
+        mlx_hist = _place_reminder([dict(m) for m in mlx_hist], rem_content, "start")  # before/start stay a known edge)
     hist_len = len(_render_ids(mlx_hist, hpaths, add_gen=False)) if mlx_hist else 0
-    mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
     mlx_msgs = _place_reminder(mlx_msgs, rem_content, mode)
     extras = {}
     ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=True, extras_out=extras)   # conversation only
@@ -891,13 +906,18 @@ def _plan_feed(ids, want_lcp, paths, vis):
       the sig is the guard).
     Rewind can land before the images (qwen snapshot boundaries) — tail_vis follows the TAIL: pixels are
     attached iff placeholders are actually in it (feeds never split an image run mid-way)."""
+    img_id = _img_token_id() if paths else None
+    first = next((i for i, t in enumerate(ids) if t == img_id), len(ids)) if paths else len(ids)
     if paths and _img_sig(paths) != PF.get("img_sig"):
-        img_id = _img_token_id()
-        first = next((i for i, t in enumerate(ids) if t == img_id), len(ids))
         want_lcp = min(want_lcp, first)
     achieved = _rewind_to(want_lcp)
+    if paths and first < achieved and any(t == img_id for t in ids[achieved:]):
+        # rewind landed BETWEEN image groups (qwen snapshot anchor): the tail holds only some of the
+        # placeholders but vis carries pixels for ALL images → scatter mismatch. Rewind before the
+        # first placeholder so the tail carries every image the vis describes.
+        achieved = _rewind_to(min(achieved, first))
     tail = ids[achieved:]
-    tail_vis = vis if (paths and any(t == _img_token_id() for t in tail)) else {}
+    tail_vis = vis if (paths and any(t == img_id for t in tail)) else {}
     return achieved, tail, tail_vis
 
 
@@ -919,21 +939,20 @@ def _do_prefill(job):
         per_turn_paths = []
         mlx_hist = _mlx_messages(messages, tmpdir, per_turn_paths)
         mode = job.params.get("mode") or "last"
-        if mode == "start":                                 # reminder rides the FIRST windowed user turn (history)
-            mlx_hist = _place_reminder(mlx_hist, _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths), "start")
-        # hist render sees EXACTLY the images its prompt contains (per_turn_paths so far) — a polluted
-        # list skews hist_len and therefore the turn-only "pre-sent"/turn_tokens numbers.
-        hist_len = len(_render_ids(mlx_hist, list(per_turn_paths), add_gen=False)) if mlx_hist else 0
-        open_content = []
-        if mode == "before":                                # reminder prefixes the OPEN turn (aligned with /chat);
-            rem = _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths)   # built BEFORE staged →
-            if rem:                                         # path order matches prompt order (rem imgs, then staged)
-                open_content += list(rem) + [{"type": "text", "text": "\n\n"}]
-        open_content += content_of(job.params.get("images") or [], tmpdir, per_turn_paths)  # staged images
+        open_content = content_of(job.params.get("images") or [], tmpdir, per_turn_paths, inline=IS_QWEN)  # staged images FIRST
         open_content += [{"type": "text", "text": partial}] if partial else []
         if not open_content:
             job.result = {"fed": 0}; return
         mlx_msgs = mlx_hist + [{"role": "user", "content": open_content}]
+        if mode in ("before", "start"):
+            # SAME placement function /chat uses, over the SAME combined list — this is what guarantees
+            # the compose render is a strict prefix of the send render. (History-only placement broke
+            # start mode on a chat's FIRST message: empty history → reminder never placed → /chat's
+            # render diverged at the turn start and the whole precompute was discarded.)
+            rem = _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths)
+            mlx_msgs = _place_reminder(mlx_msgs, rem, mode)
+        # turn-only accounting: everything except the (placed) open turn is "history".
+        hist_len = len(_render_ids(mlx_msgs[:-1], list(per_turn_paths), add_gen=False)) if mlx_msgs[:-1] else 0
         extras = {}
         ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=False, extras_out=extras)
         if not IS_QWEN:
@@ -941,16 +960,20 @@ def _do_prefill(job):
             extras = {"pixel_values": pv} if pv is not None else {}
         open_list = _strip_open(ids)               # drop trailing turn-end → user turn stays OPEN
         turn_tok = max(0, len(open_list) - hist_len)   # tokens of THE NEXT TURN only (what "pre-sent" means)
-        lcp = _lcp(PF["ids"] or [], open_list)      # conversation-token reuse (past the frozen pin)
-        if lcp >= len(open_list):
-            PF["ids"] = open_list                   # nothing new to feed (partial unchanged/shorter)
-            job.result = {"fed": turn_tok, "reused": lcp}; return
+        if (PF["ids"] or []) == open_list:              # UNCHANGED → nothing to do (the only safe skip:
+            job.result = {"fed": turn_tok, "reused": len(open_list)}; return   # PF must describe the KV EXACTLY)
+        lcp = min(_lcp(PF["ids"] or [], open_list), len(open_list))
+        # (a shrunken composer — backspace — lands here too: rewind physically evicts the deleted tail;
+        # skipping used to leave ghost tokens live in the qwen cache, since its fast path trusts len(PF))
+        if st.get("pin_len", 0) + len(open_list) > TOKEN_LIMIT:
+            job.result = {"fed": 0, "overLimit": True}; return   # composing past the context window — don't feed garbage
         achieved, tail, tail_vis = _plan_feed(open_list, lcp, per_turn_paths, extras)
-        with MLX_LOCK:
-            for _ in stream_generate(model, processor, "", input_ids=mx.array([tail]),
-                                     prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
-                                     prefill_step_size=PREFILL_STEP, **tail_vis):
-                pass
+        if tail:
+            with MLX_LOCK:
+                for _ in stream_generate(model, processor, "", input_ids=mx.array([tail]),
+                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
+                                         prefill_step_size=PREFILL_STEP, **tail_vis):
+                    pass
         PF["ids"] = open_list
         if per_turn_paths:
             PF["img_sig"] = _img_sig(per_turn_paths)
@@ -963,7 +986,7 @@ def _precache_target(messages, reminder, mode):
     """The token sequence the KV should hold BEFORE the next user message arrives (`messages` already
     includes the just-generated answer). 'last' mode → clean history through the answer. 'before'
     mode → clean history + an OPEN user turn holding just the reminder (so only the next question is
-    left to feed). Returns (target_ids, per_turn_pixels)."""
+    left to feed). Returns (target_ids, vision_kwargs, img_sig)."""
     tmpdir = tempfile.mkdtemp(prefix="civm-pc-")
     try:
         paths = []
@@ -982,9 +1005,36 @@ def _precache_target(messages, reminder, mode):
         if not IS_QWEN:
             pv = _per_turn_pixels(paths)
             if pv is not None: extras = {"pixel_values": pv}
-        return ids, extras
+        return ids, extras, _img_sig(paths)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _warm_target(tgt_ids, vis, sig):
+    """Make the conversation KV hold EXACTLY tgt_ids (the clean next-msg target). The ONLY safe skip is
+    PF == tgt_ids — a strict-prefix target still needs a physical rewind (qwen's fast path trusts
+    len(PF), so truncating PF without rewinding left ghost tokens live in the cache). Records img_sig
+    so image turns already in the KV aren't refed by the next /chat or compose sample."""
+    if (PF["ids"] or []) != tgt_ids:
+        lcp = _lcp(PF["ids"] or [], tgt_ids)
+        img_id = _img_token_id() if vis else None
+        first = next((i for i, t in enumerate(tgt_ids) if t == img_id), len(tgt_ids)) if vis else len(tgt_ids)
+        if vis and sig != PF.get("img_sig"):
+            lcp = min(lcp, first)                     # image identity unknown/changed → refeed all images
+        achieved = _rewind_to(min(lcp, len(tgt_ids)))
+        if vis and first < achieved and any(t == img_id for t in tgt_ids[achieved:]):
+            achieved = _rewind_to(min(achieved, first))   # never split an image group between KV and tail
+        tail = tgt_ids[achieved:]
+        if tail:
+            tail_vis = vis if (vis and any(t == img_id for t in tail)) else {}
+            with MLX_LOCK:
+                for _ in stream_generate(model, processor, "", input_ids=mx.array([tail]),
+                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
+                                         prefill_step_size=PREFILL_STEP, **tail_vis):
+                    pass
+    PF["ids"] = tgt_ids; PF["img_sig"] = sig
+    if IS_QWEN:                                       # anchor: clean next-msg target — divergences restore here
+        QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
 
 
 def _do_precache(job):
@@ -1005,23 +1055,8 @@ def _do_precache(job):
         conv_start = _window_start(messages, reminder, mode, st.get("conv_start", 0), eff_trigger, target)
         st["conv_start"] = conv_start
         _live_drop(messages, conv_start)                 # ongoing chat: always re-rope-drop the front (no recompute)
-        tgt_ids, vis = _precache_target(messages[conv_start:], reminder, mode)
-        lcp = _lcp(PF["ids"] or [], tgt_ids)
-        if vis:
-            # pixels must match the image placeholders in the fed tokens: with per-turn images their
-            # placeholders sit in the reused prefix, so re-feed the whole target past the pin.
-            lcp = 0
-        if lcp < len(tgt_ids):
-            lcp = _rewind_to(lcp)
-            feed = mx.array([tgt_ids[lcp:]])
-            with MLX_LOCK:
-                for _ in stream_generate(model, processor, "", input_ids=feed,
-                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
-                                         prefill_step_size=PREFILL_STEP, **vis):
-                    pass
-        PF["ids"] = tgt_ids; PF["img_sig"] = None   # clean history — no OPEN-turn images in KV
-        if IS_QWEN:                             # anchor: clean next-msg target — divergent turns restore here
-            QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
+        tgt_ids, vis, sig = _precache_target(messages[conv_start:], reminder, mode)
+        _warm_target(tgt_ids, vis, sig)
     finally:
         PRECACHE["state"] = "done"
         _free_mem()
@@ -1095,19 +1130,8 @@ def _do_reconcile(job):
             conv_start = cs0                                    # recent (or qwen, or nothing to drop) → single prefill below
         st["conv_start"] = conv_start; st["stream_start"] = conv_start
         # warm the precache target for the NEXT message on top of the rebuilt window (reminder-aware)
-        tgt_ids, vis = _precache_target(messages[conv_start:], reminder, mode) if messages else ([], {})
-        lcp = _lcp(PF["ids"] or [], tgt_ids)
-        if vis: lcp = 0
-        if lcp < len(tgt_ids):
-            lcp = _rewind_to(lcp)
-            with MLX_LOCK:
-                for _ in stream_generate(model, processor, "", input_ids=mx.array([tgt_ids[lcp:]]),
-                                         prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
-                                         prefill_step_size=PREFILL_STEP, **vis):
-                    pass
-        PF["ids"] = tgt_ids; PF["img_sig"] = None
-        if IS_QWEN:
-            QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
+        tgt_ids, vis, sig = _precache_target(messages[conv_start:], reminder, mode) if messages else ([], {}, None)
+        _warm_target(tgt_ids, vis, sig)
         job.result = {"conv_start": conv_start, "conv_tokens": len(tgt_ids), "mem_peak_gb": _mem()[1]}
     finally:
         PRECACHE["state"] = "done"
@@ -1227,11 +1251,10 @@ def _do_generate(job):
             # FIRST answer's appendix, so every turn refed everything after it (the growing "structure"
             # anew; and on qwen it collapsed reuse to zero → 3-4s TTFT on real chats).
             ans = "".join(answer)
-            if ans:
-                msgs2 = messages + [{"role": "assistant", "content": [{"type": "text", "text": ans}]}]
-                PRECACHE["state"] = "working"    # flip immediately (the job may sit behind others briefly)
-                GEMMA_Q.put(Job("precache", messages=msgs2, reminder=reminder, mode=mode,
-                                trigger=trigger, target=target, recache=recache))
+            msgs2 = messages + ([{"role": "assistant", "content": [{"type": "text", "text": ans}]}] if ans else [])
+            PRECACHE["state"] = "working"    # flip immediately (the job may sit behind others briefly)
+            GEMMA_Q.put(Job("precache", messages=msgs2, reminder=reminder, mode=mode,
+                            trigger=trigger, target=target, recache=recache))
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
         _free_mem()

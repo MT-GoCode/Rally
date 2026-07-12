@@ -146,7 +146,11 @@ enum VoiceState: Equatable {
     }
 
     // ---- in-flight turn (ask pipeline) ----
-    private(set) var busy = false { didSet { if busy != oldValue { web?.setBusy(busy) } } }   // toggle composer Send↔Stop
+    private(set) var busy = false { didSet {
+        if busy != oldValue { web?.setBusy(busy) }
+        if !busy && rewarmAfterTurn { rewarmAfterTurn = false; rewarmCache() }   // settings changed mid-turn
+    } }
+    @ObservationIgnored private var rewarmAfterTurn = false
     private(set) var streaming = ""
     // per-message accounting from the last /chat done meta — explicit cache-vs-new breakdown.
     private(set) var lastReused = 0    // history tokens reused from the cross-turn KV cache
@@ -625,7 +629,7 @@ enum VoiceState: Equatable {
         if dictating { endDictation() }                   // don't carry a locked field / muted audio across chats
         selectedMessageID = nil; sourceShownIDs = []      // nav highlight + source toggles are per-chat
         convStart = nil; convTokens = nil                 // boundary + usage unknown until this chat's cache reports
-        composeStatus = ""; lastComposeKey = ""            // precompute state is per-chat
+        composeStatus = ""; lastComposeKey = ""; preSent = 0   // precompute state is per-chat
         resetRenderWindow()                                // reset the bounded render-window for the new chat
     }
 
@@ -667,6 +671,7 @@ enum VoiceState: Equatable {
     // on it. Drives the "conversation cache" spinner and the out-of-context boundary (convStart).
     func reconcileCache() {
         guard engine.ready, store.screen == .chat, !store.chat.messages.isEmpty else { convStart = nil; return }
+        lastComposeKey = ""                          // rebuild evicts the open-turn precompute → resample
         precache = "working"
         let msgs = buildEngineMessages(), rem = store.chat.reminder, s = store.chat.settings
         let trig = trimTrigger, tgt = trimTarget, mode = recacheMode
@@ -764,6 +769,7 @@ enum VoiceState: Equatable {
                 lastPosted = partial
                 let s = self.store.chat.settings
                 let fed = await self.engine.voicePrefill(messages: self.buildEngineMessages(), partial: partial,
+                                                         images: self.pastedImages,
                                                          reminder: self.store.chat.reminder, reminderMode: s.reminderMode)
                 if self.appleRunning { self.preSent = fed }
             }
@@ -785,6 +791,9 @@ enum VoiceState: Equatable {
     // modeSwitchTask so the next send() waits for it (no /chat-vs-/precache race). Chip: working→ready.
     func rewarmCache() {
         guard engine.ready, !store.chat.messages.isEmpty else { precache = ""; return }
+        if busy { rewarmAfterTurn = true; return }   // mid-generation: the turn's own precache (old settings)
+                                                     // is already queued and would overwrite ours — defer
+        lastComposeKey = ""                          // rebuild evicts the open-turn precompute → resample
         precache = "working"
         let msgs = buildEngineMessages(), rem = store.chat.reminder, s = store.chat.settings
         let trig = trimTrigger, tgt = trimTarget, mode = recacheMode
@@ -808,13 +817,15 @@ enum VoiceState: Equatable {
         Task { [weak self] in
             guard let self else { return }
             self.precache = "working"
-            for _ in 0..<50 {                      // ~5s cap
+            for _ in 0..<600 {                     // ~60s cap (window pre-slides / image refeeds can be slow)
                 try? await Task.sleep(for: .milliseconds(100))
                 if self.busy || self.precache.isEmpty { return }   // a new turn took over
                 let s = await self.engine.precacheState()
                 if s == "done" { self.precache = "done"; break }
                 if s == "idle" { self.precache = ""; return }
             }
+            if self.precache == "working" { self.precache = "" }   // fail OPEN — a stuck "working" would
+                                                                    // gate the compose loop forever
             try? await Task.sleep(for: .seconds(1.4))
             if self.precache == "done" { self.precache = "" }       // fade the "done" chip
         }
