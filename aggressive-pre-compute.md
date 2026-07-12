@@ -69,6 +69,31 @@ image from a *changed* one. `PF.img_sig` (SHA-1 of the image bytes, in order) is
 This one rule (`_plan_feed` in `serve.py`) is shared by the compose prefill **and** `/chat`, which is
 why a send after composing skips the image forward pass entirely.
 
+## Pre-generation (speculative replies)
+
+Once the composer is **fully fed and unchanged** for a tick, the loop goes one step further: it
+renders the SEND view (your turn closed + the generation prompt), feeds that ~8-token framing delta,
+and starts **generating the reply speculatively** — up to 64 tokens per 0.5 s tick, checking for a
+real send between every token so it never delays one.
+
+```
+READY → composer fed (per-tick prefill) → unchanged? → PRE-GENERATE slice (≤64 tok/tick)
+                                            │                    │
+                                       changed? → discard   send with same text?
+                                       (ledger rewinds)      → FLUSH: emit instantly (~4 ms),
+                                                               continue from the last token
+```
+
+- **Send with unchanged text** → the speculated tokens are already in the KV: the text appears
+  **instantly** (measured 4–5 ms to first delta) and generation continues seamlessly from where the
+  speculation left off — or, if the reply already finished, it's simply displayed.
+- **Composer changed** → the speculation is stale; because the PF ledger records exactly what the KV
+  holds (base + sampled tokens), the normal rewind rails discard it with zero special cases.
+- The HUD narrates: `next turn processed ⚡ pre-generating reply — N tok`, then
+  `⚡ reply pre-generated — instant on send`.
+- Yield discipline: a queued send makes the current slice stop between tokens (`GEN_WAITING`), same
+  as compose prefills.
+
 ## Send
 
 Hitting **send** is just the final compose sample, forced: the same tokenize → LCP → feed-the-tail,

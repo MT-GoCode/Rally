@@ -114,6 +114,9 @@ extension HotkeyMode   { static var current: HotkeyMode { HotkeyMode(rawValue: U
 extension SK {
     // Clamp: trigger in [target+1 … cap]; target in [100 … trigger-1]. Absent → the coded defaults.
     static let stopOnEdit = "civm.stopOnEdit"        // editing while the VLM is generating → Stop → ready cache → precompute
+    static let sidebarShortcut = "civm.sidebarShortcut"      // in-app sidebar toggle (menu key equivalent)
+    static let defaultSidebarShortcut = "cmd+b"
+    static var sidebarShortcutValue: String { UserDefaults.standard.string(forKey: sidebarShortcut) ?? defaultSidebarShortcut }
     static var stopOnEditValue: Bool { UserDefaults.standard.object(forKey: stopOnEdit) as? Bool ?? false }
     static var cacheTriggerValue: Int { let v = (UserDefaults.standard.object(forKey: cacheTrigger) as? Int) ?? defaultCacheTrigger; return max(200, min(v, cacheTriggerCap)) }
     static var cacheTargetValue: Int { let t = cacheTriggerValue; let v = (UserDefaults.standard.object(forKey: cacheTarget) as? Int) ?? defaultCacheTarget; return max(100, min(v, t - 1)) }
@@ -309,6 +312,8 @@ struct SettingsView: View {
     @State private var confirmReset = false
     @StateObject private var hkRec = BindingRecorder()      // voice hotkey: a real key + modifiers (self-contained)
     @StateObject private var shotRec = BindingRecorder()
+    @StateObject private var sidebarRec = BindingRecorder()
+    @AppStorage(SK.sidebarShortcut) private var sidebarShortcutRaw = SK.defaultSidebarShortcut
     @StateObject private var copyRec = BindingRecorder()
 
     private var submode: Binding<Submode> { Binding(get: { .from(submodeRaw) }, set: { submodeRaw = $0.rawValue }) }
@@ -439,6 +444,7 @@ struct SettingsView: View {
             hkRec.allowMouse = false; hkRec.onFinish = { hotkey = $0 }   // voice hotkey = key+mods
             copyRec.allowMouse = false
             shotRec.onFinish = { shotBinding = $0 }
+            sidebarRec.onFinish = { sidebarShortcutRaw = $0 }
             copyRec.onFinish = { copyBinding = $0 }
         }
         .onDisappear { hkRec.cancel(); shotRec.cancel(); copyRec.cancel() }
@@ -448,7 +454,15 @@ struct SettingsView: View {
     private var captureBox: some View {
         GroupBox("Capture") {
             VStack(alignment: .leading, spacing: 14) {
-                Text("In-app: ⌃B toggles the sidebar · Esc stops generation · ↑/↓ review replies · S source · C copy · R reset")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Sidebar toggle (in-app)").font(.caption.bold()).foregroundStyle(.secondary)
+                    HStack(spacing: 10) {
+                        bindingButton(sidebarRec, current: sidebarShortcutRaw, prompt: "press a key chord")
+                        Text("menu key equivalent — works even while the chat has keyboard focus")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                Text("In-app keys: Esc stop · ↑/↓ review · E edit · C copy · S source · R reset")
                     .font(.caption2).foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Screenshot shortcut").font(.caption.bold()).foregroundStyle(.secondary)

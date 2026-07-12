@@ -311,6 +311,7 @@ enum VoiceState: Equatable {
     private(set) var composeStatus = ""                 // HUD line: "precomputing next turn — N tok"
     @ObservationIgnored private var composeLoopRunning = false
     @ObservationIgnored private var lastComposeKey = ""
+    @ObservationIgnored private var pregenDone = false
     private func startComposeLoop() {
         guard !composeLoopRunning else { return }
         composeLoopRunning = true
@@ -323,21 +324,32 @@ enum VoiceState: Equatable {
                     if !self.composeStatus.isEmpty { self.composeStatus = "" }
                     continue
                 }
-                let text = self.input, imgs = self.pastedImages
+                // trim EXACTLY like ask()/sendText do — the pre-generation flush requires the compose
+                // render to byte-match the send render, and a trailing space would break that.
+                let text = self.input.trimmingCharacters(in: .whitespacesAndNewlines)
+                let imgs = self.pastedImages
                 guard !text.isEmpty || !imgs.isEmpty else {
                     if !self.composeStatus.isEmpty { self.composeStatus = "" }
-                    self.lastComposeKey = ""
+                    self.lastComposeKey = ""; self.pregenDone = false
                     continue
                 }
                 let key = text + "|" + imgs.map { $0.id.uuidString }.joined()
-                if key == self.lastComposeKey { continue }   // nothing changed since last sample
-                self.lastComposeKey = key
+                if key == self.lastComposeKey && self.pregenDone { continue }   // fed + reply finished — idle
                 let s = self.store.chat.settings
-                let fed = await self.engine.voicePrefill(messages: self.buildEngineMessages(),
-                                                         partial: text, images: imgs,
-                                                         reminder: self.store.chat.reminder,
-                                                         reminderMode: s.reminderMode)
-                if fed > 0 { self.preSent = fed; self.composeStatus = "precomputing next turn — \(fed) tok ready" }
+                let r = await self.engine.voicePrefill(messages: self.buildEngineMessages(),
+                                                       partial: text, images: imgs,
+                                                       reminder: self.store.chat.reminder,
+                                                       reminderMode: s.reminderMode)
+                self.lastComposeKey = key
+                self.pregenDone = r.pregenDone
+                if r.pregen > 0 {
+                    self.preSent = r.fed
+                    self.composeStatus = r.pregenDone
+                        ? "next turn processed ⚡ reply pre-generated — instant on send"
+                        : "next turn processed ⚡ pre-generating reply — \(r.pregen) tok"
+                } else if r.fed > 0 {
+                    self.preSent = r.fed; self.composeStatus = "precomputing next turn — \(r.fed) tok ready"
+                }
             }
         }
     }
@@ -786,10 +798,10 @@ enum VoiceState: Equatable {
                 if partial.isEmpty || partial == lastPosted { continue }
                 lastPosted = partial
                 let s = self.store.chat.settings
-                let fed = await self.engine.voicePrefill(messages: self.buildEngineMessages(), partial: partial,
-                                                         images: self.pastedImages,
-                                                         reminder: self.store.chat.reminder, reminderMode: s.reminderMode)
-                if self.appleRunning { self.preSent = fed }
+                let r = await self.engine.voicePrefill(messages: self.buildEngineMessages(), partial: partial,
+                                                       images: self.pastedImages,
+                                                       reminder: self.store.chat.reminder, reminderMode: s.reminderMode)
+                if self.appleRunning { self.preSent = r.fed }
             }
         }
     }

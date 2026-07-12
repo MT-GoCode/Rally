@@ -300,6 +300,20 @@ struct ChatRow: View {
 @main struct CIVMApp: App {
     @StateObject private var deps = AppDeps()
     let memOK: Bool
+    // "cmd+shift+b" → SwiftUI key equivalent (same string format as the capture bindings)
+    static func parseShortcut(_ s: String) -> (KeyEquivalent, EventModifiers) {
+        var mods: EventModifiers = []; var key: KeyEquivalent = "b"
+        for part in s.lowercased().split(separator: "+") {
+            switch part {
+            case "cmd", "command": mods.insert(.command)
+            case "ctrl", "control": mods.insert(.control)
+            case "alt", "opt", "option": mods.insert(.option)
+            case "shift": mods.insert(.shift)
+            default: if let c = part.first, part.count == 1 { key = KeyEquivalent(c) }
+            }
+        }
+        return (key, mods)
+    }
     init() {
         NSApplication.shared.setActivationPolicy(.regular)
         // Disable the press-and-hold accent popup (ś š ș…) so held keys repeat like a normal text
@@ -309,17 +323,11 @@ struct ChatRow: View {
         UserDefaults.standard.set(false, forKey: "ApplePressAndHoldEnabled")
         memOK = Mem.enough
     }
+    @AppStorage(SK.sidebarShortcut) private var sidebarShortcutRaw = SK.defaultSidebarShortcut
     var body: some Scene {
         WindowGroup("Rally") {
             Group {
-                if !memOK {
-                    VStack(spacing: 10) {
-                        Text("Not enough memory").font(.title2.bold())
-                        Text(String(format: "Need ~%.0fGB free (model %.0f + %.0f headroom); have %.1fGB of %.1fGB.",
-                                    Mem.modelGB + Mem.headroomGB, Mem.modelGB, Mem.headroomGB, Mem.availableGB, Mem.totalGB))
-                            .foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    }.padding(40).frame(minWidth: 460, minHeight: 240)
-                } else {
+                // memory no longer gates LAUNCH — only model selection (the home-screen cards grey out)
                     RootView().environment(deps.engine).environment(deps.store).environment(deps.promptLib).environment(deps.session)
                         .onAppear {
                             deps.engine.start()
@@ -328,7 +336,6 @@ struct ChatRow: View {
                                 requestAgentPerms()
                             }
                         }.frame(minWidth: 260, minHeight: 200)   // shrinks to a thin sliver (collapse the sidebar for the narrowest)
-                }
             }
         }
         .commands {
@@ -336,10 +343,11 @@ struct ChatRow: View {
             // while the chat WebView owns the keyboard — key equivalents are checked before first-responder
             // dispatch. State is the same @AppStorage key RootView binds.
             CommandGroup(after: .sidebar) {
+                let (key, mods) = Self.parseShortcut(sidebarShortcutRaw)
                 Button("Toggle Sidebar") {
                     UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: SK.sidebarCollapsed), forKey: SK.sidebarCollapsed)
                 }
-                .keyboardShortcut("b", modifiers: .control)
+                .keyboardShortcut(key, modifiers: mods)
             }
         }
     }

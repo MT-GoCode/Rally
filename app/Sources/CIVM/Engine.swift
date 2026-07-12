@@ -53,8 +53,9 @@ enum EngineModel: String, CaseIterable, Identifiable {
                        : "hybrid 9B · near-Gemma intelligence · ~7 GB · 262K ctx"
     }
     var weightsGB: Double { self == .gemma ? 16.0 : 6.0 }
-    // weights + pin/generation headroom — the bar for "enough memory to run this"
-    var neededGB: Double { self == .gemma ? 22.0 : 9.0 }
+    // weights + 8 GB pin/generation headroom — the bar for "enough memory to SELECT this model"
+    // (memory never gates app LAUNCH; only what you can turn on)
+    var neededGB: Double { weightsGB + 8 }
     static var current: EngineModel {
         get { EngineModel(rawValue: UserDefaults.standard.string(forKey: "engineModel") ?? "") ?? .gemma }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "engineModel") }
@@ -248,7 +249,8 @@ enum EngineModel: String, CaseIterable, Identifiable {
     // (typed text OR Apple partial, plus staged images — images first, so their expensive forward pass
     // happens while the user is still typing). Returns tokens now sitting past the pin ("pre-sent").
     func voicePrefill(messages: [ChatMessage], partial: String, images: [Block] = [],
-                      reminder: [Block] = [], reminderMode: String = "last") async -> Int {
+                      reminder: [Block] = [], reminderMode: String = "last")
+        async -> (fed: Int, pregen: Int, pregenDone: Bool) {
         struct Req: Encodable {
             let messages: [ChatMessage]; let partial: String
             let images: [Block]; let reminder: [Block]; let reminderMode: String
@@ -256,8 +258,8 @@ enum EngineModel: String, CaseIterable, Identifiable {
         let body = await Self.encodeOffMain(Req(messages: messages, partial: partial,
                                                 images: images, reminder: reminder, reminderMode: reminderMode))
         guard let d = try? await post("/voice/prefill", body: body, timeout: 60),
-              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return 0 }
-        return j["fed"] as? Int ?? 0
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return (0, 0, false) }
+        return (j["fed"] as? Int ?? 0, j["pregen"] as? Int ?? 0, j["pregenDone"] as? Bool ?? false)
     }
     // POST /keepalive — idle warmth ping (fired while the window is frontmost + a chat is open): the
     // engine reads its weights + pinned KV so macOS keeps those pages resident and the GPU stays warm,
