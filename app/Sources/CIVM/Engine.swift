@@ -77,7 +77,8 @@ enum EngineModel: String, CaseIterable, Identifiable {
     private(set) var model: EngineModel = .current   // what THIS engine process is running
 
     func start() {
-        if proc != nil { return }   // idempotent — a window reopen must not spawn a 2nd engine + 2nd poll loop
+        if let p = proc, p.isRunning { return }   // idempotent — but a DEAD engine (crash/external kill) must respawn
+        proc = nil
         model = .current
         let py = root.appendingPathComponent(".venv/bin/python")
         let modelPath = root.appendingPathComponent("models/\(model.dirName)")
@@ -164,6 +165,13 @@ enum EngineModel: String, CaseIterable, Identifiable {
             }
             // surface a stuck load whether /health is unreachable OR responding with loaded:false
             if !ready && ticks == 600 { status = "engine did not become ready (see serve.log)" }
+            // auto-respawn a DEAD engine (crash / external kill). switchModel nils proc BEFORE it
+            // terminates the old process, so an intentional swap never trips this.
+            if let p = proc, !p.isRunning {
+                proc = nil; ready = false; parakeet = false; memGb = 0
+                status = "engine died — restarting…"
+                start()
+            }
             ticks += 1
             try? await Task.sleep(for: .seconds(1))
         }
