@@ -597,6 +597,11 @@ def _do_pin(job):
     sys_imgs = content_of([b for b in (d.get("system") or []) if b.get("type") == "image"], tmpdir, paths)
     ctx_content = sys_imgs + content_of(d.get("context"), tmpdir, paths)
     msgs = build_messages(d.get("system"), ctx_content, [])
+    if IS_QWEN and msgs and not any(m.get("role") == "user" for m in msgs):
+        # qwen's template raises "No user query found" on a system-only render — give a SYSTEM-ONLY pin
+        # the same shape a context pin has (a tiny user turn + ACK) so it renders. Gemma path unchanged.
+        msgs.append({"role": "user", "content": [{"type": "text", "text": "(Context loaded — begin.)"}]})
+        msgs.append({"role": "assistant", "content": ACK})
     if msgs:
         pin_prompt = prompt_str(msgs, len(paths), add_gen=False)
         input_ids, pin_vis = token_ids(pin_prompt, paths)

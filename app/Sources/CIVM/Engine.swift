@@ -42,10 +42,23 @@ struct VoicePoll: Decodable {
     var captures: [Capture]? = nil
 }
 
-// The one model the engine runs: Gemma 4 26B-A4B (MoE, 262K ctx).
-enum Model {
-    static let dirName = "gemma-4-26b-a4b-4bit"
-    static let weightsGB = 16.0
+// The engine runs ONE of two local models; picked on the home screen, persisted, swap = engine restart.
+enum EngineModel: String, CaseIterable, Identifiable {
+    case gemma, qwen
+    var id: String { rawValue }
+    var dirName: String { self == .gemma ? "gemma-4-26b-a4b-4bit" : "qwen3.5-9b-4bit" }
+    var label: String { self == .gemma ? "Gemma 4 · 26B-A4B" : "Qwen3.5 · 9B" }
+    var detail: String {
+        self == .gemma ? "MoE 26B (4B active) · strongest reasoning · ~18 GB"
+                       : "hybrid 9B · near-Gemma intelligence · ~7 GB · 262K ctx"
+    }
+    var weightsGB: Double { self == .gemma ? 16.0 : 6.0 }
+    // weights + pin/generation headroom — the bar for "enough memory to run this"
+    var neededGB: Double { self == .gemma ? 22.0 : 9.0 }
+    static var current: EngineModel {
+        get { EngineModel(rawValue: UserDefaults.standard.string(forKey: "engineModel") ?? "") ?? .gemma }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "engineModel") }
+    }
 }
 
 @MainActor @Observable final class Engine {
@@ -61,10 +74,13 @@ enum Model {
     private let root = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("code/contextualized_instant_voice_models/engine")
 
+    private(set) var model: EngineModel = .current   // what THIS engine process is running
+
     func start() {
         if proc != nil { return }   // idempotent — a window reopen must not spawn a 2nd engine + 2nd poll loop
+        model = .current
         let py = root.appendingPathComponent(".venv/bin/python")
-        let modelPath = root.appendingPathComponent("models/\(Model.dirName)")
+        let modelPath = root.appendingPathComponent("models/\(model.dirName)")
         let p = Process()
         p.executableURL = py
         p.arguments = [root.appendingPathComponent("serve.py").path, modelPath.path, String(port)]
@@ -73,10 +89,29 @@ enum Model {
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         p.standardError = try? FileHandle(forWritingTo: logURL)
         do { try p.run(); proc = p } catch { status = "failed to launch engine: \(error.localizedDescription)"; return }
-        Task { await pollHealth() }
+        if !pollLoopRunning { pollLoopRunning = true; Task { await pollHealth() } }   // ONE poll loop across restarts
     }
 
     func stop() { proc?.terminate() }
+    @ObservationIgnored private var pollLoopRunning = false
+
+    // Home-screen model switch: unload the running engine, relaunch with the other model. The caller
+    // clears its pin bookkeeping (Store.enginePinned*) so every chat re-pins on next open.
+    func switchModel(to m: EngineModel) {
+        guard m != model || proc == nil else { return }
+        EngineModel.current = m
+        ready = false; parakeet = false; memGb = 0
+        status = "switching to \(m.label)…"
+        let old = proc
+        proc = nil
+        old?.terminate()
+        Task { [weak self] in
+            if let old {
+                await Task.detached { old.waitUntilExit() }.value   // free the port + the model's memory
+            }
+            self?.start()
+        }
+    }
 
     // POST /precache — re-warm the KV for the next message (new reminder mode / bounded-cache budget).
     func precache(messages: [ChatMessage], reminder: [Block], reminderMode: String,
@@ -251,8 +286,12 @@ enum Mem {
         let freeish = Double(stats.free_count + stats.inactive_count + stats.purgeable_count) * page
         return freeish / 1e9
     }
-    // gate follows the DEFAULT model (Settings → Model) since that's what start() loads at launch
-    static var modelGB: Double { Model.weightsGB }
+    // gate follows the SELECTED model (home-screen picker) since that's what start() loads
+    static var modelGB: Double { EngineModel.current.weightsGB }
     static let headroomGB = 10.0
     static var enough: Bool { availableGB >= modelGB + headroomGB }
+    // can `m` run right now? Free-ish memory PLUS whatever the running engine would release on switch.
+    static func canRun(_ m: EngineModel, runningEngineGB: Double) -> Bool {
+        availableGB + runningEngineGB >= m.neededGB
+    }
 }

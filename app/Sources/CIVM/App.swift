@@ -579,6 +579,10 @@ struct RootView: View {
                     Text(engine.parakeet ? "parakeet ready" : "parakeet loading…")
                         .font(.caption).foregroundStyle(engine.parakeet ? .primary : .secondary)
                 }
+                Text("MODEL").font(.caption.bold()).foregroundStyle(.secondary).padding(.top, 8)
+                HStack(spacing: 10) {
+                    ForEach(EngineModel.allCases) { m in modelCard(m) }
+                }
                 HStack {
                     Button("＋ New chat") { newChat() }   // chat-able immediately (engine holds an empty baseline; first ask resets the pin)
                     Button("Grant agent permissions…") { requestAgentPerms() }.font(.caption)
@@ -599,6 +603,41 @@ struct RootView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { store.refreshStubs() }
+    }
+
+    // One selectable model card. Greyed out when there isn't enough free memory to run it (free-ish +
+    // whatever the currently-running engine would release on switch). Selecting the other model unloads
+    // the engine and relaunches with the new one; pins are invalidated so every chat re-pins on open.
+    @ViewBuilder func modelCard(_ m: EngineModel) -> some View {
+        let selected = engine.model == m
+        let runnable = selected || Mem.canRun(m, runningEngineGB: engine.memGb)
+        Button {
+            guard !selected, runnable else { return }
+            store.enginePinnedChat = nil; store.enginePinnedHash = nil   // engine restart voids every pin
+            session.resetForModelSwitch()
+            engine.switchModel(to: m)
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                        .font(.system(size: 11)).foregroundStyle(selected ? Color.accentColor : .secondary)
+                    Text(m.label).font(.callout.weight(.medium))
+                }
+                Text(m.detail).font(.caption2).foregroundStyle(.secondary)
+                if !runnable {
+                    Text("needs ~\(Int(m.neededGB)) GB free — close some apps")
+                        .font(.caption2).foregroundStyle(.orange)
+                }
+            }
+            .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 9)
+                .fill(selected ? Color.accentColor.opacity(0.12) : Color.gray.opacity(0.08)))
+            .overlay(RoundedRectangle(cornerRadius: 9)
+                .stroke(selected ? Color.accentColor.opacity(0.5) : Color.gray.opacity(0.2)))
+            .opacity(runnable ? 1 : 0.5)
+        }
+        .buttonStyle(.plain)
+        .disabled(!runnable)
     }
 
     var chatBody: some View {

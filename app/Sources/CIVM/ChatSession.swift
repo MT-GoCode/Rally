@@ -567,6 +567,13 @@ enum VoiceState: Equatable {
         resetRenderWindow()                                // reset the bounded render-window for the new chat
     }
 
+    // Model switch (home screen): same in-flight/boundary reset as a chat switch, plus the cache chips —
+    // the engine process is being replaced, so everything cached is gone until chats re-pin on open.
+    func resetForModelSwitch() {
+        resetForChatSwitch()
+        precache = ""; pinOutcome = .none; caching = false
+    }
+
     // Single chat-activation path (fix A). Fires once per open / new / seed, AFTER store.chat settled.
     private var lastActivatedChatId: UUID? = nil
     private func onChatActivated(_ kind: Store.Activation) {
