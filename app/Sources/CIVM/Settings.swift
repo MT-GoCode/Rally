@@ -113,6 +113,8 @@ extension RecacheMode  { static var current: RecacheMode { RecacheMode(rawValue:
 extension HotkeyMode   { static var current: HotkeyMode { HotkeyMode(rawValue: UserDefaults.standard.string(forKey: SK.hotkeyMode) ?? SK.defaultHotkeyMode) ?? .selfContained } }
 extension SK {
     // Clamp: trigger in [target+1 … cap]; target in [100 … trigger-1]. Absent → the coded defaults.
+    static let stopOnEdit = "civm.stopOnEdit"        // editing while the VLM is generating → Stop → ready cache → precompute
+    static var stopOnEditValue: Bool { UserDefaults.standard.object(forKey: stopOnEdit) as? Bool ?? false }
     static var cacheTriggerValue: Int { let v = (UserDefaults.standard.object(forKey: cacheTrigger) as? Int) ?? defaultCacheTrigger; return max(200, min(v, cacheTriggerCap)) }
     static var cacheTargetValue: Int { let t = cacheTriggerValue; let v = (UserDefaults.standard.object(forKey: cacheTarget) as? Int) ?? defaultCacheTarget; return max(100, min(v, t - 1)) }
     // Bool keys: absent → the default (object(forKey:) is nil until the toggle is first written).
@@ -299,6 +301,7 @@ struct SettingsView: View {
     @AppStorage(SK.defaultSystemPrompt) private var defaultSystemPromptID = ""
     @AppStorage(SK.defaultReminderPrompt) private var defaultReminderPromptID = ""
     @AppStorage(SK.cacheTrigger) private var cacheTrigger = SK.defaultCacheTrigger
+    @AppStorage(SK.stopOnEdit) private var stopOnEdit = false
     @AppStorage(SK.cacheTarget) private var cacheTarget = SK.defaultCacheTarget
     @AppStorage(SK.recacheMode) private var recacheModeRaw = SK.defaultRecacheMode
     @AppStorage(SK.hotkeyMode) private var hotkeyModeRaw = SK.defaultHotkeyMode
@@ -368,6 +371,11 @@ struct SettingsView: View {
                                                   set: { recacheModeRaw = $0.rawValue })) {
                         ForEach(RecacheMode.allCases, id: \.self) { m in Text("\(m.label) — \(m.blurb)").tag(m) }
                     }.pickerStyle(.radioGroup).labelsHidden()
+                    Divider()
+                    Toggle("Stop on message edit to optimize precompute", isOn: $stopOnEdit)
+                        .font(.caption)
+                    Text("If you start composing (typing, staging an image, or talking) while the VLM is still generating, stop it immediately so the cache readies and your next message precomputes while you type.")
+                        .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }
 

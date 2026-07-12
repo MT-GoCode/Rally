@@ -85,6 +85,7 @@ enum VoiceState: Equatable {
             .sink { [weak self] _ in MainActor.assumeIsolated { self?.setAppActive(true) } }.store(in: &cancellables)
         NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
             .sink { [weak self] _ in MainActor.assumeIsolated { self?.setAppActive(false) } }.store(in: &cancellables)
+        startComposeLoop()   // aggressive precompute (self-gates: chat open + cache ready + composing)
     }
 
     // engine readiness → post config once it flips ready. onChange fires on the willSet; the Task defers
@@ -219,6 +220,7 @@ enum VoiceState: Equatable {
     func sendText(_ text: String) {
         let imgs = pastedImages
         pastedImages = []; input = ""; web?.setThumbs([])
+        composeStatus = ""; lastComposeKey = ""          // composed state is now the sent turn
         ask(text: text, images: imgs)
     }
     // A "data:<mediaType>;base64,<data>" URI pasted into the composer → a pasted image (+ refresh thumbs).
@@ -298,6 +300,51 @@ enum VoiceState: Equatable {
     private(set) var livePartial = ""
     private(set) var preSent = 0        // tokens prefilled into Gemma so far this utterance (live)
     private var voiceSeq = -1
+
+    // ---- aggressive precompute: while the cache is READY and the user is composing, sample the
+    // composer every 0.5s and prefill [history + OPEN user(images-first + text)] into the KV, so the
+    // send only pays for the un-typed tail (and images are forward-passed while the user types). ----
+    private(set) var composeStatus = ""                 // HUD line: "precomputing next turn — N tok"
+    @ObservationIgnored private var composeLoopRunning = false
+    @ObservationIgnored private var lastComposeKey = ""
+    private func startComposeLoop() {
+        guard !composeLoopRunning else { return }
+        composeLoopRunning = true
+        Task { [weak self] in
+            while let self {
+                try? await Task.sleep(for: .milliseconds(500))
+                // gate: chat open, engine ready, NOT generating, conversation cache ready (not warming)
+                guard self.store.screen == .chat, self.engine.ready, !self.busy,
+                      self.precache != "working", !self.appleRunning else {
+                    if !self.composeStatus.isEmpty { self.composeStatus = "" }
+                    continue
+                }
+                let text = self.input, imgs = self.pastedImages
+                guard !text.isEmpty || !imgs.isEmpty else {
+                    if !self.composeStatus.isEmpty { self.composeStatus = "" }
+                    self.lastComposeKey = ""
+                    continue
+                }
+                let key = text + "|" + imgs.map { $0.id.uuidString }.joined()
+                if key == self.lastComposeKey { continue }   // nothing changed since last sample
+                self.lastComposeKey = key
+                let s = self.store.chat.settings
+                let fed = await self.engine.voicePrefill(messages: self.buildEngineMessages(),
+                                                         partial: text, images: imgs,
+                                                         reminder: self.store.chat.reminder,
+                                                         reminderMode: s.reminderMode)
+                if fed > 0 { self.preSent = fed; self.composeStatus = "precomputing next turn — \(fed) tok ready" }
+            }
+        }
+    }
+
+    // "Stop on message edit": the user started composing (typing / staging an image / starting to talk)
+    // while the VLM is still generating → Stop it now so the ONE ready-cache rail runs (stop →
+    // stashInterrupted → rewarm/precache) and the compose loop can precompute against a ready cache.
+    func userStartedEditing() {
+        guard busy, SK.stopOnEditValue else { return }
+        stop()
+    }
 
     // ---- Apple SpeechTranscriber (streaming submode; on-device, Swift-side). Python drives the
     // chord/overlay and reports state; the app runs Apple while listening and finalizes on chord-up. ----
@@ -505,10 +552,13 @@ enum VoiceState: Equatable {
     // interruption prefix added HERE only. Cross-turn KV reuse keeps this cheap regardless of length.
     private func buildEngineMessages() -> [ChatMessage] {
         store.chat.messages.map { m in
-            var blocks: [Block] = []
+            // IMAGES FIRST in user turns: they're the expensive, STABLE part of a composed message, so
+            // leading with them lets the compose-prefill forward-pass them once while the (volatile)
+            // text keeps changing after — and the send then reuses that work via the image-sig LCP.
+            var blocks: [Block] = m.role == "user" ? m.content.filter { $0.type == "image" } : []
             let t = m.isInterruption ? "@@INTERRUPTION@@: " + m.text : m.text
             if !t.isEmpty { blocks.append(Block(text: t)) }
-            blocks.append(contentsOf: m.content)
+            blocks.append(contentsOf: m.role == "user" ? m.content.filter { $0.type != "image" } : m.content)
             return ChatMessage(role: m.role, content: blocks)
         }
     }
@@ -564,6 +614,7 @@ enum VoiceState: Equatable {
         if dictating { endDictation() }                   // don't carry a locked field / muted audio across chats
         selectedMessageID = nil; sourceShownIDs = []      // nav highlight + source toggles are per-chat
         convStart = nil; convTokens = nil                 // boundary + usage unknown until this chat's cache reports
+        composeStatus = ""; lastComposeKey = ""            // precompute state is per-chat
         resetRenderWindow()                                // reset the bounded render-window for the new chat
     }
 
@@ -700,7 +751,9 @@ enum VoiceState: Equatable {
                 let partial = self.apple.partial
                 if partial.isEmpty || partial == lastPosted { continue }
                 lastPosted = partial
-                let fed = await self.engine.voicePrefill(messages: self.buildEngineMessages(), partial: partial)
+                let s = self.store.chat.settings
+                let fed = await self.engine.voicePrefill(messages: self.buildEngineMessages(), partial: partial,
+                                                         reminder: self.store.chat.reminder, reminderMode: s.reminderMode)
                 if self.appleRunning { self.preSent = fed }
             }
         }
@@ -838,6 +891,7 @@ enum VoiceState: Equatable {
     // then mute system audio if enabled.
     private func beginDictation() {
         guard !dictating else { return }                    // once per utterance
+        userStartedEditing()                                // starting to talk counts as composing (stop-on-edit)
         dictCaret = inputCaretOffset()
         dictWasAlone = input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         dictating = true

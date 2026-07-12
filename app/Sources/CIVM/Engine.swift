@@ -244,12 +244,18 @@ enum EngineModel: String, CaseIterable, Identifiable {
         let body = (try? JSONSerialization.data(withJSONObject: ["count": count])) ?? Data("{}".utf8)
         _ = try? await post("/voice/captures-ack", body: body, timeout: 5)
     }
-    // POST /voice/prefill — prefill Gemma's KV with the in-progress Apple transcript while the user
-    // talks. Returns the token count now sitting past the pin (the live "pre-sent" number).
-    func voicePrefill(messages: [ChatMessage], partial: String) async -> Int {
-        struct Req: Encodable { let messages: [ChatMessage]; let partial: String }
-        let body = (try? JSONEncoder().encode(Req(messages: messages, partial: partial))) ?? Data("{}".utf8)
-        guard let d = try? await post("/voice/prefill", body: body, timeout: 10),
+    // POST /voice/prefill — aggressive precompute: prefill the KV with the in-progress composer state
+    // (typed text OR Apple partial, plus staged images — images first, so their expensive forward pass
+    // happens while the user is still typing). Returns tokens now sitting past the pin ("pre-sent").
+    func voicePrefill(messages: [ChatMessage], partial: String, images: [Block] = [],
+                      reminder: [Block] = [], reminderMode: String = "last") async -> Int {
+        struct Req: Encodable {
+            let messages: [ChatMessage]; let partial: String
+            let images: [Block]; let reminder: [Block]; let reminderMode: String
+        }
+        let body = await Self.encodeOffMain(Req(messages: messages, partial: partial,
+                                                images: images, reminder: reminder, reminderMode: reminderMode))
+        guard let d = try? await post("/voice/prefill", body: body, timeout: 60),
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return 0 }
         return j["fed"] as? Int ?? 0
     }

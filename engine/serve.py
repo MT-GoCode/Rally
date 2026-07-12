@@ -31,7 +31,7 @@ Endpoints (localhost; JSON; ndjson where noted):
 Block shape (interro-verbatim): {"type":"text","text":..} |
   {"type":"image","source":{"type":"base64","media_type":..,"data":..}}
 """
-import base64, json, os, queue, shutil, sys, tempfile, threading, time
+import base64, hashlib, json, os, queue, shutil, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import mlx.core as mx
@@ -83,7 +83,7 @@ GEMMA_Q = queue.Queue()                    # jobs for the single Gemma worker th
 KEEPALIVE = {"pending": False}             # coalesce idle keepalive pings (never queue a second while one is in flight)
 
 st = {}                                    # pinned chat: kv, pin_len, ctx_content, ctx_paths, tmpdir, system
-PF = {"ids": None}                         # streaming-prefill: token-id list currently fed past the pin
+PF = {"ids": None, "img_sig": None}        # streaming-prefill: ids fed past the pin + identity of open-turn images in KV
 PRECACHE = {"state": "idle"}               # post-response KV warm-up for the NEXT message: idle|working|done
                                            # (Apple partials prefill Gemma while you talk; /chat LCP-reuses it)
 
@@ -191,7 +191,7 @@ def _do_reclaim(job):
         _free_mem()
         if _mem()[0] > MEM_CEILING_GB and st.get("kv") is not None and st.get("pin_len") is not None:
             _rewind_to(0)                       # drop conversation → bare pin (gemma trim / qwen snapshot)
-            PF["ids"] = []; st["conv_start"] = 0; st["stream_start"] = 0
+            PF["ids"] = []; PF["img_sig"] = None; st["conv_start"] = 0; st["stream_start"] = 0
             QSNAP["conv"] = None                # the conv snapshot holds conversation KV — release it too
             _free_mem()
             MEM["reclaims"] += 1
@@ -610,7 +610,7 @@ def _drop_pin():
     if st.get("tmpdir"):
         shutil.rmtree(st["tmpdir"], ignore_errors=True)
     st.clear()
-    PF["ids"] = None
+    PF["ids"] = None; PF["img_sig"] = None
 
 
 def _do_pin(job):
@@ -664,7 +664,7 @@ def _do_pin(job):
     _drop_pin()
     st.update(kv=kv, pin_len=pin_len, ctx_content=ctx_content, ctx_paths=paths,
               tmpdir=tmpdir, system=d.get("system"), conv_start=0, stream_start=0)   # fresh pin → window restarts at turn 0
-    PF["ids"] = None
+    PF["ids"] = None; PF["img_sig"] = None
     if IS_QWEN:                                # the frozen anchor every divergence can rewind to
         QSNAP["pin"] = snap_cache(kv); QSNAP["conv"] = None
     peak = _mem()[1]
@@ -857,10 +857,47 @@ def _strip_open(ids_list):
     return ids_list
 
 
+def _img_sig(paths):
+    """Identity of the per-turn images last fed into the KV. Placeholder token ids are all identical, so
+    an LCP can silently 'match' STALE image tokens whose pixels changed — the sig is what makes image
+    reuse safe: equal sig ⇒ same bytes ⇒ the cached image tokens are valid."""
+    if not paths:
+        return None
+    h = hashlib.sha1()
+    for p in paths:
+        with open(p, "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()
+
+
+def _plan_feed(ids, want_lcp, paths, vis):
+    """THE shared reuse rail for image-bearing feeds (compose-prefill AND /chat): decide how much of
+    `ids` is safely reusable, rewind the cache there, and return (achieved, tail, tail_vis).
+    - No images → plain rewind (today's text path).
+    - sig UNCHANGED (same image bytes, same order as last fed — history or staged alike) → the image
+      tokens already in the KV are valid: keep the full text LCP. This is what lets a send reuse the
+      compose-prefill's image forward pass.
+    - sig CHANGED/unknown → cap reuse at the first placeholder and refeed all images with pixels
+      (placeholder ids are identical for every image, so an LCP can't distinguish stale image tokens —
+      the sig is the guard).
+    Rewind can land before the images (qwen snapshot boundaries) — tail_vis follows the TAIL: pixels are
+    attached iff placeholders are actually in it (feeds never split an image run mid-way)."""
+    if paths and _img_sig(paths) != PF.get("img_sig"):
+        img_id = _img_token_id()
+        first = next((i for i, t in enumerate(ids) if t == img_id), len(ids))
+        want_lcp = min(want_lcp, first)
+    achieved = _rewind_to(want_lcp)
+    tail = ids[achieved:]
+    tail_vis = vis if (paths and any(t == _img_token_id() for t in tail)) else {}
+    return achieved, tail, tail_vis
+
+
 def _do_prefill(job):
-    """Streaming prefill (Apple partial → Gemma KV): feed [messages + OPEN user(partial)] past the
-    pin, incrementally. max_tokens=0 = clean prefill (no generated token pollutes the sliding cache);
-    the user turn is kept OPEN (no <end_of_turn>) so /chat reuses it exactly. Returns fed-past-pin."""
+    """Compose/voice prefill: feed [messages + OPEN user(images-first + partial text)] past the pin,
+    incrementally — the generalized 'aggressive precompute' (the app samples the composer every 0.5s;
+    Apple streaming uses the same path). max_tokens=0 = clean prefill; the user turn stays OPEN (no
+    turn-end) so /chat's LCP reuses it exactly. Reminder is placed for before/start modes (so their
+    precached shape survives); 'after' rides the /chat render, of which this is a strict prefix."""
     if not st.get("kv"):
         job.result = {"fed": 0}; return
     partial = job.params["partial"]
@@ -869,34 +906,34 @@ def _do_prefill(job):
     try:
         per_turn_paths = []
         mlx_msgs = _mlx_messages(messages, tmpdir, per_turn_paths)
-        mlx_msgs = mlx_msgs + [{"role": "user", "content": [{"type": "text", "text": partial}]}]
-        prompt = prompt_str(mlx_msgs, len(per_turn_paths), add_gen=False)   # conversation only (no system/ctx)
-        ids_arr, vis = token_ids(prompt, per_turn_paths)
-        ids = ids_arr.flatten().tolist()
-        bos = _bos_id()
-        if bos is not None and ids and ids[0] == bos:
-            ids = ids[1:]
-        open_list = _strip_open(ids)               # drop trailing turn-end → user turn stays OPEN
-        lcp = _lcp(PF["ids"] or [], open_list)      # conversation-token reuse (past the frozen pin)
-        if per_turn_paths:
-            # pixels must match the image placeholders in the fed tokens: with per-turn images their
-            # placeholders sit in the reused prefix, so re-feed the whole conversation past the pin.
-            lcp = 0
-        if lcp >= len(open_list):
-            PF["ids"] = open_list                   # nothing new to feed (partial unchanged/shorter)
-            job.result = {"fed": len(open_list)}; return
-        lcp = _rewind_to(lcp)                       # a revised partial diverged → drop the wrong tail
-        feed = mx.array([open_list[lcp:]])
+        open_content = content_of(job.params.get("images") or [], tmpdir, per_turn_paths)  # staged images FIRST
+        open_content += [{"type": "text", "text": partial}] if partial else []
+        if not open_content:
+            job.result = {"fed": len(PF["ids"] or [])}; return
+        mlx_msgs = mlx_msgs + [{"role": "user", "content": open_content}]
+        mode = job.params.get("mode") or "last"
+        if mode in ("before", "start"):                     # keep the precached reminder shape aligned
+            mlx_msgs = _place_reminder(mlx_msgs, _reminder_content(job.params.get("reminder"), tmpdir, per_turn_paths), mode)
+        extras = {}
+        ids = _render_ids(mlx_msgs, per_turn_paths, add_gen=False, extras_out=extras)
         if not IS_QWEN:
             pv = _per_turn_pixels(per_turn_paths)
-            vis = {"pixel_values": pv} if pv is not None else {}
+            extras = {"pixel_values": pv} if pv is not None else {}
+        open_list = _strip_open(ids)               # drop trailing turn-end → user turn stays OPEN
+        lcp = _lcp(PF["ids"] or [], open_list)      # conversation-token reuse (past the frozen pin)
+        if lcp >= len(open_list):
+            PF["ids"] = open_list                   # nothing new to feed (partial unchanged/shorter)
+            job.result = {"fed": len(open_list), "reused": lcp}; return
+        achieved, tail, tail_vis = _plan_feed(open_list, lcp, per_turn_paths, extras)
         with MLX_LOCK:
-            for _ in stream_generate(model, processor, "", input_ids=feed,
+            for _ in stream_generate(model, processor, "", input_ids=mx.array([tail]),
                                      prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
-                                     prefill_step_size=PREFILL_STEP, **vis):
+                                     prefill_step_size=PREFILL_STEP, **tail_vis):
                 pass
         PF["ids"] = open_list
-        job.result = {"fed": len(open_list)}
+        if per_turn_paths:
+            PF["img_sig"] = _img_sig(per_turn_paths)
+        job.result = {"fed": len(open_list), "reused": achieved}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -961,7 +998,7 @@ def _do_precache(job):
                                          prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
                                          prefill_step_size=PREFILL_STEP, **vis):
                     pass
-        PF["ids"] = tgt_ids                     # next /chat's LCP reuses everything up to the question
+        PF["ids"] = tgt_ids; PF["img_sig"] = None   # clean history — no OPEN-turn images in KV
         if IS_QWEN:                             # anchor: clean next-msg target — divergent turns restore here
             QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
     finally:
@@ -978,7 +1015,7 @@ def _stream_replay(messages, reminder, mode, trigger, target):
     pin_len = st["pin_len"]
     with MLX_LOCK:
         trim_kv(st["kv"], pin_len)
-    PF["ids"] = []; st["stream_start"] = 0
+    PF["ids"] = []; PF["img_sig"] = None; st["stream_start"] = 0
     starts = [i for i, m in enumerate(messages) if m.get("role") == "user"]
     if not starts:
         return 0
@@ -1033,7 +1070,7 @@ def _do_reconcile(job):
             conv_start = _stream_replay(messages, reminder, mode, trigger, target)   # dropping → rebuild the smear
         else:
             _rewind_to(0)                                       # back to the bare pin (gemma trim / qwen snapshot)
-            PF["ids"] = []; st["stream_start"] = 0
+            PF["ids"] = []; PF["img_sig"] = None; st["stream_start"] = 0
             conv_start = cs0                                    # recent (or qwen, or nothing to drop) → single prefill below
         st["conv_start"] = conv_start; st["stream_start"] = conv_start
         # warm the precache target for the NEXT message on top of the rebuilt window (reminder-aware)
@@ -1047,7 +1084,7 @@ def _do_reconcile(job):
                                          prompt_cache=st["kv"], max_tokens=0, temperature=0.0,
                                          prefill_step_size=PREFILL_STEP, **vis):
                     pass
-        PF["ids"] = tgt_ids
+        PF["ids"] = tgt_ids; PF["img_sig"] = None
         if IS_QWEN:
             QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
         job.result = {"conv_start": conv_start, "conv_tokens": len(tgt_ids), "mem_peak_gb": _mem()[1]}
@@ -1080,16 +1117,13 @@ def _do_generate(job):
         # match lands right after the previous user message — ~[last ai + new user + reminder] re-feeds.
         pf = PF["ids"] or []
         lcp_conv = _lcp(pf, conv_ids)
-        if per_turn_paths:
-            # vis holds pixels for ALL per-turn chat images, whose placeholder tokens live in the
-            # reused prefix. Cross-turn LCP reuse would feed a tail with no image placeholders while
-            # vis still carries those pixels → masked_scatter shape mismatch. Disable conversation
-            # reuse (the pin stays reused) so feed_list = conv_ids carries every image placeholder.
-            lcp_conv = 0
-        lcp_conv = _rewind_to(lcp_conv)      # gemma: trim_kv; qwen: snapshot restore (achieved ≤ wanted)
-        feed_list = conv_ids[lcp_conv:]
+        # Images in HISTORY turns (or the reminder) sit in the reused prefix → _plan_feed refeeds from
+        # the first placeholder (the old conservative rule). Images in the CURRENT message with an
+        # UNCHANGED sig (compose-prefill already forward-passed them) keep the full LCP — the send
+        # skips the image forward pass entirely (that's the aggressive-precompute payoff).
+        lcp_conv, feed_list, vis = _plan_feed(conv_ids, lcp_conv, per_turn_paths, vis)
         if not feed_list:                    # nothing new (shouldn't happen — genprompt differs each turn)
-            feed_list = conv_ids[-1:]; lcp_conv = _rewind_to(len(conv_ids) - 1)
+            lcp_conv = _rewind_to(len(conv_ids) - 1)
             feed_list = conv_ids[lcp_conv:]
         feed_ids = mx.array([feed_list])
         reused = lcp_conv                    # conversation tokens reused from the cross-turn cache
@@ -1154,6 +1188,8 @@ def _do_generate(job):
         # those conversation tokens so the NEXT /chat reuses all of them and re-feeds only the
         # divergent tail. Preserved on interrupt too (the history up to the interruption stays cached).
         PF["ids"] = conv_ids + gen_ids
+        if per_turn_paths:
+            PF["img_sig"] = _img_sig(per_turn_paths)
         if not job.cancelled:
             chat_tokens = len(conv_ids) + gen_count
             meta = {"done": True, "ttft": round(ttft or 0, 3), "gen_s": round(time.time() - start, 2),
@@ -1480,12 +1516,15 @@ class H(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True})
 
             if self.path == "/voice/prefill":
-                # Apple partial → prefill Gemma's KV while the user talks. {messages, partial} →
-                # {fed} = tokens now sitting past the pin (live "pre-sent" count for the UI).
+                # Aggressive precompute: the app samples the composer (typed text, Apple partial, staged
+                # images) and this prefill feeds [history + OPEN user(images-first + text)] past the pin.
+                # {messages, partial, images?, reminder?, reminderMode?} → {fed, reused}.
                 d = self._body()
                 if not st.get("kv"):
                     return self._json(200, {"fed": 0})
-                job = Job("prefill", messages=d.get("messages") or [], partial=str(d.get("partial") or ""))
+                job = Job("prefill", messages=d.get("messages") or [], partial=str(d.get("partial") or ""),
+                          images=d.get("images") or [], reminder=d.get("reminder"),
+                          mode=d.get("reminderMode") or "last")
                 GEMMA_Q.put(job)
                 job.done.wait()
                 return self._json(200, job.result or {"fed": 0})

@@ -108,11 +108,15 @@ struct ChatWebView: NSViewRepresentable {
             guard let d = m.body as? [String: Any], let action = d["action"] as? String else { return }
             switch action {
             case "send":       session?.sendText(d["text"] as? String ?? "")
-            case "input":      session?.input = d["text"] as? String ?? ""
+            case "input":
+                session?.userStartedEditing()   // stop-on-edit (no-op unless generating + setting on)
+                session?.input = d["text"] as? String ?? ""
             case "focus":      session?.inputIsFocused = (d["focused"] as? Bool ?? false)
             case "copy":       let s = d["text"] as? String ?? ""; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string)
             case "reset":       if let id = (d["id"] as? String).flatMap(UUID.init) { session?.resetToHere(id) }
-            case "pasteImage":  if let uri = d["data"] as? String { session?.attachDataURIImage(uri) }
+            case "pasteImage":
+                session?.userStartedEditing()   // staging an image counts as composing
+                if let uri = d["data"] as? String { session?.attachDataURIImage(uri) }
             case "removeImage": if let i = d["index"] as? Int { session?.removePastedImageAt(i) }
             case "stop":        session?.stop()
             default: break
