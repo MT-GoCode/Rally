@@ -605,6 +605,22 @@ enum VoiceState: Equatable {
         rewarmCache()                           // recompute the KV up to the (now truncated) transcript
     }
 
+    // Edit an OLD user message: reset to just before it (same truncation rail as resetToHere — the
+    // /chat render's LCP + the exactness invariant rebuild the cache), then send the edited text as a
+    // fresh message immediately. No precompute step — the send IS the next sample, forced.
+    func editUserMessage(_ id: UUID, text: String) {
+        guard let i = store.chat.messages.firstIndex(where: { $0.id == id }),
+              store.chat.messages[i].role == "user" else { return }
+        askTask?.cancel()
+        streaming = ""; busy = false
+        let images = store.chat.messages[i].content.filter { $0.type == "image" }   // keep the msg's images
+        store.chat.messages = Array(store.chat.messages.prefix(upTo: i))
+        lastReused = 0; lastNew = 0; lastPinned = 0; lastTtft = 0; lastTurnTokens = 0
+        anewParts = []; selectedMessageID = nil
+        store.save()
+        ask(text: text, images: images)
+    }
+
     // ---- capture staging intents (fix E) — clipboard/timeline UI hands finished Blocks in ----
     func attachPastedImages(_ blocks: [Block]) { pastedImages.append(contentsOf: blocks); syncThumbs() }
     func removePastedImage(id: UUID) { pastedImages.removeAll { $0.id == id }; syncThumbs() }

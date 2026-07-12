@@ -44,16 +44,20 @@
   .usertext { white-space: pre-wrap; }                 /* user messages: the nice sans, not monospace */
   .src { white-space: pre-wrap; font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12px; }
   /* ⋯ menu sits OUTSIDE the bubble, to its right */
-  .dotswrap { position: relative; align-self: flex-start; margin: 2px 0 0 4px; flex: 0 0 auto; }
-  .dots { color: #8a8a8a; cursor: pointer; font-size: 16px; line-height: 1; opacity: 0; padding: 3px 6px; border-radius: 6px; }
-  .row.assistant:hover .dots, .row.sel .dots { opacity: 1; }
-  .dots:hover { background: rgba(160,160,160,0.15); color: #e6e6e6; }
-  .menu { position: absolute; top: 26px; left: 0; background: #2b2b2b; border: 1px solid rgba(160,160,160,0.3);
-    border-radius: 8px; padding: 4px; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,0.4); display: none; }
-  .menu.open { display: block; }
-  .menu button { display: block; width: 100%; text-align: left; background: none; border: 0; color: #e6e6e6;
-    font: inherit; padding: 5px 10px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
-  .menu button:hover { background: rgba(10,132,255,0.3); }
+  /* per-message action buttons — one row OUTSIDE the bubble (agent: right; user: left) */
+  .btnrow { display: flex; gap: 2px; align-self: flex-start; margin-top: 2px; flex: 0 0 auto; opacity: 0; }
+  .row:hover .btnrow, .row.sel .btnrow { opacity: 1; }
+  .abtn { background: none; border: 0; color: #8a8a8a; cursor: pointer; font-size: 12px; line-height: 1;
+    padding: 4px 6px; border-radius: 6px; font-family: "SF Mono", ui-monospace, monospace; }
+  .abtn:hover { background: rgba(160,160,160,0.15); color: #e6e6e6; }
+  /* inline editor for an old user message */
+  .editbox { display: flex; flex-direction: column; gap: 8px; min-width: 320px; }
+  .editbox textarea { background: rgba(0,0,0,0.25); border: 1px solid rgba(160,160,160,0.3); border-radius: 8px;
+    color: #e6e6e6; font: inherit; padding: 8px; min-height: 60px; resize: vertical; outline: none; }
+  .editbox .ebtns { display: flex; gap: 8px; justify-content: flex-end; }
+  .editbox .ebtns button { border: 0; border-radius: 7px; padding: 5px 12px; font: inherit; font-size: 12.5px; cursor: pointer; }
+  .editbox .e-cancel { background: rgba(160,160,160,0.22); color: #e6e6e6; }
+  .editbox .e-send { background: #0a84ff; color: #fff; }
   #composer-wrap { flex: 0 0 auto; border-top: 1px solid rgba(160,160,160,0.2); padding: 8px 12px; background: #1a1a1a; }
   /* image SEND QUEUE: single horizontal-scrolling row, delete ✕ on each, click to zoom */
   #thumbs { display: flex; gap: 8px; overflow-x: auto; overflow-y: hidden; margin-bottom: 8px; }
@@ -126,11 +130,32 @@ let toastTimer = 0;
 function toast(msg){ toastEl.textContent = msg; toastEl.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(()=>toastEl.classList.remove("show"), 1100); }
 function copyMsg(text){ bridge({action:"copy", text}); toast("Copied"); }   // write to clipboard (Swift) + flash
 let MSGS = [], CONV_START = -1, SEL = -1, SRC = {}, streamEl = null, BUSY = false;
+const EDITS = new Set();   // message indices with an open edit box (many at once — pure frontend)
+const msgBody = m => ((m && m.text) || "").split("@@APPENDIX@@")[0].trim();
 
 function zoom(src){ zoomEl.querySelector("img").src = src; zoomEl.style.display = "flex"; }
 zoomEl.onclick = () => { zoomEl.style.display = "none"; };
 
-function agentIndices(){ return MSGS.map((m,i)=>m.role==="assistant"?i:-1).filter(i=>i>=0); }
+// ONE action table for both roles — buttons, keyboard shortcuts, and tooltips all read from it.
+function actionsFor(m, i){
+  if (m.role === "assistant") {
+    const acts = [["⧉", "Copy (C)", "c", ()=>copyMsg(msgBody(m))],
+                  ["</>", SRC[i] ? "View rendered (S)" : "View source (S)", "s", ()=>{ SRC[i]=!SRC[i]; render(); }]];
+    if (m.id) acts.push(["↺", "Reset to here (R)", "r", ()=>bridge({action:"reset", id:m.id})]);
+    return acts;
+  }
+  const acts = [];
+  if (m.id) acts.push(["✎", "Edit (E) — resend from here", "e", ()=>startEdit(i)]);
+  acts.push(["⧉", "Copy (C)", "c", ()=>copyMsg(msgBody(m))]);
+  return acts;
+}
+function startEdit(i){
+  if (!(MSGS[i] && MSGS[i].role === "user" && MSGS[i].id)) return;
+  EDITS.add(i); SEL = -1; render();
+  const ta = messagesEl.querySelector(`.row[data-idx="${i}"] .editbox textarea`);
+  if (ta){ ta.focus(); ta.selectionStart = ta.selectionEnd = ta.value.length; }
+}
+function cancelEdit(i){ EDITS.delete(i); render(); }
 function atBottom(){ return messagesEl.scrollTop + messagesEl.clientHeight >= messagesEl.scrollHeight - 60; }
 function toBottom(){ messagesEl.scrollTop = messagesEl.scrollHeight; }
 
@@ -157,35 +182,54 @@ function render(msgs, convStart){
   messagesEl.innerHTML = ""; streamEl = null;
   MSGS.forEach((m,i)=>{
     if (CONV_START>0 && i===CONV_START){ const dv=document.createElement("div"); dv.className="divider"; dv.textContent="earlier turns are out of context"; messagesEl.appendChild(dv); }
+    // IMAGES prefix the user message → render them as their OWN side-scrolling bubble ABOVE the text
+    // bubble. Not navigable / copyable / editable (reset-before still covers it); the TEXT bubble below
+    // is the message for nav/copy/edit purposes. Agent images (rare) stay inline.
+    if (m.role==="user" && m.images && m.images.length){
+      const irow=document.createElement("div"); irow.className="row user imgonly";
+      const ibub=document.createElement("div"); ibub.className="bubble";
+      const s=document.createElement("div"); s.className="imgstrip";
+      m.images.forEach(src=>{const im=document.createElement("img"); im.src=src; im.onclick=()=>zoom(src); s.appendChild(im);});
+      ibub.appendChild(s); irow.appendChild(ibub); messagesEl.appendChild(irow);
+    }
     const row=document.createElement("div");
     row.className="row "+(m.role==="user"?"user":"assistant")+(m.isInterruption?" interruption":"")+(i===SEL?" sel":"");
+    row.dataset.idx = i;                                   // nav anchor (rows ≠ message indices now)
     const bub=document.createElement("div"); bub.className="bubble";
     if (m.isInterruption){ const l=document.createElement("div"); l.className="intlabel"; l.textContent="INTERRUPTED TO ADD"; bub.appendChild(l); }
-    if (m.images&&m.images.length){ const s=document.createElement("div"); s.className="imgstrip";
+    if (m.role!=="user" && m.images && m.images.length){ const s=document.createElement("div"); s.className="imgstrip";
       m.images.forEach(src=>{const im=document.createElement("img"); im.src=src; im.onclick=()=>zoom(src); s.appendChild(im);}); bub.appendChild(s); }
+    if (EDITS.has(i) && m.role==="user"){                  // inline edit (text only — images ride along on resend)
+      const eb=document.createElement("div"); eb.className="editbox";
+      const ta=document.createElement("textarea"); ta.value=msgBody(m);
+      const commit=()=>{ bridge({action:"editSend", id:m.id, text:ta.value}); EDITS.delete(i); };
+      ta.addEventListener("keydown",(ev)=>{ ev.stopPropagation();   // own keys: Esc=cancel, Enter=commit
+        if (ev.key==="Escape"){ ev.preventDefault(); cancelEdit(i); }
+        else if (ev.key==="Enter" && !ev.shiftKey){ ev.preventDefault(); commit(); } });
+      const btns=document.createElement("div"); btns.className="ebtns";
+      const bc=document.createElement("button"); bc.className="e-cancel"; bc.textContent="Cancel"; bc.onclick=()=>cancelEdit(i);
+      const bs=document.createElement("button"); bs.className="e-send"; bs.textContent="Send"; bs.onclick=commit;
+      eb.appendChild(ta); btns.appendChild(bc); btns.appendChild(bs); eb.appendChild(btns); bub.appendChild(eb);
+      row.appendChild(bub); messagesEl.appendChild(row); return;
+    }
     const bodyEl=document.createElement("div");
-    if (SRC[i]){ bodyEl.className="src"; bodyEl.textContent=m.text.split("@@APPENDIX@@")[0].trim(); }         // agent: view source (mono)
-    else if (m.role==="user"){ bodyEl.className="usertext"; bodyEl.textContent=m.text.split("@@APPENDIX@@")[0].trim(); }  // user: sans
-    else { renderBody(bodyEl, m.text); }                                                                     // agent: rendered markdown
+    if (SRC[i]){ bodyEl.className="src"; bodyEl.textContent=msgBody(m); }         // view source (mono)
+    else if (m.role==="user"){ bodyEl.className="usertext"; bodyEl.textContent=msgBody(m); }  // user: sans
+    else { renderBody(bodyEl, m.text); }                                          // agent: rendered markdown
     bub.appendChild(bodyEl);
     if (m.interrupted){ const c=document.createElement("div"); c.style.cssText="font-size:11px;color:#8a8a8a"; c.textContent="⎯ interrupted"; bub.appendChild(c); }
-    row.appendChild(bub);
-    if (m.role==="assistant" && m.id){                    // ⋯ menu OUTSIDE the bubble, to its right
-      const wrap=document.createElement("div"); wrap.className="dotswrap";
-      const dots=document.createElement("div"); dots.className="dots"; dots.textContent="⋯";
-      const menu=document.createElement("div"); menu.className="menu";
-      const mk=(label,fn)=>{const b=document.createElement("button"); b.textContent=label; b.onclick=(e)=>{e.stopPropagation(); menu.classList.remove("open"); fn();}; return b;};
-      menu.appendChild(mk("Copy · C", ()=>copyMsg((m.text.split("@@APPENDIX@@")[0]).trim())));
-      menu.appendChild(mk("View source · S", ()=>{ SRC[i]=!SRC[i]; render(); }));
-      menu.appendChild(mk("Reset to here · R", ()=>bridge({action:"reset", id:m.id})));
-      dots.onclick=(e)=>{ e.stopPropagation(); document.querySelectorAll(".menu.open").forEach(x=>x.classList.remove("open")); menu.classList.toggle("open"); };
-      wrap.appendChild(dots); wrap.appendChild(menu); row.appendChild(wrap);
-    }
+    // ONE button-row builder for both roles: user → row sits LEFT of the bubble; agent → RIGHT.
+    const acts=actionsFor(m,i);
+    let brow=null;
+    if (acts.length){ brow=document.createElement("div"); brow.className="btnrow";
+      acts.forEach(([icon,title,_k,fn])=>{ const b=document.createElement("button"); b.className="abtn";
+        b.textContent=icon; b.title=title; b.onclick=(ev)=>{ ev.stopPropagation(); fn(); }; brow.appendChild(b); }); }
+    if (m.role==="user"){ if (brow) row.appendChild(brow); row.appendChild(bub); }
+    else { row.appendChild(bub); if (brow) row.appendChild(brow); }
     messagesEl.appendChild(row);
   });
   if (stick) toBottom();
 }
-document.addEventListener("click", ()=>document.querySelectorAll(".menu.open").forEach(x=>x.classList.remove("open")));
 
 // ---- streaming (rAF-coalesced; direct per-token push from Swift) ----
 let pendingStream=null, streamRAF=0;
@@ -212,8 +256,8 @@ function submit(){ const t=composer.value; composer.value=""; composer.style.hei
 btnSend.onclick=submit; btnInterrupt.onclick=submit; btnStop.onclick=()=>bridge({action:"stop"});
 
 // ---- selection / keyboard nav ----
-function setSel(i){ SEL=i; render(); const rows=messagesEl.querySelectorAll(".row"); if(i>=0&&rows[i]) rows[i].scrollIntoView({block:"center"}); }
-function selectLast(){ const a=agentIndices(); if(a.length){ composer.blur(); setSel(a[a.length-1]); } }
+function setSel(i){ SEL=i; render(); if(i>=0){ const r=messagesEl.querySelector(`.row[data-idx="${i}"]`); if(r) r.scrollIntoView({block:"center"}); } }
+function selectLast(){ if(MSGS.length){ composer.blur(); setSel(MSGS.length-1); } }
 function focusComposer(){ setSel(-1); composer.focus(); }
 function caretAtStart(){ return composer.selectionStart===0 && composer.selectionEnd===0; }
 
@@ -225,21 +269,24 @@ composer.addEventListener("paste", (e)=>{ const items=e.clipboardData?.items||[]
 document.addEventListener("keydown", (e)=>{
   if (zoomEl.style.display==="flex"){ if(e.key==="Escape"){ zoomEl.style.display="none"; e.preventDefault(); } return; }
   if (e.key==="Escape" && BUSY){ e.preventDefault(); bridge({action:"stop"}); return; }   // Esc interrupts/stops generation (from anywhere)
-  const inComposer = document.activeElement===composer;
+  const ae = document.activeElement;
+  if (ae && ae.tagName === "TEXTAREA" && ae !== composer) return;   // the edit box owns its keys
+  const inComposer = ae === composer;
   if (inComposer){
     if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); submit(); return; }
     if (e.key==="ArrowUp" && caretAtStart()){ e.preventDefault(); selectLast(); return; }
     return;
   }
-  const a = agentIndices(); const pos = a.indexOf(SEL);
-  if (e.key==="ArrowUp"){ e.preventDefault(); if(pos>0) setSel(a[pos-1]); else if(pos<0&&a.length) setSel(a[a.length-1]); }
-  else if (e.key==="ArrowDown"){ e.preventDefault(); if(pos>=0&&pos<a.length-1) setSel(a[pos+1]); else focusComposer(); }
+  // nav over ALL messages (user + agent); per-role single-key actions come from the SAME table the
+  // buttons render from, so keys and buttons can never drift apart.
+  if (e.key==="ArrowUp"){ e.preventDefault(); if(SEL>0) setSel(SEL-1); else if(SEL<0&&MSGS.length) setSel(MSGS.length-1); }
+  else if (e.key==="ArrowDown"){ e.preventDefault(); if(SEL>=0&&SEL<MSGS.length-1) setSel(SEL+1); else focusComposer(); }
   else if (e.key===" "){ e.preventDefault(); focusComposer(); }
   else if (e.key==="Escape"){ setSel(-1); }
-  else if (SEL>=0){ const m=MSGS[SEL];
-    if (e.key==="s"){ SRC[SEL]=!SRC[SEL]; render(); }
-    else if (e.key==="c"){ copyMsg((m.text.split("@@APPENDIX@@")[0]).trim()); }
-    else if (e.key==="r" && m.id){ bridge({action:"reset", id:m.id}); } }
+  else if (SEL>=0){
+    const act = actionsFor(MSGS[SEL], SEL).find(a => a[2] === e.key.toLowerCase());
+    if (act){ e.preventDefault(); act[3](); }
+  }
 });
 
 // ---- Swift → JS ----

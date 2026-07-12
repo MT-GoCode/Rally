@@ -114,6 +114,8 @@ struct ChatWebView: NSViewRepresentable {
             case "focus":      session?.inputIsFocused = (d["focused"] as? Bool ?? false)
             case "copy":       let s = d["text"] as? String ?? ""; NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string)
             case "reset":       if let id = (d["id"] as? String).flatMap(UUID.init) { session?.resetToHere(id) }
+            case "editSend":    if let id = (d["id"] as? String).flatMap(UUID.init) {
+                                    session?.editUserMessage(id, text: d["text"] as? String ?? "") }
             case "pasteImage":
                 session?.userStartedEditing()   // staging an image counts as composing
                 if let uri = d["data"] as? String { session?.attachDataURIImage(uri) }
