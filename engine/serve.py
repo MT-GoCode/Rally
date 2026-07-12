@@ -88,7 +88,11 @@ GEN_WAITING = {"n": 0}                     # sends waiting in the queue — comp
 # render == base flushes `text` instantly and continues from ids[-1]; any divergence just discards —
 # the exactness ledger (PF) makes the rewind automatic.
 PREGEN = {"open": None, "base": None, "ids": [], "text": "", "done": False, "gen": None, "sig": None}
-PREGEN_SLICE = 64                          # tokens per compose tick (yields per-token to a waiting send)
+PREGEN_SLICE = 16                          # tokens per compose tick — SMALL so a slice never holds the
+                                           # worker > ~0.5s even on gemma (~34 tok/s); the queue stays live
+PREGEN_BUDGET = 192                        # max reply tokens speculated while composing (generator stays
+                                           # open; the flush resumes it past the budget)
+COMPOSE = {"x": 0, "y": 0, "z": 0}         # last compose-tick accounting (turn / precomputed / anew-on-send)
 
 
 def _pregen_clear():
@@ -988,8 +992,8 @@ def _pregen(base, paths, vis, sig, open_list):
     exact, so any divergence rewinds through the normal rails. Returns (n_reply_tokens, done)."""
     if PREGEN["open"] is not None and PREGEN["open"] != open_list:
         _pregen_clear()                                   # composer changed → speculation is stale
-    if PREGEN["done"]:
-        return len(PREGEN["ids"]), True
+    if PREGEN["done"] or len(PREGEN["ids"]) >= PREGEN_BUDGET:
+        return len(PREGEN["ids"]), PREGEN["done"]   # budget hit: stop consuming; the flush resumes the gen
     if PREGEN["gen"] is None:                             # first tick: feed the framing delta, start gen
         lcp = _lcp(PF["ids"] or [], base)
         achieved, tail, tail_vis = _plan_feed(base, lcp, paths, vis)
@@ -1012,15 +1016,18 @@ def _dup_final(chunk, ids):
         and getattr(chunk, "token", None) == ids[-1]
 
 
-def _pregen_consume(limit, emit):
+def _pregen_consume(limit, emit, should_stop=None):
     """Advance the persistent speculation generator by ≤limit tokens (None limit = to completion),
-    yielding between tokens to a waiting send unless we ARE the send (emit != None streams deltas).
+    yielding between tokens to a waiting send unless we ARE the send (emit != None streams deltas;
+    should_stop is then checked EVERY token so an interrupt halts within one token, not one slice).
     Maintains PF = base + ids (the KV's true content — mlx feeds one step ahead)."""
     gen = PREGEN["gen"]
     n = 0; done = False
     while gen is not None and (limit is None or n < limit):
         if emit is None and GEN_WAITING["n"] > 0:
             break                                         # a real send arrived — it resumes this generator
+        if should_stop is not None and should_stop():
+            break                                         # our own client disconnected (interrupt)
         with MLX_LOCK:
             try: chunk = next(gen)
             except StopIteration:
@@ -1062,6 +1069,7 @@ def _do_prefill(job):
     staged = job.params.get("images") or []
     if not staged and not partial:
         _pregen_clear()                             # composer emptied → drop any speculation
+        COMPOSE["x"] = COMPOSE["y"] = COMPOSE["z"] = 0
         job.result = {"fed": 0, "turnTokens": 0, "precomputed": 0, "anewOnSend": 0,
                       "pregen": 0, "pregenDone": False}; return
     tmpdir = tmpdir2 = None
@@ -1078,7 +1086,10 @@ def _do_prefill(job):
             messages, reminder, mode, open_turn=(staged, partial), add_gen=True)
         X = max(0, len(base) - bhist)               # turn's NOTIONAL cost (the "anew" a clean send pays)
         sig_ok = not paths or sig == PF.get("img_sig")
-        composer_fed = ((PF["ids"] or []) == open_list) and sig_ok
+        # composer is "fed" when PF == the open render — OR when a speculation for exactly this
+        # composer is live (PF = base+ids then; without this clause every tick after a pregen thought
+        # the composer changed and destroyed the speculation → the 16→0→16 flip-flop).
+        composer_fed = (((PF["ids"] or []) == open_list) or PREGEN["open"] == open_list) and sig_ok
         n, done = 0, False
         if not composer_fed:                        # feed the composer this tick (speculate next tick)
             if st.get("pin_len", 0) + len(open_list) > TOKEN_LIMIT:
@@ -1097,6 +1108,7 @@ def _do_prefill(job):
         matched = _lcp(PF["ids"] or [], base)
         Y = max(0, min(matched, len(base)) - bhist)
         Z = max(0, X - Y)
+        COMPOSE["x"], COMPOSE["y"], COMPOSE["z"] = X, Y, Z   # published via /progress (the ONE state)
         job.result = {"fed": Y, "turnTokens": X, "precomputed": Y, "anewOnSend": Z,
                       "pregen": n, "pregenDone": done}
     finally:
@@ -1136,6 +1148,7 @@ def _warm_target(tgt_ids, vis, sig):
         _feed(st["kv"], tail, vis if (vis and any(t == img_id for t in tail)) else {})
     PF["ids"] = tgt_ids; PF["img_sig"] = sig
     _pregen_clear()                                   # the KV is now the clean target — speculation is stale
+    COMPOSE["x"] = COMPOSE["y"] = COMPOSE["z"] = 0    # …and so are the compose numbers
     if IS_QWEN:                                       # anchor: clean next-msg target — divergences restore here
         QSNAP["conv"] = (list(tgt_ids), snap_cache(st["kv"]))
 
@@ -1240,6 +1253,7 @@ def _do_reconcile(job):
 
 def _do_generate(job):
     GEN_WAITING["n"] = max(0, GEN_WAITING["n"] - 1)
+    COMPOSE["x"] = COMPOSE["y"] = COMPOSE["z"] = 0   # the composed turn is being sent — live numbers reset
     if not st.get("kv"):
         job.q.put(("err", "nothing pinned — cache first"))
         return
@@ -1349,7 +1363,7 @@ def _do_generate(job):
                     job.q.put(("delta", chunk.text))
                     _prog(done=gen_count, label=f"{gen_count} tok")
                 while not job.cancelled:
-                    _n, _d = _pregen_consume(64, _emit)
+                    _n, _d = _pregen_consume(64, _emit, should_stop=lambda: job.cancelled)
                     if _d or _n == 0: break
                 gen_ids = list(PREGEN["ids"]); answer = [PREGEN["text"]]
                 gen_count = len(gen_ids)
@@ -1591,6 +1605,21 @@ class H(BaseHTTPRequestHandler):
             # worker's live counter under the tiny PROG_LOCK (never MLX_LOCK) → answers while the GPU is busy.
             with PROG_LOCK:
                 snap = dict(PROGRESS)              # copy under the fast lock…
+            # ONE authoritative phase, computed HERE (the engine knows; the app only renders):
+            #   pin → generate → warm (precache/reconcile) → pregen → composing → ready
+            op = snap.get("op")
+            if op in ("pin", "generate", "reconcile"):
+                snap["phase"] = "warm" if op == "reconcile" else op
+            elif PRECACHE["state"] == "working":
+                snap["phase"] = "warm"
+            elif PREGEN["gen"] is not None or PREGEN["done"]:
+                snap["phase"] = "pregen"
+            elif COMPOSE["x"] > 0:
+                snap["phase"] = "composing"
+            else:
+                snap["phase"] = "ready"
+            snap["x"] = COMPOSE["x"]; snap["y"] = COMPOSE["y"]; snap["z"] = COMPOSE["z"]
+            snap["pregen"] = len(PREGEN["ids"]); snap["pregenDone"] = PREGEN["done"]
             return self._json(200, snap)           # …serialize/send outside it
         if self.path == "/voice/poll":
             with VLOCK:

@@ -194,6 +194,7 @@ enum VoiceState: Equatable {
     private(set) var progDone = 0
     private(set) var progTotal = 0
     private(set) var progLabel = ""
+    private(set) var progPhase = "ready"   // the engine's ONE state (pin|generate|warm|pregen|composing|ready)
     var progBusy: Bool { progOp != "idle" }
     // Poll the engine's real progress ~8Hz into the fields above (deduped so idle never invalidates).
     func pollProgress() async {
@@ -206,6 +207,13 @@ enum VoiceState: Equatable {
                 if progDone  != s.done  { progDone = s.done }
                 if progTotal != s.total { progTotal = s.total }
                 if progLabel != s.label { progLabel = s.label }
+                if progPhase != s.phase { progPhase = s.phase }
+                // live compose numbers come from the SAME poll — one source of truth, no mirrors
+                if liveTurnTokens != s.x { liveTurnTokens = s.x }
+                if livePrecomputed != s.y { livePrecomputed = s.y }
+                if liveAnew != s.z { liveAnew = s.z }
+                if livePregen != s.pregen { livePregen = s.pregen }
+                if livePregenDone != s.pregenDone { livePregenDone = s.pregenDone }
             }
             try? await Task.sleep(for: .milliseconds(120))
         }
@@ -314,51 +322,38 @@ enum VoiceState: Equatable {
     // ---- aggressive precompute: while the cache is READY and the user is composing, sample the
     // composer every 0.5s and prefill [history + OPEN user(images-first + text)] into the KV, so the
     // send only pays for the un-typed tail (and images are forward-passed while the user types). ----
-    private(set) var composeStatus = ""                 // HUD line — precompute/pre-generation state
     @ObservationIgnored private var composeLoopRunning = false
-    private func clearComposeState() {                  // composer empty / turn sent → every live number to 0
-        composeStatus = ""; preSent = 0
-        liveTurnTokens = 0; livePrecomputed = 0; liveAnew = 0; livePregen = 0; livePregenDone = false
-    }
+    private func clearComposeState() { preSent = 0 }   // display state is engine-owned now (via /progress)
     private func startComposeLoop() {
         guard !composeLoopRunning else { return }
         composeLoopRunning = true
         Task { [weak self] in
             while let self {
                 try? await Task.sleep(for: .milliseconds(500))
-                // gate: chat open, engine ready, NOT generating, conversation cache ready (not warming)
-                guard self.store.screen == .chat, self.engine.ready, !self.busy,
-                      self.precache != "working", !self.appleRunning else {
-                    if !self.composeStatus.isEmpty { self.clearComposeState() }
-                    continue
-                }
-                // trim EXACTLY like ask()/sendText do — the pre-generation flush requires the compose
-                // render to byte-match the send render, and a trailing space would break that.
+                // gate on the ENGINE's phase (the one state): only drive while it's compose-able.
+                guard self.store.screen == .chat, self.engine.ready, !self.busy, !self.appleRunning,
+                      ["ready", "composing", "pregen"].contains(self.progPhase) else { continue }
                 let text = self.input.trimmingCharacters(in: .whitespacesAndNewlines)
                 let imgs = self.pastedImages
-                guard !text.isEmpty || !imgs.isEmpty else {
-                    self.clearComposeState()            // composer empty → numbers must read 0, not stale
+                if text.isEmpty && imgs.isEmpty {
+                    // composer emptied: one empty ping clears the engine's compose/pregen state, so the
+                    // HUD numbers can never go stale (the reported bug). Skip when already clear.
+                    if self.progPhase == "composing" || self.progPhase == "pregen" || self.liveTurnTokens > 0 {
+                        let s = self.store.chat.settings
+                        _ = await self.engine.voicePrefill(messages: self.buildEngineMessages(), partial: "",
+                                                           reminder: self.store.chat.reminder,
+                                                           reminderMode: s.reminderMode,
+                                                           trimTrigger: self.trimTrigger, trimTarget: self.trimTarget)
+                    }
                     continue
                 }
-                // ALWAYS ping (no done-latch skip): keeps the live numbers honest AND self-heals if the
-                // engine discarded the speculation (a memory reclaim, a settings rebuild). The engine
-                // early-returns cheaply when the composed turn is already fed + speculated.
                 let s = self.store.chat.settings
                 let r = await self.engine.voicePrefill(messages: self.buildEngineMessages(),
                                                        partial: text, images: imgs,
                                                        reminder: self.store.chat.reminder,
                                                        reminderMode: s.reminderMode,
                                                        trimTrigger: self.trimTrigger, trimTarget: self.trimTarget)
-                self.liveTurnTokens = r.turnTokens; self.livePrecomputed = r.precomputed
-                self.liveAnew = r.anewOnSend; self.livePregen = r.pregen; self.livePregenDone = r.pregenDone
-                self.preSent = r.precomputed
-                if r.pregen > 0 && r.pregenDone {
-                    self.composeStatus = "next turn ready ⚡ reply pre-generated — instant send"
-                } else if r.pregen > 0 {
-                    self.composeStatus = "next turn precomputed ⚡ pre-generating reply — \(r.pregen) tok"
-                } else if r.turnTokens > 0 {
-                    self.composeStatus = "precomputing next turn — \(r.precomputed)/\(r.turnTokens) tok · \(r.anewOnSend) anew on send"
-                }
+                self.preSent = r.precomputed        // (voice "pre-sent" display; all HUD state is polled)
             }
         }
     }
@@ -543,7 +538,6 @@ enum VoiceState: Equatable {
             anewParts = (meta["anew_parts"] as? [[String: Any]] ?? [])
                 .map { (label: $0["label"] as? String ?? "", n: $0["n"] as? Int ?? 0) }
             streaming = ""; busy = false; store.save()
-            watchPrecache()                     // engine is now warming the KV for the next message
         } catch {
             if Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled {
                 stashInterrupted()              // the interrupting turn keeps busy=true
@@ -853,23 +847,7 @@ enum VoiceState: Equatable {
     }
 
     // After a reply the engine warms the KV for the next message; mirror it in the bottom-right chip.
-    private func watchPrecache() {
-        Task { [weak self] in
-            guard let self else { return }
-            self.precache = "working"
-            for _ in 0..<600 {                     // ~60s cap (window pre-slides / image refeeds can be slow)
-                try? await Task.sleep(for: .milliseconds(100))
-                if self.busy || self.precache.isEmpty { return }   // a new turn took over
-                let s = await self.engine.precacheState()
-                if s == "done" { self.precache = "done"; break }
-                if s == "idle" { self.precache = ""; return }
-            }
-            if self.precache == "working" { self.precache = "" }   // fail OPEN — a stuck "working" would
-                                                                    // gate the compose loop forever
-            try? await Task.sleep(for: .seconds(1.4))
-            if self.precache == "done" { self.precache = "" }       // fade the "done" chip
-        }
-    }
+
 
     private func handleVoicePoll(_ p: VoicePoll) async {
         // capture events arrive whether voice is on or off — deliver, then ack what we consumed (FIFO).

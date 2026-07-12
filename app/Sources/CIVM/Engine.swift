@@ -136,7 +136,13 @@ enum EngineModel: String, CaseIterable, Identifiable {
     }
 
     // GET /progress — real per-op progress (pin encode/prefill, reconcile replay, generate decode).
-    struct ProgressSnapshot: Decodable { var op = "idle"; var stage = ""; var frac = 0.0; var done = 0; var total = 0; var label = "" }
+    struct ProgressSnapshot: Decodable {
+        var op = "idle"; var stage = ""; var frac = 0.0; var done = 0; var total = 0; var label = ""
+        // the ONE engine-computed state the UI renders (pin|generate|warm|pregen|composing|ready)
+        var phase = "ready"
+        var x = 0; var y = 0; var z = 0          // live compose accounting: turn / precomputed / anew-on-send
+        var pregen = 0; var pregenDone = false   // speculated reply tokens + finished flag
+    }
     func progress() async -> ProgressSnapshot? {
         guard let d = try? await get("/progress") else { return nil }
         return try? JSONDecoder().decode(ProgressSnapshot.self, from: d)

@@ -562,11 +562,13 @@ struct RootView: View {
                     .foregroundStyle(.green)
                     .help("X anew = the whole turn's cost from a cold cache. Y precomputed = already fed into the KV while you type. Z anew on send = X − Y, what pressing send still forward-passes (0 once the reply is pre-generated).")
             }
-            if session.lastNew > 0 || session.lastTtft > 0 {
+            if session.lastTurnTokens > 0 || session.lastNew > 0 || session.lastTtft > 0 {
                 // X = the turn's notional cost, Y = precomputed while composing, Z = actually processed.
+                // A fully pre-generated turn is Z=0/TTFT≈0 — the best receipt of all; show it as "instant ⚡".
                 let x = max(session.lastTurnTokens, session.lastNew), z = session.lastNew
                 let y = max(0, x - z)
-                Text("last msg: \(cached) read from cache · turn was \(x) tok\(y > 0 ? " · ⚡\(y) precomputed" : "") · \(z) processed anew · TTFT \(String(format: "%.2f", session.lastTtft))s")
+                let ttft = session.lastTtft < 0.005 ? "instant ⚡" : String(format: "%.2fs", session.lastTtft)
+                Text("last msg: \(cached) read from cache · turn was \(x) tok\(y > 0 ? " · ⚡\(y) precomputed" : "") · \(z) processed anew · TTFT \(ttft)")
                     .foregroundStyle(session.lastTtft > 1.5 ? .orange : .secondary)
                 if !session.anewParts.isEmpty {
                     Text("  processed = " + session.anewParts.map { "\($0.n) \($0.label)" }.joined(separator: " + "))
