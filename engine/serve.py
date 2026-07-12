@@ -215,6 +215,20 @@ def load_model():
     config = model.config
     global IS_QWEN
     IS_QWEN = str(getattr(config, "model_type", "")).startswith("qwen")
+    if IS_QWEN:
+        # Cap the dynamic-resolution ViT's per-image token spend. Uncapped, a real textbook page costs
+        # ~1,500 visual tokens (46-image Sipser pin → 70K tokens, 139s, 22GB peak) vs gemma's ~256.
+        # 512 tokens/image (= 512·28·28 pixels) keeps pages readable while keeping pins ~25K/40s/10GB.
+        try:
+            mp = int(os.environ.get("CIVM_QWEN_MAX_PIXELS", 512 * 28 * 28))
+            ip = getattr(processor, "image_processor", None)
+            if ip is not None:
+                if hasattr(ip, "max_pixels"): ip.max_pixels = mp
+                if isinstance(getattr(ip, "size", None), dict) and "longest_edge" in ip.size:
+                    ip.size["longest_edge"] = mp
+            log(f"qwen vision cap: {mp} px (~{mp // (28 * 28)} tok/image)")
+        except Exception as e:
+            log(f"qwen vision cap failed: {e}")
     log(f"loaded ({getattr(config, 'model_type', '?')})")
 
 
@@ -269,9 +283,17 @@ def build_messages(system, ctx_content, history):
 
 def prompt_str(msgs, nimg, add_gen=True):
     # qwen3.5 thinks by default (template opens '<think>\n'); enable_thinking=False pre-closes the block
-    # so answers start immediately — matching gemma's instant-answer behavior. No-op for add_gen=False.
+    # so answers start immediately — matching gemma's instant-answer behavior.
     kw = {"enable_thinking": False} if IS_QWEN else {}
-    return apply_chat_template(processor, config, msgs, num_images=nimg, add_generation_prompt=add_gen, **kw)
+    s = apply_chat_template(processor, config, msgs, num_images=nimg, add_generation_prompt=add_gen, **kw)
+    if IS_QWEN and not add_gen:
+        # The qwen template gives the LAST assistant message a generation-style '<think>\n\n</think>\n\n'
+        # prefix but STRIPS it when the same message is re-rendered deeper in a longer history. That
+        # breaks the prefix property all cross-turn reuse relies on (every next-turn render diverged at
+        # the previous answer's header → reused=0 → 1.6-3.7s TTFT on real chats). Normalize history
+        # renders (add_gen=False) to the thinkless form; generation prompts (add_gen=True) keep theirs.
+        s = s.replace("<|im_start|>assistant\n<think>\n\n</think>\n\n", "<|im_start|>assistant\n")
+    return s
 
 
 def token_ids(prompt, paths):
@@ -1132,9 +1154,12 @@ def _do_generate(job):
                     "conv_start": conv_start, "conv_tokens": len(conv_ids),   # sliding-window boundary + size
                     "mem_active_gb": _mem()[0], "mem_peak_gb": _mem()[1]}      # MLX Metal mem (spike check)
             job.q.put(("done", meta))
-            # PRECACHE: warm the KV for the next message NOW (idle time). Reconstruct the clean answer
-            # exactly as the app stores it (text before @@APPENDIX@@, trimmed) so next turn's history matches.
-            ans = "".join(answer).split("@@APPENDIX@@")[0].strip()
+            # PRECACHE: warm the KV for the next message NOW (idle time). Use the RAW full answer —
+            # the app stores Msg.text = the unmodified stream (INCLUDING @@APPENDIX@@) and resends it
+            # verbatim next turn. The old appendix-strip made PF diverge from the app's history at the
+            # FIRST answer's appendix, so every turn refed everything after it (the growing "structure"
+            # anew; and on qwen it collapsed reuse to zero → 3-4s TTFT on real chats).
+            ans = "".join(answer)
             if ans:
                 msgs2 = messages + [{"role": "assistant", "content": [{"type": "text", "text": ans}]}]
                 PRECACHE["state"] = "working"    # flip immediately (the job may sit behind others briefly)
