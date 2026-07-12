@@ -226,6 +226,10 @@ function render(msgs, convStart){
         b.textContent=icon; b.title=title; b.onclick=(ev)=>{ ev.stopPropagation(); fn(); }; brow.appendChild(b); }); }
     if (m.role==="user"){ if (brow) row.appendChild(brow); row.appendChild(bub); }
     else { row.appendChild(bub); if (brow) row.appendChild(brow); }
+    bub.addEventListener("click",(ev)=>{               // click selects (same as ↑/↓) — but not on
+      if (ev.target.closest("button, a, img, textarea, details")) return;   // controls/links/images,
+      if (String(getSelection()||"").length) return;                        // and not while text-selecting
+      setSel(SEL === i ? -1 : i); });
     messagesEl.appendChild(row);
   });
   if (stick) toBottom();

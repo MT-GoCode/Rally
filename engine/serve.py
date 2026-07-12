@@ -81,6 +81,7 @@ parakeet = {"model": None}                 # set by the voice thread after load
 MLX_LOCK = threading.Lock()                # serialize Gemma <-> parakeet GPU work (SPEC concurrency)
 GEMMA_Q = queue.Queue()                    # jobs for the single Gemma worker thread
 KEEPALIVE = {"pending": False}             # coalesce idle keepalive pings (never queue a second while one is in flight)
+GEN_WAITING = {"n": 0}                     # sends waiting in the queue — compose prefills yield to them
 
 st = {}                                    # pinned chat: kv, pin_len, ctx_content, ctx_paths, tmpdir, system
 PF = {"ids": None, "img_sig": None}        # streaming-prefill: ids fed past the pin + identity of open-turn images in KV
@@ -967,8 +968,8 @@ def _do_prefill(job):
     Apple streaming uses the same path). max_tokens=0 = clean prefill; the user turn stays OPEN (no
     turn-end) so /chat's LCP reuses it exactly. Reminder is placed for before/start modes (so their
     precached shape survives); 'after' rides the /chat render, of which this is a strict prefix."""
-    if not st.get("kv"):
-        job.result = {"fed": 0}; return
+    if not st.get("kv") or GEN_WAITING["n"] > 0:
+        job.result = {"fed": 0}; return        # a send is queued behind us — yield (it feeds the same tokens)
     partial = job.params["partial"]
     # WINDOW the history exactly like /chat and /precache do (messages[conv_start:]). Rendering the
     # full transcript here diverged from the windowed PF at token 0 → every compose session refed the
@@ -1137,6 +1138,7 @@ def _do_reconcile(job):
 
 
 def _do_generate(job):
+    GEN_WAITING["n"] = max(0, GEN_WAITING["n"] - 1)
     if not st.get("kv"):
         job.q.put(("err", "nothing pinned — cache first"))
         return
@@ -1157,7 +1159,9 @@ def _do_generate(job):
     st["conv_start"] = conv_start
     _live_drop(messages, conv_start)                 # (no-op unless the emergency backstop fired)
     win = messages[conv_start:]
+    _t0 = time.time()
     conv_ids, vis, per_turn_paths, tmpdir, hist_len = _conv_ids(win, reminder, mode)
+    _t_render = time.time() - _t0
     try:
         pin_len = st["pin_len"]              # frozen physical length of the pinned [system+ctx+ACK] KV
         # Cross-turn reuse on the CONVERSATION tokens only (pure text past the pin → deterministic).
@@ -1202,6 +1206,7 @@ def _do_generate(job):
         if struct_n: parts.append(("structure", struct_n))
         anew_parts = [{"label": l, "n": n} for l, n in parts]
         _prog(op="generate", stage="prefill", done=0, total=new_tokens, label="prefilling", bump=True)
+        _t_pre = time.time()
         gen = stream_generate(model, processor, "", input_ids=feed_ids,
                               prompt_cache=st["kv"],
                               max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
@@ -1222,6 +1227,8 @@ def _do_generate(job):
                     break
             if ttft is None:
                 ttft = time.time() - start
+                log(f"[ttft] render={_t_render:.3f}s rewind+setup={_t_pre - _t0 - _t_render:.3f}s "
+                    f"feed+first-token={time.time() - _t_pre:.3f}s (Z={new_tokens})")
                 _prog(stage="decode", done=0, total=0, label="generating")   # total=0 → indeterminate + live count
             gen_count = chunk.generation_tokens or gen_count   # running total (every chunk)
             _prog(done=gen_count, label=f"{gen_count} tok")
@@ -1484,7 +1491,8 @@ class H(BaseHTTPRequestHandler):
                 self.send_header("content-type", "application/x-ndjson")
                 self.end_headers()
                 PRECACHE["state"] = "idle"     # a new turn begins; clear the previous "done" flag
-                job = Job("generate", messages=messages, reminder=body.get("reminder"),
+                GEN_WAITING["n"] += 1          # queued prefills yield (a just-fired compose sample must
+                job = Job("generate", messages=messages, reminder=body.get("reminder"),   # not delay the send)
                           mode=body.get("reminderMode") or "last",
                           trigger=body.get("trimTrigger"), target=body.get("trimTarget"),
                           recache=body.get("recacheMode"))

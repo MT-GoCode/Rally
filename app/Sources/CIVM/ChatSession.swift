@@ -601,6 +601,7 @@ enum VoiceState: Equatable {
         anewParts = []
         store.chat.chatTokens = 0
         selectedMessageID = nil                 // the anchor turn is now the newest; drop any nav highlight
+        convStart = nil; convTokens = nil       // boundary/"N dropped" is STALE until the rebuilt cache reports
         store.save()
         rewarmCache()                           // recompute the KV up to the (now truncated) transcript
     }
@@ -617,6 +618,7 @@ enum VoiceState: Equatable {
         store.chat.messages = Array(store.chat.messages.prefix(upTo: i))
         lastReused = 0; lastNew = 0; lastPinned = 0; lastTtft = 0; lastTurnTokens = 0
         anewParts = []; selectedMessageID = nil
+        convStart = nil; convTokens = nil       // stale boundary — the resend's meta re-reports it
         store.save()
         ask(text: text, images: images)
     }

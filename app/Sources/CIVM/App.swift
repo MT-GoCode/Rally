@@ -553,6 +553,7 @@ struct RootView: View {
                     .foregroundStyle(session.lastTtft > 1.5 ? .orange : .secondary)
                 if !session.anewParts.isEmpty {
                     Text("  processed = " + session.anewParts.map { "\($0.n) \($0.label)" }.joined(separator: " + "))
+                        .help("What the send itself had to feed. \"structure\" = the turn's framing tokens — closing your message (<|im_end|>) + the model's generation prompt — which can never be precomputed, because your turn must stay OPEN while you compose.")
                 }
             }
         }.font(.caption2).foregroundStyle(.secondary)
