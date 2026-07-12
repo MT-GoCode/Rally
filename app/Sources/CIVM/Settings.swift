@@ -440,6 +440,8 @@ struct SettingsView: View {
     private var captureBox: some View {
         GroupBox("Capture") {
             VStack(alignment: .leading, spacing: 14) {
+                Text("In-app: ⌃B toggles the sidebar · Esc stops generation · ↑/↓ review replies · S source · C copy · R reset")
+                    .font(.caption2).foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Screenshot shortcut").font(.caption.bold()).foregroundStyle(.secondary)
                     HStack(spacing: 10) {

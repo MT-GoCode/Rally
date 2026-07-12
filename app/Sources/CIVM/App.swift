@@ -331,6 +331,17 @@ struct ChatRow: View {
                 }
             }
         }
+        .commands {
+            // ⌃B toggles the sidebar. A MENU key equivalent (not a local key monitor) so it works even
+            // while the chat WebView owns the keyboard — key equivalents are checked before first-responder
+            // dispatch. State is the same @AppStorage key RootView binds.
+            CommandGroup(after: .sidebar) {
+                Button("Toggle Sidebar") {
+                    UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: SK.sidebarCollapsed), forKey: SK.sidebarCollapsed)
+                }
+                .keyboardShortcut("b", modifiers: .control)
+            }
+        }
     }
 }
 
@@ -674,11 +685,10 @@ struct RootView: View {
         .onChange(of: store.chat.id, initial: true) { _, _ in
             reminderDraft = store.chat.reminder
             editingChatName = false
-            // Collapse content-heavy SYSTEM/CONTEXT panes on open so their (image-heavy) BlockStream isn't
-            // rendered/decoded while you're chatting — pane() only builds BlockStream when open. Empty panes
-            // stay open for editing. One click expands. (Keeps the open path free of the 34-image decode.)
-            systemOpen  = nonEmpty(store.chat.system).isEmpty
-            contextOpen = nonEmpty(store.chat.context).isEmpty
+            // Panes stay OPEN on chat open (image decode is off-main via AsyncBlockImage, so an open
+            // pinned-context pane no longer threatens the open path; the old auto-collapse read as a bug).
+            systemOpen = true
+            contextOpen = true
         }
     }
 
@@ -696,7 +706,7 @@ struct RootView: View {
             }
             chatNameField
             pane("SYSTEM PROMPT", $systemOpen, $store.chat.system, key: "system") { systemPromptMenu }
-            pane("CONTEXT", $contextOpen, $store.chat.context, key: "context")
+            pane("PINNED CONTEXT", $contextOpen, $store.chat.context, key: "context")
 
             HStack(spacing: 8) {
                 Button(session.caching ? "Caching…" : "Cache") { session.cache() }
@@ -912,7 +922,7 @@ struct RootView: View {
             }
             Divider().frame(height: 30)
             VStack(alignment: .leading, spacing: 4) {
-                Text("AGENT OUTPUT").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
+                Text("VLM OUTPUT").font(.system(size: 9, weight: .bold)).foregroundStyle(.secondary).tracking(1)
                 Picker("", selection: Binding(get: { cs.agentOutputV },
                                               set: { if !$0.comingSoon { session.setAgentOutput($0) } })) {
                     ForEach(AgentOutput.allCases, id: \.self) { o in

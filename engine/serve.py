@@ -939,7 +939,12 @@ def _do_precache(job):
         messages = job.params["messages"]; reminder = job.params["reminder"]; mode = job.params["mode"]
         trigger = int(job.params.get("trigger") or 0); target = int(job.params.get("target") or 0)
         recache = job.params.get("recache") or "recent"
-        conv_start = _window_start(messages, reminder, mode, st.get("conv_start", 0), trigger, target)
+        # PRE-SLIDE with headroom: this runs right after an answer (user is mid-read — free time). If the
+        # NEXT question would push the conversation over the trigger, the slide used to happen inside the
+        # next /chat and its drop/refeed cost landed on TTFT. Reserve room for a typical question (+ the
+        # reminder, which _window_start already counts) so the boundary crossing happens NOW, not then.
+        eff_trigger = max(target, trigger - 256) if trigger > 0 else 0
+        conv_start = _window_start(messages, reminder, mode, st.get("conv_start", 0), eff_trigger, target)
         st["conv_start"] = conv_start
         _live_drop(messages, conv_start)                 # ongoing chat: always re-rope-drop the front (no recompute)
         tgt_ids, vis = _precache_target(messages[conv_start:], reminder, mode)
