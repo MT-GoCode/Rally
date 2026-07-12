@@ -216,11 +216,15 @@ def load_model():
     global IS_QWEN
     IS_QWEN = str(getattr(config, "model_type", "")).startswith("qwen")
     if IS_QWEN:
-        # Cap the dynamic-resolution ViT's per-image token spend. Uncapped, a real textbook page costs
-        # ~1,500 visual tokens (46-image Sipser pin → 70K tokens, 139s, 22GB peak) vs gemma's ~256.
-        # 512 tokens/image (= 512·28·28 pixels) keeps pages readable while keeping pins ~25K/40s/10GB.
+        # Cap the dynamic-resolution ViT's per-image token spend via qwen's OFFICIAL knob (max_pixels —
+        # the same setting in every Qwen-VL model card; recommended range 256–1280 tok/image; the
+        # processor downscales the image to fit, nothing is cropped). Uncapped, a real textbook page
+        # costs ~1,500 tokens (46-page Sipser pin → 70K tok/139s/22GB peak). Default 1024: the A/B on
+        # the real Sipser pages (256 vs 512 vs 1024) showed 1024 gives the most verbatim page reads
+        # (Definition 1.5 quoted exactly) at pin 52s / 9.6GB resident; 256 ≈ gemma's fixed budget and
+        # started conflating diagram labels. Tunable: CIVM_QWEN_MAX_PIXELS (official max 1280·28·28).
         try:
-            mp = int(os.environ.get("CIVM_QWEN_MAX_PIXELS", 512 * 28 * 28))
+            mp = int(os.environ.get("CIVM_QWEN_MAX_PIXELS", 1024 * 28 * 28))
             ip = getattr(processor, "image_processor", None)
             if ip is not None:
                 if hasattr(ip, "max_pixels"): ip.max_pixels = mp
