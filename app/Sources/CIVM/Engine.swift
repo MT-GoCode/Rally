@@ -263,15 +263,15 @@ enum EngineModel: String, CaseIterable, Identifiable {
                          var pregen = 0; var pregenDone = false }
     func voicePrefill(messages: [ChatMessage], partial: String, images: [Block] = [],
                       reminder: [Block] = [], reminderMode: String = "last",
-                      trimTrigger: Int = 0, trimTarget: Int = 0) async -> PrefillStat {
+                      trimTrigger: Int = 0, trimTarget: Int = 0, pregen: Bool = true) async -> PrefillStat {
         struct Req: Encodable {
             let messages: [ChatMessage]; let partial: String
             let images: [Block]; let reminder: [Block]; let reminderMode: String
-            let trimTrigger: Int; let trimTarget: Int
+            let trimTrigger: Int; let trimTarget: Int; let pregen: Bool
         }
         let body = await Self.encodeOffMain(Req(messages: messages, partial: partial,
                                                 images: images, reminder: reminder, reminderMode: reminderMode,
-                                                trimTrigger: trimTrigger, trimTarget: trimTarget))
+                                                trimTrigger: trimTrigger, trimTarget: trimTarget, pregen: pregen))
         guard let d = try? await post("/voice/prefill", body: body, timeout: 60),
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return PrefillStat() }
         return PrefillStat(turnTokens: j["turnTokens"] as? Int ?? 0,

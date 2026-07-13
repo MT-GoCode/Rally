@@ -331,7 +331,8 @@ enum VoiceState: Equatable {
             while let self {
                 try? await Task.sleep(for: .milliseconds(500))
                 // gate on the ENGINE's phase (the one state): only drive while it's compose-able.
-                guard self.store.screen == .chat, self.engine.ready, !self.busy, !self.appleRunning,
+                guard SK.precomputeOnValue,        // master toggle (Settings → Precompute while typing)
+                      self.store.screen == .chat, self.engine.ready, !self.busy, !self.appleRunning,
                       ["ready", "composing", "pregen"].contains(self.progPhase) else { continue }
                 let text = self.input.trimmingCharacters(in: .whitespacesAndNewlines)
                 let imgs = self.pastedImages
@@ -352,7 +353,8 @@ enum VoiceState: Equatable {
                                                        partial: text, images: imgs,
                                                        reminder: self.store.chat.reminder,
                                                        reminderMode: s.reminderMode,
-                                                       trimTrigger: self.trimTrigger, trimTarget: self.trimTarget)
+                                                       trimTrigger: self.trimTrigger, trimTarget: self.trimTarget,
+                                                       pregen: SK.pregenOnValue)
                 self.preSent = r.precomputed        // (voice "pre-sent" display; all HUD state is polled)
             }
         }

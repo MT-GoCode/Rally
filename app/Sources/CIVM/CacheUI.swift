@@ -58,14 +58,14 @@ struct CacheHUDView: View {
                 ? ("bolt.fill", "next turn processed ⚡ reply pre-generated — instant send", false, .green)
                 : ("bolt.fill", "next turn processed ⚡ pre-generating reply — \(session.livePregen) tok", true, .accentColor)
         case "composing":
-            return ("bolt.fill", "precomputing next turn — \(session.livePrecomputed)/\(session.liveTurnTokens) tok · \(session.liveAnew) anew on send", false, .accentColor)
+            return ("bolt.fill", "precomputing next turn — \(session.livePrecomputed)/\(session.liveTurnTokens) tok fed · \(session.liveAnew) anew on send", false, .accentColor)
         default: break
         }
         if session.busy {   // phase can lag a beat behind the app's own send — keep the generating text stable
             return ("bubble.left.and.text.bubble.right", "generating…", true, .accentColor) }
         switch session.cacheState {
         case .overLimit, .failed:        return ("exclamationmark.triangle.fill", cacheStatusText(session.cacheState), false, .red)
-        case .cached(let t):             return ("checkmark.seal.fill", "cached ✓ · \(t) tok context", false, .green)
+        case .cached:                    return ("checkmark.seal.fill", "ready ✓ — cache warm, ask anything", false, .green)
         case .changed:                   return ("pencil.circle", "context changed — re-cache to apply", false, .orange)
         case .nothingToCache:            return ("checkmark.seal", "ready — just ask", false, .secondary)
         default:                         return ("circle", cacheStatusText(session.cacheState), false, .secondary)

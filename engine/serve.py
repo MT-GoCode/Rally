@@ -87,7 +87,7 @@ GEN_WAITING = {"n": 0}                     # sends waiting in the queue — comp
 # sampled tokens; the KV physically holds base + ids[:-1] (last sampled token not yet fed). A send whose
 # render == base flushes `text` instantly and continues from ids[-1]; any divergence just discards —
 # the exactness ledger (PF) makes the rewind automatic.
-PREGEN = {"open": None, "base": None, "ids": [], "text": "", "done": False, "gen": None, "sig": None}
+PREGEN = {"open": None, "base": None, "ids": [], "text": "", "done": False, "gen": None, "sig": None, "rsnap": None}
 PREGEN_SLICE = 16                          # tokens per compose tick — SMALL so a slice never holds the
                                            # worker > ~0.5s even on gemma (~34 tok/s); the queue stays live
 PREGEN_BUDGET = 192                        # max reply tokens speculated while composing (generator stays
@@ -95,10 +95,13 @@ PREGEN_BUDGET = 192                        # max reply tokens speculated while c
 COMPOSE = {"x": 0, "y": 0, "z": 0}         # last compose-tick accounting (turn / precomputed / anew-on-send)
 
 
-def _pregen_clear():
+def _pregen_clear(restore=True):
     if PREGEN.get("gen") is not None:
         try: PREGEN["gen"].close()
         except Exception: pass
+    if restore and PREGEN.get("rsnap"):               # DISCARD → undo the speculation's rotating-layer
+        _rot_restore(PREGEN["rsnap"])                 # residue (framing + ghost reply). A FLUSH passes
+    PREGEN["rsnap"] = None                            # restore=False: the speculation IS the reply.
     PREGEN["open"] = None; PREGEN["base"] = None; PREGEN["ids"] = []; PREGEN["text"] = ""
     PREGEN["done"] = False; PREGEN["gen"] = None; PREGEN["sig"] = None
 
@@ -983,6 +986,35 @@ def _plan_feed(ids, want_lcp, paths, vis):
     return achieved, tail, tail_vis
 
 
+def _rot_snap():
+    """GEMMA: snapshot the 25 RotatingKVCache sliding layers (bounded ≤1024 tokens each — cheap).
+    Full-attention layers rewind EXACTLY via trim_kv, but rotating layers are forward-only: every
+    discarded speculation would otherwise leave its reply AND its <start_of_turn> framing as permanent
+    ghosts in the sliding window — hours of composing turns the window into ghost generation prompts
+    and the model starts emitting its thinking-channel tokens as text. Qwen needs none of this (QSNAP
+    restore is exact)."""
+    if IS_QWEN or not st.get("kv"):
+        return None
+    out = []
+    for c in st["kv"]:
+        if getattr(c, "max_size", None):               # RotatingKVCache
+            out.append((c, None if c.keys is None else mx.array(c.keys),
+                        None if c.values is None else mx.array(c.values),
+                        c.offset, getattr(c, "_idx", None)))
+    return out
+
+
+def _rot_restore(snap):
+    if not snap:
+        return
+    for c, k, v, off, idx in snap:
+        c.keys = None if k is None else mx.array(k)
+        c.values = None if v is None else mx.array(v)
+        c.offset = off
+        if idx is not None:
+            c._idx = idx
+
+
 def _pregen(base, paths, vis, sig, open_list):
     """Speculate the reply on the ALREADY-rendered SEND view `base` (composer is fully fed = PF is a
     prefix of base). First call feeds the framing delta (turn-close + gen prompt + reminder-after) via
@@ -1004,6 +1036,7 @@ def _pregen(base, paths, vis, sig, open_list):
         PREGEN["gen"] = stream_generate(model, processor, "", input_ids=mx.array([tail]),
                                         prompt_cache=st["kv"], max_tokens=MAX_TOKENS,
                                         temperature=TEMPERATURE, prefill_step_size=PREFILL_STEP, **tail_vis)
+        PREGEN["rsnap"] = _rot_snap()                 # gemma: so a DISCARD can undo the sliding-window residue
         PREGEN["base"] = list(base); PREGEN["open"] = list(open_list); PREGEN["sig"] = sig
     _pregen_consume(PREGEN_SLICE, None)
     return len(PREGEN["ids"]), PREGEN["done"]
@@ -1100,8 +1133,10 @@ def _do_prefill(job):
             _feed(st["kv"], tail, tail_vis)
             PF["ids"] = open_list
             if paths: PF["img_sig"] = sig
-        else:                                       # composer stable + fed → speculate the reply
+        elif job.params.get("pregen", True):        # composer stable + fed → speculate the reply
             n, done = _pregen(base, bpaths, bvis, bsig, open_list)
+        else:
+            _pregen_clear()                         # speculation disabled in settings — keep none live
         # PRECISE accounting from the ledger vs the send view:
         #   precomputed Y = matched prefix of `base` already in the KV, minus history
         #   anewOnSend Z  = X - Y  (what /chat still forward-passes; 0 once pregen has run)
@@ -1367,7 +1402,7 @@ def _do_generate(job):
                     if _d or _n == 0: break
                 gen_ids = list(PREGEN["ids"]); answer = [PREGEN["text"]]
                 gen_count = len(gen_ids)
-            _pregen_clear()                      # consumed (or cancelled — the ledger stays exact either way)
+            _pregen_clear(restore=False)         # CONSUMED — the speculation is the real reply; keep it
         while gen is not None:
             if job.cancelled:
                 try: gen.close()
@@ -1748,7 +1783,7 @@ class H(BaseHTTPRequestHandler):
                     return self._json(200, {"fed": 0})
                 job = Job("prefill", messages=d.get("messages") or [], partial=str(d.get("partial") or ""),
                           images=d.get("images") or [], reminder=d.get("reminder"),
-                          mode=d.get("reminderMode") or "last",
+                          mode=d.get("reminderMode") or "last", pregen=d.get("pregen", True),
                           trigger=d.get("trimTrigger"), target=d.get("trimTarget"))
                 GEMMA_Q.put(job)
                 job.done.wait()

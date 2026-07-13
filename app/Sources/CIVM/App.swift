@@ -551,17 +551,7 @@ struct RootView: View {
         let cached = session.lastPinned + session.lastReused
         return VStack(alignment: .leading, spacing: 1) {
             Text("\(p) pinned + \(c) chat = \(p + c) tok")
-            // LIVE while composing: exact X/Y/Z + pre-generation, from the engine's send-view render.
-            if session.liveTurnTokens > 0 {
-                let x = session.liveTurnTokens, y = session.livePrecomputed, z = session.liveAnew
-                let pg = session.livePregen > 0
-                    ? (session.livePregenDone ? " · ⚡ reply pre-generated → instant send"
-                                              : " · ⚡ pre-generating reply \(session.livePregen) tok")
-                    : ""
-                Text("next turn: \(x) tok · ⚡\(y) precomputed · \(z) anew on send\(pg)")
-                    .foregroundStyle(.green)
-                    .help("X anew = the whole turn's cost from a cold cache. Y precomputed = already fed into the KV while you type. Z anew on send = X − Y, what pressing send still forward-passes (0 once the reply is pre-generated).")
-            }
+            // (live compose/pregen state lives ONLY in the top HUD — one surface per fact)
             if session.lastTurnTokens > 0 || session.lastNew > 0 || session.lastTtft > 0 {
                 // X = the turn's notional cost, Y = precomputed while composing, Z = actually processed.
                 // A fully pre-generated turn is Z=0/TTFT≈0 — the best receipt of all; show it as "instant ⚡".
@@ -734,8 +724,16 @@ struct RootView: View {
             HStack(spacing: 8) {
                 Button(session.caching ? "Caching…" : "Cache") { session.cache() }
                     .disabled(!session.canCache)
-                if session.progBusy { CacheProgressBar(session: session) }
-                Text(cacheStatusText(session.cacheState)).font(.caption).foregroundStyle(cacheStatusIsError ? .red : .secondary)
+                // status here ONLY when it's actionable for THIS button (edit pending / error) —
+                // the top HUD is the single machine-status surface, the bottom line the token ledger.
+                switch session.cacheState {
+                case .caching, .changed, .overLimit, .failed:
+                    Text(cacheStatusText(session.cacheState)).font(.caption)
+                        .foregroundStyle(cacheStatusIsError ? .red : .orange)
+                case .cached:
+                    Image(systemName: "checkmark.seal.fill").font(.caption).foregroundStyle(.green)
+                default: EmptyView()
+                }
                 Spacer()
             }
             HStack(spacing: 6) {
@@ -743,7 +741,6 @@ struct RootView: View {
                 Spacer()
                 Text(estLabel).font(.caption2).foregroundStyle(session.estOverLimit ? .red : .secondary)
             }
-            Text(engine.status).font(.caption2).foregroundStyle(engine.ready ? .green : .secondary)
 
             // REMINDER edits a DRAFT — "Update reminder" applies draft → active chat.reminder (send() always uses ACTIVE).
             // The header "Load" menu applies Default / a saved reminder DIRECTLY (explicit user action, not a stray edit).

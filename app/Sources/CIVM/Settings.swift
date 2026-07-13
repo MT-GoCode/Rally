@@ -114,6 +114,10 @@ extension HotkeyMode   { static var current: HotkeyMode { HotkeyMode(rawValue: U
 extension SK {
     // Clamp: trigger in [target+1 … cap]; target in [100 … trigger-1]. Absent → the coded defaults.
     static let stopOnEdit = "civm.stopOnEdit"        // editing while the VLM is generating → Stop → ready cache → precompute
+    static let precomputeOn = "civm.precomputeOn"    // sample the composer + prefill while typing
+    static let pregenOn = "civm.pregenOn"            // speculatively pre-generate the reply once composed
+    static var precomputeOnValue: Bool { UserDefaults.standard.object(forKey: precomputeOn) as? Bool ?? true }
+    static var pregenOnValue: Bool { UserDefaults.standard.object(forKey: pregenOn) as? Bool ?? true }
     static let sidebarShortcut = "civm.sidebarShortcut"      // in-app sidebar toggle (menu key equivalent)
     static let defaultSidebarShortcut = "cmd+b"
     static var sidebarShortcutValue: String { UserDefaults.standard.string(forKey: sidebarShortcut) ?? defaultSidebarShortcut }
@@ -314,6 +318,8 @@ struct SettingsView: View {
     @StateObject private var shotRec = BindingRecorder()
     @StateObject private var sidebarRec = BindingRecorder()
     @AppStorage(SK.sidebarShortcut) private var sidebarShortcutRaw = SK.defaultSidebarShortcut
+    @AppStorage(SK.precomputeOn) private var precomputeOn = true
+    @AppStorage(SK.pregenOn) private var pregenOn = true
     @StateObject private var copyRec = BindingRecorder()
 
     private var submode: Binding<Submode> { Binding(get: { .from(submodeRaw) }, set: { submodeRaw = $0.rawValue }) }
@@ -377,7 +383,10 @@ struct SettingsView: View {
                         ForEach(RecacheMode.allCases, id: \.self) { m in Text("\(m.label) — \(m.blurb)").tag(m) }
                     }.pickerStyle(.radioGroup).labelsHidden()
                     Divider()
-                    Toggle("Stop on message edit to optimize precompute", isOn: $stopOnEdit)
+                    Toggle("Precompute while typing (feed your message into the cache live)", isOn: $precomputeOn)
+                Toggle("Pre-generate replies (start answering before you hit send)", isOn: $pregenOn)
+                    .disabled(!precomputeOn)
+                Toggle("Stop on message edit to optimize precompute", isOn: $stopOnEdit)
                         .font(.caption)
                     Text("If you start composing (typing, staging an image, or talking) while the VLM is still generating, stop it immediately so the cache readies and your next message precomputes while you type.")
                         .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
