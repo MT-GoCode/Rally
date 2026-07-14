@@ -54,7 +54,8 @@ MEM = {"active_gb": 0.0, "peak_gb": 0.0, "over": False, "ceiling_gb": MEM_CEILIN
 ACK = "Understood — I have the reference material. Ask me anything."
 MAX_TOKENS = 2048         # SAFETY CEILING ONLY — the model stops at <end_of_turn>. Length is
                           # controlled by REMINDER, not this.
-TEMPERATURE = 0.5
+TEMPERATURE = 0.7          # chat-assistant consensus; pairs with TOP_P
+TOP_P = 0.95
 # MLX buffer-reuse pool cap. UNSET by default → MLX's default (full reuse = fastest decode). Capping the
 # pool trims the generation footprint but costs tok/s (more alloc/free per token), so it's opt-in only:
 # set CIVM_CACHE_LIMIT_GB=<n> if you ever need to trade speed for memory. (Idle already drops via _free_mem.)
@@ -82,6 +83,7 @@ MLX_LOCK = threading.Lock()                # serialize Gemma <-> parakeet GPU wo
 GEMMA_Q = queue.Queue()                    # jobs for the single Gemma worker thread
 KEEPALIVE = {"pending": False}             # coalesce idle keepalive pings (never queue a second while one is in flight)
 GEN_WAITING = {"n": 0}                     # sends waiting in the queue — compose prefills yield to them
+PF_WAITING = {"n": 0}                      # newer compose samples queued — greedy speculation yields to them
 # Speculative PRE-GENERATION of the reply while the user is still composing (only once the composer is
 # fully fed + unchanged). base = the SEND render (closed turn + gen prompt) it was generated on; ids =
 # sampled tokens; the KV physically holds base + ids[:-1] (last sampled token not yet fed). A send whose
@@ -90,8 +92,8 @@ GEN_WAITING = {"n": 0}                     # sends waiting in the queue — comp
 PREGEN = {"open": None, "base": None, "ids": [], "text": "", "done": False, "gen": None, "sig": None, "rsnap": None}
 PREGEN_SLICE = 16                          # tokens per compose tick — SMALL so a slice never holds the
                                            # worker > ~0.5s even on gemma (~34 tok/s); the queue stays live
-PREGEN_BUDGET = 192                        # max reply tokens speculated while composing (generator stays
-                                           # open; the flush resumes it past the budget)
+PREGEN_BUDGET = 1024                       # max reply tokens speculated while composing (per-token
+                                           # preemption makes deep speculation safe; flush resumes past it)
 COMPOSE = {"x": 0, "y": 0, "z": 0}         # last compose-tick accounting (turn / precomputed / anew-on-send)
 
 
@@ -668,7 +670,10 @@ def _feed(kv, ids, vis=None):
 
 def _do_pin(job):
     d = job.params["body"]
-    _prog(op="pin", stage="reading", done=0, total=0, label="reading context", bump=True)
+    quiet = bool(job.params.get("quiet"))     # /new empty-baseline install — not user-visible caching
+    def _pprog(**kw):
+        if not quiet: _prog(**kw)
+    _pprog(op="pin", stage="reading", done=0, total=0, label="reading context", bump=True)
     _mem_reset_peak()                          # so mem_peak_gb reflects THIS pin's transient (chunking check)
     tmpdir = tempfile.mkdtemp(prefix="civm-")
     paths = []
@@ -693,7 +698,7 @@ def _do_pin(job):
         if IS_QWEN:
             # qwen: plain chunked feed (stream_generate handles prefill_step_size); no gemma-style
             # bidirectional-image chunking needed — MRoPE handles image spans inside the generic path.
-            _prog(stage="prefill", done=0, total=pin_len, label="prefilling context")
+            _pprog(stage="prefill", done=0, total=pin_len, label="prefilling context")
             _feed(kv, input_ids, pin_vis)
         else:
             # gemma: encode images in small batches, then prefill the KV in chunks (one image per chunk,
@@ -704,9 +709,9 @@ def _do_pin(job):
                 # stream_generate under the lock), so encode INSIDE the lock, before _pin_prefill.
                 pv = _per_turn_pixels(paths) if paths else None
                 if pv is not None:
-                    _prog(stage="encode", done=0, total=len(paths), label=f"encoding {len(paths)} images")
+                    _pprog(stage="encode", done=0, total=len(paths), label=f"encoding {len(paths)} images")
                 feats = _batch_encode_images(pv) if pv is not None else None
-                _prog(stage="prefill", done=0, total=pin_len, label="prefilling context")
+                _pprog(stage="prefill", done=0, total=pin_len, label="prefilling context")
                 _pin_prefill(kv, input_ids, pv, feats)
     else:
         kv, pin_len = make_kv(), 0
@@ -1035,7 +1040,8 @@ def _pregen(base, paths, vis, sig, open_list):
         PF["ids"] = list(base[:achieved])
         PREGEN["gen"] = stream_generate(model, processor, "", input_ids=mx.array([tail]),
                                         prompt_cache=st["kv"], max_tokens=MAX_TOKENS,
-                                        temperature=TEMPERATURE, prefill_step_size=PREFILL_STEP, **tail_vis)
+                                        temperature=TEMPERATURE, top_p=TOP_P,
+                                        prefill_step_size=PREFILL_STEP, **tail_vis)
         PREGEN["rsnap"] = _rot_snap()                 # gemma: so a DISCARD can undo the sliding-window residue
         PREGEN["base"] = list(base); PREGEN["open"] = list(open_list); PREGEN["sig"] = sig
     _pregen_consume(PREGEN_SLICE, None)
@@ -1057,8 +1063,8 @@ def _pregen_consume(limit, emit, should_stop=None):
     gen = PREGEN["gen"]
     n = 0; done = False
     while gen is not None and (limit is None or n < limit):
-        if emit is None and GEN_WAITING["n"] > 0:
-            break                                         # a real send arrived — it resumes this generator
+        if emit is None and (GEN_WAITING["n"] > 0 or PF_WAITING["n"] > 0):
+            break                             # a send (or a newer compose sample) arrived — yield NOW
         if should_stop is not None and should_stop():
             break                                         # our own client disconnected (interrupt)
         with MLX_LOCK:
@@ -1088,6 +1094,7 @@ def _do_prefill(job):
     Apple streaming uses the same path). max_tokens=0 = clean prefill; the user turn stays OPEN (no
     turn-end) so /chat's LCP reuses it exactly. Reminder is placed for before/start modes (so their
     precached shape survives); 'after' rides the /chat render, of which this is a strict prefix."""
+    PF_WAITING["n"] = max(0, PF_WAITING["n"] - 1)
     if not st.get("kv") or GEN_WAITING["n"] > 0:
         job.result = {"fed": 0}; return        # a send is queued behind us — yield (it feeds the same tokens)
     partial = job.params["partial"]
@@ -1124,7 +1131,7 @@ def _do_prefill(job):
         # the composer changed and destroyed the speculation → the 16→0→16 flip-flop).
         composer_fed = (((PF["ids"] or []) == open_list) or PREGEN["open"] == open_list) and sig_ok
         n, done = 0, False
-        if not composer_fed:                        # feed the composer this tick (speculate next tick)
+        if not composer_fed:                        # feed the composer FIRST
             if st.get("pin_len", 0) + len(open_list) > TOKEN_LIMIT:
                 _pregen_clear(); job.result = {"fed": 0, "overLimit": True}; return
             _pregen_clear()                         # composer changed → speculation stale
@@ -1133,8 +1140,15 @@ def _do_prefill(job):
             _feed(st["kv"], tail, tail_vis)
             PF["ids"] = open_list
             if paths: PF["img_sig"] = sig
-        elif job.params.get("pregen", True):        # composer stable + fed → speculate the reply
-            n, done = _pregen(base, bpaths, bvis, bsig, open_list)
+        if job.params.get("pregen", True):
+            # GREEDY speculation: start the instant the composer is fed (same job — no tick gap) and
+            # keep consuming until the reply finishes or someone newer preempts us (a send or a fresher
+            # compose sample — checked between TOKENS in _pregen_consume, so preemption is instant).
+            prev = -1
+            while GEN_WAITING["n"] == 0 and PF_WAITING["n"] == 0:
+                n, done = _pregen(base, bpaths, bvis, bsig, open_list)
+                if done or n >= PREGEN_BUDGET or n == prev: break   # n==prev: preempted/no progress
+                prev = n
         else:
             _pregen_clear()                         # speculation disabled in settings — keep none live
         # PRECISE accounting from the ledger vs the send view:
@@ -1379,7 +1393,7 @@ def _do_generate(job):
         if not pregen_flush:
             gen = stream_generate(model, processor, "", input_ids=feed_ids,
                                   prompt_cache=st["kv"],
-                                  max_tokens=MAX_TOKENS, temperature=TEMPERATURE,
+                                  max_tokens=MAX_TOKENS, temperature=TEMPERATURE, top_p=TOP_P,
                                   prefill_step_size=PREFILL_STEP, **vis)   # vis: gemma pixels / qwen pixels+grid
         ttft, last, start = None, None, time.time()
         gen_count = 0
@@ -1668,8 +1682,9 @@ class H(BaseHTTPRequestHandler):
         try:
             if self.path == "/new":
                 # drop the pinned cache and install the empty baseline (pin_len=0) in its place,
-                # so a fresh chat never needs a /pin round-trip before chatting.
-                job = Job("pin", body={})
+                # so a fresh chat never needs a /pin round-trip before chatting. quiet=True: this is
+                # NOT user-visible caching work — an empty chat must never show "caching context".
+                job = Job("pin", body={}, quiet=True)
                 GEMMA_Q.put(job)
                 job.done.wait()
                 return self._json(200, {"ok": True})
@@ -1781,6 +1796,7 @@ class H(BaseHTTPRequestHandler):
                 d = self._body()
                 if not st.get("kv"):
                     return self._json(200, {"fed": 0})
+                PF_WAITING["n"] += 1
                 job = Job("prefill", messages=d.get("messages") or [], partial=str(d.get("partial") or ""),
                           images=d.get("images") or [], reminder=d.get("reminder"),
                           mode=d.get("reminderMode") or "last", pregen=d.get("pregen", True),
