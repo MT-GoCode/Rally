@@ -183,7 +183,7 @@ def run(model):
             wait_ready()
 
         # 10 image compose (qwen only — gemma per-turn images use the classic path)
-        if "qwen" in model:
+        if "qwen" in model or "bonsai" in model:
             ticks_until(hist, "What color is this image? Briefly.", REM, "start",
                         images=[IMG], min_pregen=5)
             hist.append({"role": "user", "content": [IMG, {"type": "text", "text": "What color is this image? Briefly."}]})
@@ -196,8 +196,11 @@ def run(model):
         proc.send_signal(signal.SIGTERM); time.sleep(1); proc.kill()
 
 which = sys.argv[1] if len(sys.argv) > 1 else "both"
-models = {"qwen": ["qwen3.5-9b-4bit"], "gemma": ["gemma-4-26b-a4b-4bit"],
-          "both": ["qwen3.5-9b-4bit", "gemma-4-26b-a4b-4bit"]}[which]
+ALIASES = {"qwen": ["qwen3.5-9b-4bit"], "gemma": ["gemma-4-26b-a4b-4bit"],
+           "qwen36": ["qwen3.6-27b-4bit"], "bonsai": ["bonsai-27b-ternary"],
+           "both": ["qwen3.5-9b-4bit", "gemma-4-26b-a4b-4bit"],
+           "all": ["qwen3.5-9b-4bit", "gemma-4-26b-a4b-4bit", "qwen3.6-27b-4bit", "bonsai-27b-ternary"]}
+models = ALIASES.get(which, [which])   # any models/<dir> name works directly
 for m in models:
     run(m)
 print("\nALL PASS ✓" if not fails else f"\nFAILURES: {fails}")

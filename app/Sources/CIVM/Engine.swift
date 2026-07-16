@@ -44,18 +44,46 @@ struct VoicePoll: Decodable {
 
 // The engine runs ONE of two local models; picked on the home screen, persisted, swap = engine restart.
 enum EngineModel: String, CaseIterable, Identifiable {
-    case gemma, qwen
+    case qwen36, bonsai, gemma, qwen          // picker order: flagship → efficient → legacy
     var id: String { rawValue }
-    var dirName: String { self == .gemma ? "gemma-4-26b-a4b-4bit" : "qwen3.5-9b-4bit" }
-    var label: String { self == .gemma ? "Gemma 4 · 26B-A4B" : "Qwen3.5 · 9B" }
-    var detail: String {
-        self == .gemma ? "MoE 26B (4B active) · strongest reasoning · ~18 GB"
-                       : "hybrid 9B · near-Gemma intelligence · ~7 GB · 262K ctx"
+    var dirName: String {
+        switch self {
+        case .gemma:  return "gemma-4-26b-a4b-4bit"
+        case .qwen:   return "qwen3.5-9b-4bit"
+        case .qwen36: return "qwen3.6-27b-4bit"
+        case .bonsai: return "bonsai-27b-ternary"
+        }
     }
-    var weightsGB: Double { self == .gemma ? 16.0 : 6.0 }
+    var label: String {
+        switch self {
+        case .gemma:  return "Gemma 4 · 26B-A4B"
+        case .qwen:   return "Qwen3.5 · 9B"
+        case .qwen36: return "Qwen3.6 · 27B"
+        case .bonsai: return "Bonsai 27B · ternary"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .gemma:  return "MoE 26B (4B active) · strong reasoning · ~18 GB"
+        case .qwen:   return "hybrid 9B · fast + light · ~7 GB · 262K ctx"
+        case .qwen36: return "dense 27B flagship · best reasoning+coding · ~16 GB · 262K ctx"
+        case .bonsai: return "Qwen3.6-27B at 2-bit (94.6%) · ~9 GB · 262K ctx"
+        }
+    }
+    var weightsGB: Double {
+        switch self {
+        case .gemma: return 16.0; case .qwen: return 6.0
+        case .qwen36: return 15.5; case .bonsai: return 8.5
+        }
+    }
     // weights + 8 GB pin/generation headroom — the bar for "enough memory to SELECT this model"
     // (memory never gates app LAUNCH; only what you can turn on)
     var neededGB: Double { weightsGB + 8 }
+    // whether the weights are on disk (setup.sh downloads; missing models show a hint, not a dead engine)
+    var installed: Bool {
+        FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("code/contextualized_instant_voice_models/engine/models/\(dirName)/config.json").path)
+    }
     static var current: EngineModel {
         get { EngineModel(rawValue: UserDefaults.standard.string(forKey: "engineModel") ?? "") ?? .gemma }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "engineModel") }

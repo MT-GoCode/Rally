@@ -604,7 +604,7 @@ struct RootView: View {
                         .font(.caption).foregroundStyle(engine.parakeet ? .primary : .secondary)
                 }
                 Text("MODEL").font(.caption.bold()).foregroundStyle(.secondary).padding(.top, 8)
-                HStack(spacing: 10) {
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                     ForEach(EngineModel.allCases) { m in modelCard(m) }
                 }
                 HStack {
@@ -634,7 +634,8 @@ struct RootView: View {
     // the engine and relaunches with the new one; pins are invalidated so every chat re-pins on open.
     @ViewBuilder func modelCard(_ m: EngineModel) -> some View {
         let selected = engine.model == m
-        let runnable = selected || Mem.canRun(m, runningEngineGB: engine.memGb)
+        let installed = m.installed
+        let runnable = (selected || Mem.canRun(m, runningEngineGB: engine.memGb)) && installed
         Button {
             guard !selected, runnable else { return }
             store.enginePinnedChat = nil; store.enginePinnedHash = nil   // engine restart voids every pin
@@ -648,7 +649,9 @@ struct RootView: View {
                     Text(m.label).font(.callout.weight(.medium))
                 }
                 Text(m.detail).font(.caption2).foregroundStyle(.secondary)
-                if !runnable {
+                if !installed {
+                    Text("not downloaded — run engine/setup.sh").font(.caption2).foregroundStyle(.orange)
+                } else if !runnable {
                     Text("needs ~\(Int(m.neededGB)) GB free — close some apps")
                         .font(.caption2).foregroundStyle(.orange)
                 }

@@ -37,9 +37,10 @@ Parakeet / Apple SpeechAnalyzer. Nothing leaves your machine.
   turns); Qwen by snapshot restore.
 - **Always sub-second TTFT** (mostly sub-half-second, often milliseconds) — enforced by design: sends
   never pay for cache maintenance, window slides, image passes, or re-reading anything.
-- **Two models, one picker** — Gemma 4 26B-A4B (MoE, strongest reasoning, ~18 GB) ↔ Qwen3.5 9B
-  (hybrid SSM, near-Gemma intelligence, ~7 GB, 262 K ctx). Cards grey out if they don't fit in free
-  memory (weights + 8 GB); switching swaps the engine process live.
+- **Four models, one picker** — Qwen3.6 27B (dense flagship, best reasoning+coding, ~16 GB, 262 K ctx),
+  Bonsai 27B ternary (the same brain at 2-bit / 94.6% quality, ~9 GB), Gemma 4 26B-A4B (MoE, ~18 GB),
+  Qwen3.5 9B (fast + light, ~7 GB). Cards grey out if they don't fit in free memory (weights + 8 GB)
+  or aren't downloaded; switching swaps the engine process live.
 - **Reminder prompts** — a per-chat instruction that rides with every question, with a placement
   trade-off you control: *at chat start* (cached once), *before question* (precomputable), *after
   question* (max adherence). The cache machinery keeps all three instant.
@@ -58,10 +59,10 @@ Parakeet / Apple SpeechAnalyzer. Nothing leaves your machine.
 
 ## Requirements
 
-- Apple Silicon Mac, macOS 14+. **Gemma**: 48 GB unified memory recommended (~24 GB free to select).
-  **Qwen3.5 9B runs on 16–24 GB Macs** (~14 GB free to select) — skip the big download with
-  `CIVM_SKIP_GEMMA=1`.
-- ~22 GB disk for both models (~6 GB qwen-only)
+- Apple Silicon Mac, macOS 14+. **Qwen3.6 27B / Gemma**: 48 GB unified memory recommended (~24 GB free
+  to select). **Bonsai 27B ternary and Qwen3.5 9B run on 16–24 GB Macs.** Skip downloads you don't
+  want with `CIVM_SKIP_GEMMA/QWEN/QWEN36/BONSAI=1`.
+- ~46 GB disk for all four models (~9 GB bonsai-only)
 - Xcode 16+ or Command Line Tools with **Swift 6** (`xcode-select --install`)
 - **uv** and **ffmpeg**: `brew install uv ffmpeg`
 

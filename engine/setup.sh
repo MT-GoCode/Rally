@@ -47,4 +47,10 @@ fi
 if [ -z "${CIVM_SKIP_QWEN:-}" ]; then
   .venv/bin/hf download mlx-community/Qwen3.5-9B-MLX-4bit --local-dir ./models/qwen3.5-9b-4bit 2>&1 | tail -2             # ~6GB
 fi
+if [ -z "${CIVM_SKIP_QWEN36:-}" ]; then
+  .venv/bin/hf download mlx-community/Qwen3.6-27B-4bit --local-dir ./models/qwen3.6-27b-4bit 2>&1 | tail -2               # ~15.5GB flagship
+fi
+if [ -z "${CIVM_SKIP_BONSAI:-}" ]; then
+  .venv/bin/hf download prism-ml/Ternary-Bonsai-27B-mlx-2bit --local-dir ./models/bonsai-27b-ternary 2>&1 | tail -2       # ~8.5GB (27B at 2-bit)
+fi
 echo "SETUP DONE"
