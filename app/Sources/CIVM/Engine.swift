@@ -62,12 +62,12 @@ enum EngineModel: String, CaseIterable, Identifiable {
         case .bonsai: return "Bonsai 27B · ternary"
         }
     }
-    var detail: String {
+    var detail: String {   // tok/s measured on this machine (M-series, 150-word warm turns)
         switch self {
-        case .gemma:  return "MoE 26B (4B active) · strong reasoning · ~18 GB"
-        case .qwen:   return "hybrid 9B · fast + light · ~7 GB · 262K ctx"
-        case .qwen36: return "dense 27B flagship · best reasoning+coding · ~16 GB · 262K ctx"
-        case .bonsai: return "Qwen3.6-27B at 2-bit (94.6%) · ~9 GB · 262K ctx"
+        case .gemma:  return "MoE 26B (4B active) · strong reasoning · ~34 tok/s · ~18 GB"
+        case .qwen:   return "hybrid 9B · fast + light · ~43 tok/s · ~7 GB · 262K ctx"
+        case .qwen36: return "dense 27B flagship · best reasoning+coding · ~14 tok/s · ~16 GB · 262K ctx"
+        case .bonsai: return "Qwen3.6-27B at 2-bit (94.6%) · ~22 tok/s · ~9 GB · 262K ctx"
         }
     }
     var weightsGB: Double {
