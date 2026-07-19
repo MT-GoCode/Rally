@@ -45,14 +45,17 @@ struct CacheHUDView: View {
         let lbl = session.progLabel
         if !engine.ready                 { return ("hourglass", engine.status, true, .secondary) }
         if store.loadingChat             { return ("hourglass", "loading chat…", true, .secondary) }
+        // busy is APP-known truth (the send happened HERE) — it overrides the ≤120ms-stale poll phase,
+        // so "generating" appears the instant you press send, never a beat of leftover "pregen".
+        if session.busy || session.progPhase == "generate" {
+            return ("bubble.left.and.text.bubble.right", lbl.isEmpty || session.progPhase != "generate" ? "generating…" : "generating — \(lbl)", true, .accentColor)
+        }
         // ONE state machine, engine-computed (/progress.phase); this is a pure renderer.
         switch session.progPhase {
         case "pin":
             return ("externaldrive.badge.plus", lbl.isEmpty ? "caching context (system + reference)…" : "caching context — \(lbl)", true, .accentColor)
         case "warm":
             return ("arrow.triangle.2.circlepath", lbl.isEmpty ? "warming conversation cache…" : "warming conversation cache — \(lbl)", true, .accentColor)
-        case "generate":
-            return ("bubble.left.and.text.bubble.right", lbl.isEmpty ? "generating…" : "generating — \(lbl)", true, .accentColor)
         case "pregen":
             if !session.speculationCurrent {   // engine is speculating for an OLDER draft — never claim
                                                // "instant" for text the user has typed past (truth gate)
@@ -62,11 +65,12 @@ struct CacheHUDView: View {
                 ? ("bolt.fill", "next turn processed ⚡ reply pre-generated — instant send", false, .green)
                 : ("bolt.fill", "next turn processed ⚡ pre-generating reply — \(session.livePregen) tok", true, .accentColor)
         case "composing":
+            if !session.sampleCurrent {   // the numbers belong to an older draft — never show stale exacts
+                return ("bolt.fill", "precomputing next turn — syncing your latest edits…", true, .accentColor)
+            }
             return ("bolt.fill", "precomputing next turn — \(session.livePrecomputed)/\(session.liveTurnTokens) tok fed · \(session.liveAnew) anew on send", false, .accentColor)
         default: break
         }
-        if session.busy {   // phase can lag a beat behind the app's own send — keep the generating text stable
-            return ("bubble.left.and.text.bubble.right", "generating…", true, .accentColor) }
         switch session.cacheState {
         case .overLimit, .failed:        return ("exclamationmark.triangle.fill", cacheStatusText(session.cacheState), false, .red)
         case .cached:                    return ("checkmark.seal.fill", "ready ✓ — cache warm, ask anything", false, .green)

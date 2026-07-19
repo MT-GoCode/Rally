@@ -318,20 +318,23 @@ enum VoiceState: Equatable {
     private(set) var livePregen = 0       // reply tokens speculatively generated so far
     private(set) var livePregenDone = false
     private(set) var speculatedKey = ""   // composer key the live speculation was built FOR
-    // TRUTH GATE for the HUD: "instant send" may only be claimed while the composer still matches the
-    // text the speculation was built on — the reported flakiness was the HUD promising a flush for a
-    // draft the user had already typed past.
-    var speculationCurrent: Bool {
-        !speculatedKey.isEmpty && speculatedKey ==
-            input.trimmingCharacters(in: .whitespacesAndNewlines) + "|" + pastedImages.map { $0.id.uuidString }.joined()
+    private(set) var sampledKey = ""      // composer key of the last MEASURED tick (X/Y/Z belong to it)
+    // The live composer's identity — typed text, or the streaming transcript while dictating.
+    var composerKey: String {
+        let text = appleRunning ? livePartial : input
+        return text.trimmingCharacters(in: .whitespacesAndNewlines) + "|" + pastedImages.map { $0.id.uuidString }.joined()
     }
+    // TRUTH GATES for the HUD — app-known facts (keystrokes) override poll-known state instantly:
+    // numbers/claims may only render while they describe the CURRENT composer text.
+    var speculationCurrent: Bool { !speculatedKey.isEmpty && speculatedKey == composerKey }
+    var sampleCurrent: Bool { !sampledKey.isEmpty && sampledKey == composerKey }
     private var voiceSeq = -1
 
     // ---- aggressive precompute: while the cache is READY and the user is composing, sample the
     // composer every 0.5s and prefill [history + OPEN user(images-first + text)] into the KV, so the
     // send only pays for the un-typed tail (and images are forward-passed while the user types). ----
     @ObservationIgnored private var composeLoopRunning = false
-    private func clearComposeState() { preSent = 0; speculatedKey = "" }
+    private func clearComposeState() { preSent = 0; speculatedKey = ""; sampledKey = "" }
     private func startComposeLoop() {
         guard !composeLoopRunning else { return }
         composeLoopRunning = true
@@ -365,6 +368,7 @@ enum VoiceState: Equatable {
                                                        pregen: SK.pregenOnValue)
                 self.preSent = r.precomputed        // (voice "pre-sent" display; all HUD state is polled)
                 let key = text + "|" + imgs.map { $0.id.uuidString }.joined()
+                self.sampledKey = key
                 self.speculatedKey = r.pregen > 0 ? key : ""
             }
         }
@@ -818,6 +822,9 @@ enum VoiceState: Equatable {
                 if self.appleRunning {
                     self.preSent = r.precomputed
                     self.liveTurnTokens = r.turnTokens; self.livePrecomputed = r.precomputed; self.liveAnew = r.anewOnSend
+                    let vkey = partial.trimmingCharacters(in: .whitespacesAndNewlines) + "|" + self.pastedImages.map { $0.id.uuidString }.joined()
+                    self.sampledKey = vkey
+                    self.speculatedKey = r.pregen > 0 ? vkey : ""
                 }
             }
         }
