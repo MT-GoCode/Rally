@@ -54,6 +54,10 @@ struct CacheHUDView: View {
         case "generate":
             return ("bubble.left.and.text.bubble.right", lbl.isEmpty ? "generating…" : "generating — \(lbl)", true, .accentColor)
         case "pregen":
+            if !session.speculationCurrent {   // engine is speculating for an OLDER draft — never claim
+                                               // "instant" for text the user has typed past (truth gate)
+                return ("bolt.fill", "precomputing next turn — syncing your latest edits…", true, .accentColor)
+            }
             return session.livePregenDone
                 ? ("bolt.fill", "next turn processed ⚡ reply pre-generated — instant send", false, .green)
                 : ("bolt.fill", "next turn processed ⚡ pre-generating reply — \(session.livePregen) tok", true, .accentColor)

@@ -317,13 +317,21 @@ enum VoiceState: Equatable {
     private(set) var liveAnew = 0         // Z = X − Y: what the send still forward-passes (0 once pregen runs)
     private(set) var livePregen = 0       // reply tokens speculatively generated so far
     private(set) var livePregenDone = false
+    private(set) var speculatedKey = ""   // composer key the live speculation was built FOR
+    // TRUTH GATE for the HUD: "instant send" may only be claimed while the composer still matches the
+    // text the speculation was built on — the reported flakiness was the HUD promising a flush for a
+    // draft the user had already typed past.
+    var speculationCurrent: Bool {
+        !speculatedKey.isEmpty && speculatedKey ==
+            input.trimmingCharacters(in: .whitespacesAndNewlines) + "|" + pastedImages.map { $0.id.uuidString }.joined()
+    }
     private var voiceSeq = -1
 
     // ---- aggressive precompute: while the cache is READY and the user is composing, sample the
     // composer every 0.5s and prefill [history + OPEN user(images-first + text)] into the KV, so the
     // send only pays for the un-typed tail (and images are forward-passed while the user types). ----
     @ObservationIgnored private var composeLoopRunning = false
-    private func clearComposeState() { preSent = 0 }   // display state is engine-owned now (via /progress)
+    private func clearComposeState() { preSent = 0; speculatedKey = "" }
     private func startComposeLoop() {
         guard !composeLoopRunning else { return }
         composeLoopRunning = true
@@ -356,6 +364,8 @@ enum VoiceState: Equatable {
                                                        trimTrigger: self.trimTrigger, trimTarget: self.trimTarget,
                                                        pregen: SK.pregenOnValue)
                 self.preSent = r.precomputed        // (voice "pre-sent" display; all HUD state is polled)
+                let key = text + "|" + imgs.map { $0.id.uuidString }.joined()
+                self.speculatedKey = r.pregen > 0 ? key : ""
             }
         }
     }

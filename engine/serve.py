@@ -1144,10 +1144,15 @@ def _do_prefill(job):
             # GREEDY speculation: start the instant the composer is fed (same job — no tick gap) and
             # keep consuming until the reply finishes or someone newer preempts us (a send or a fresher
             # compose sample — checked between TOKENS in _pregen_consume, so preemption is instant).
-            prev = -1
+            prev = -1; t0 = time.time()
             while GEN_WAITING["n"] == 0 and PF_WAITING["n"] == 0:
                 n, done = _pregen(base, bpaths, bvis, bsig, open_list)
                 if done or n >= PREGEN_BUDGET or n == prev: break   # n==prev: preempted/no progress
+                if time.time() - t0 > 1.2:
+                    break   # RETURN to the app between slices: the compose loop is awaiting THIS call —
+                            # holding it (up to ~70s of greedy speculation on a 14 tok/s model) starved
+                            # composer sampling, so sends kept missing on the user's newest keystrokes.
+                            # The next tick resumes the same generator ~0.5s later; net loss is nil.
                 prev = n
         else:
             _pregen_clear()                         # speculation disabled in settings — keep none live
